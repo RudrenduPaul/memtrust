@@ -162,6 +162,22 @@ class UpdateResult:
     raw: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class DeleteResult:
+    """Result of MemoryBackendAdapter.delete().
+
+    On failure, adapters raise BackendAPIError instead of returning a
+    DeleteResult with success=False -- `success` here reports the
+    vendor's own acknowledgement shape (e.g. "deleted" vs "already
+    gone"), not whether the HTTP call itself succeeded.
+    """
+
+    success: bool
+    memory_id: str
+    latency_ms: float
+    raw: dict[str, object] = field(default_factory=dict)
+
+
 class MemoryBackendAdapter(ABC):
     """Abstract base every backend adapter must implement.
 
@@ -169,9 +185,9 @@ class MemoryBackendAdapter(ABC):
       * __init__ must read credentials from an environment variable and
         raise BackendNotConfiguredError immediately if missing -- never
         defer the check to the first method call.
-      * store()/query()/update() must raise BackendAPIError (not a bare
-        vendor exception) on any network/API failure, so the harness can
-        report a uniform error shape across all backends.
+      * store()/query()/update()/delete() must raise BackendAPIError (not
+        a bare vendor exception) on any network/API failure, so the
+        harness can report a uniform error shape across all backends.
       * Never mutate eval logic per backend. If a backend cannot support
         an operation (see supports_update), report that fact through
         supports_update / ConflictSignal.NOT_APPLICABLE rather than
@@ -249,6 +265,64 @@ class MemoryBackendAdapter(ABC):
             BackendAPIError: on any network or vendor-side failure.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def delete(self, memory_id: str) -> DeleteResult:
+        """Delete a single stored memory/entity by id.
+
+        This is the primitive an eval needs to reproduce vendor bugs in
+        the "delete N entities" class (e.g. a client whose batch-delete
+        code silently keeps only the last response instead of aggregating
+        all N) -- see delete_many() below, which is what an eval actually
+        calls to construct that scenario.
+
+        Implementers that genuinely cannot delete (no documented/verified
+        vendor endpoint) must still define this method and raise
+        BackendAPIError with a clear "not implemented for this backend"
+        detail rather than omitting the method -- the eval layer needs a
+        uniform call shape across all adapters, same as store/query/
+        update, even when the honest answer is "not supported yet."
+
+        Raises:
+            BackendAPIError: on any network/vendor-side failure, or when
+                this backend has no verified delete endpoint.
+        """
+        raise NotImplementedError
+
+    def delete_many(self, memory_ids: list[str]) -> list[DeleteResult]:
+        """Delete several memories, one at a time, via delete().
+
+        Default implementation for every adapter: a plain per-id loop
+        that appends each DeleteResult (or a failure record, if an
+        individual delete() call raises) to a single results list sized
+        exactly len(memory_ids). This is deliberately naive -- it exists
+        so the eval layer has one aggregation path to trust, rather than
+        each adapter rolling its own batch logic that could silently
+        drop or overwrite results the way a buggy vendor client might
+        (see mem0ai/mem0#5936, #5970: a multi-entity delete that kept
+        only the last response instead of all N). Adapters with a real
+        vendor batch-delete endpoint may override this for efficiency,
+        but must preserve the same one-result-per-input-id contract.
+
+        Does not raise: a per-id BackendAPIError is caught and recorded
+        as a DeleteResult(success=False, ...) at that id's position so
+        one failure in the middle of a batch cannot truncate or drop the
+        results for the ids after it.
+        """
+        results: list[DeleteResult] = []
+        for memory_id in memory_ids:
+            try:
+                results.append(self.delete(memory_id))
+            except BackendAPIError as exc:
+                results.append(
+                    DeleteResult(
+                        success=False,
+                        memory_id=memory_id,
+                        latency_ms=0.0,
+                        raw={"error": str(exc)},
+                    )
+                )
+        return results
 
     @staticmethod
     def _timed() -> _Timer:
