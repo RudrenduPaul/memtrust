@@ -5,6 +5,7 @@ guarantee. See PRICING_LAST_VERIFIED below and docs/methodology.md.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 #: Last time the per-1M-token prices below were checked against the
@@ -35,9 +36,20 @@ class CostEntry:
 
 @dataclass
 class CostTracker:
-    """Accumulates cost entries across a `memtrust run` invocation."""
+    """Accumulates cost entries across a `memtrust run` invocation.
+
+    memtrust's eval runners are sequential today, so ``_lock`` guards a
+    mutation that is not actually contended yet. It's here preemptively:
+    a real, merged vendor bug (volcengine/OpenViking PR #3091) shipped a
+    benchmark tool that silently ignored its own --concurrency flag,
+    quietly invalidating its self-reported numbers. Keeping this shared
+    list append synchronized now means that if/when memtrust adds
+    concurrent eval execution, cost accounting can't silently drop or
+    corrupt entries the way an unsynchronized append would.
+    """
 
     entries: list[CostEntry] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def record(self, label: str, model: str, input_tokens: int, output_tokens: int) -> CostEntry:
         price_in, price_out = MODEL_PRICING_PER_MILLION_TOKENS.get(
@@ -51,7 +63,8 @@ class CostTracker:
             output_tokens=output_tokens,
             cost_usd=round(cost, 6),
         )
-        self.entries.append(entry)
+        with self._lock:
+            self.entries.append(entry)
         return entry
 
     @property
