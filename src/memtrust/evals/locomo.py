@@ -47,6 +47,12 @@ class LoCoMoCaseResult:
     actual_answer: str
     verdict: JudgeVerdict
     reasoning: str
+    records_empty: bool = False
+    """True when adapter.query() completed without error but returned zero
+    records for this question -- see LongMemEvalCaseResult.records_empty
+    and ConflictSignal.EMPTY_OR_LOST for the same distinction applied
+    here: a silent empty-success from the backend is not the same
+    diagnostic as a judge-graded wrong answer."""
     error: str | None = None
 
 
@@ -69,6 +75,12 @@ class LoCoMoResult:
             return None
         correct = sum(1 for c in graded if c.verdict == JudgeVerdict.CORRECT)
         return correct / len(graded)
+
+    @property
+    def n_records_empty(self) -> int:
+        """Count of cases where the backend call succeeded but returned
+        zero records -- see LoCoMoCaseResult.records_empty."""
+        return sum(1 for c in self.case_results if c.records_empty)
 
     def accuracy_by_category(self) -> dict[str, float | None]:
         categories = {c.category for c in self.case_results}
@@ -158,6 +170,7 @@ def run_locomo(
                     actual_answer=actual_answer,
                     verdict=judge_result.verdict,
                     reasoning=judge_result.reasoning,
+                    records_empty=not query_result.records,
                 )
             )
 

@@ -152,9 +152,14 @@ def test_stale_adapter_classified_served_stale() -> None:
 
 
 def test_no_update_adapter_all_not_applicable_and_never_called() -> None:
+    """A genuinely-no-update-primitive backend (supports_update=False)
+    must still report NOT_APPLICABLE unchanged -- EMPTY_OR_LOST is only
+    ever assigned to a *capable* backend that ran the calls and came back
+    empty, not to a backend that structurally cannot be evaluated here."""
     adapter = NoUpdateFakeAdapter()
     result = run_contradiction_eval(adapter)
     assert result.not_applicable_rate == 1.0
+    assert result.empty_or_lost_rate == 0.0
     assert adapter.store_calls == 0
 
 
@@ -168,18 +173,29 @@ def test_failing_adapter_records_error_without_crashing() -> None:
 
 
 @pytest.mark.parametrize(
-    ("has_initial", "has_updated", "adapter_signal", "expected"),
+    ("has_initial", "has_updated", "irrelevant_content", "adapter_signal", "expected"),
     [
-        (True, True, ConflictSignal.NOT_APPLICABLE, ConflictSignal.FLAGGED),
-        (False, True, ConflictSignal.NOT_APPLICABLE, ConflictSignal.SILENT_OVERWRITE),
-        (True, False, ConflictSignal.NOT_APPLICABLE, ConflictSignal.SERVED_STALE),
-        (False, False, ConflictSignal.NOT_APPLICABLE, ConflictSignal.NOT_APPLICABLE),
-        (False, False, ConflictSignal.FLAGGED, ConflictSignal.NOT_APPLICABLE),
+        (True, True, False, ConflictSignal.NOT_APPLICABLE, ConflictSignal.FLAGGED),
+        (False, True, False, ConflictSignal.NOT_APPLICABLE, ConflictSignal.SILENT_OVERWRITE),
+        (True, False, False, ConflictSignal.NOT_APPLICABLE, ConflictSignal.SERVED_STALE),
+        # Records came back but contain neither value -- a genuine "eval
+        # could not observe anything meaningful" case, still NOT_APPLICABLE
+        # regardless of what the adapter itself claimed.
+        (False, False, True, ConflictSignal.NOT_APPLICABLE, ConflictSignal.NOT_APPLICABLE),
+        (False, False, True, ConflictSignal.FLAGGED, ConflictSignal.NOT_APPLICABLE),
+        # Zero records at all from a capable backend (classify_case is only
+        # ever invoked when adapter.supports_update is True -- see
+        # run_contradiction_eval) is the "call succeeded, produced nothing"
+        # failure mode -- EMPTY_OR_LOST, never NOT_APPLICABLE, regardless
+        # of what the adapter self-reported.
+        (False, False, False, ConflictSignal.NOT_APPLICABLE, ConflictSignal.EMPTY_OR_LOST),
+        (False, False, False, ConflictSignal.FLAGGED, ConflictSignal.EMPTY_OR_LOST),
     ],
 )
 def test_classify_case_matrix(
     has_initial: bool,
     has_updated: bool,
+    irrelevant_content: bool,
     adapter_signal: ConflictSignal,
     expected: ConflictSignal,
 ) -> None:
@@ -198,6 +214,8 @@ def test_classify_case_matrix(
         content_parts.append("OLDVALUE")
     if has_updated:
         content_parts.append("NEWVALUE")
+    if irrelevant_content:
+        content_parts.append("something else entirely")
     records = (
         [MemoryRecord(memory_id="m0", content=" ".join(content_parts))] if content_parts else []
     )
@@ -206,6 +224,55 @@ def test_classify_case_matrix(
     assert signal == expected
     assert got_initial == has_initial
     assert got_updated == has_updated
+
+
+def test_classify_case_capable_backend_empty_result_is_not_not_applicable() -> None:
+    """The exact gap this fix closes: a capable backend (supports_update
+    True) whose query() call succeeded with no exception but returned zero
+    records must be distinguishable from a backend with no update
+    primitive at all. Both used to collapse into NOT_APPLICABLE."""
+    case = ContradictionCase(
+        case_id="c1",
+        session_id="s1",
+        subject="test",
+        initial_fact="fact A",
+        contradicting_fact="fact B",
+        query="q",
+        initial_value="OLDVALUE",
+        updated_value="NEWVALUE",
+    )
+    empty_result = QueryResult(
+        records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, _, _ = classify_case(case, empty_result)
+    assert signal == ConflictSignal.EMPTY_OR_LOST
+    assert signal != ConflictSignal.NOT_APPLICABLE
+
+
+class EmptyButCapableFakeAdapter(RecallAllFakeAdapter):
+    """Simulates a real-world "silent empty success": store()/update() both
+    succeed with no exception, but query() always returns zero records --
+    the exact MemPalace/OpenViking/mem0 failure mode this fix targets."""
+
+    name = "fake-empty-capable"
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        return QueryResult(
+            records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+
+def test_empty_capable_adapter_classified_empty_or_lost_end_to_end() -> None:
+    """Full run_contradiction_eval pipeline: a capable adapter that calls
+    store()/update() successfully but always returns an empty query result
+    must surface as EMPTY_OR_LOST in the aggregated results, not silently
+    default to NOT_APPLICABLE or a plain miss."""
+    adapter = EmptyButCapableFakeAdapter()
+    result = run_contradiction_eval(adapter)
+    assert adapter.store_calls > 0
+    assert result.empty_or_lost_rate == 1.0
+    assert result.not_applicable_rate == 0.0
+    assert all(c.signal == ConflictSignal.EMPTY_OR_LOST for c in result.scored_cases)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +318,29 @@ def test_longmemeval_computes_accuracy_when_judge_configured(
     judge.close()
 
 
+def test_longmemeval_sets_records_empty_on_empty_query_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backend whose query() succeeds but returns zero records must have
+    records_empty=True on every case result, distinct from an ordinary
+    judge-graded miss where the backend at least returned something."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    adapter = EmptyButCapableFakeAdapter()
+    judge = LLMJudge()
+    result = run_longmemeval(adapter, judge)
+    assert len(result.case_results) == 3
+    assert all(c.records_empty for c in result.case_results)
+    assert result.n_records_empty == 3
+
+
+def test_longmemeval_records_empty_false_when_records_returned() -> None:
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_longmemeval(adapter, judge)
+    assert all(not c.records_empty for c in result.case_results)
+    assert result.n_records_empty == 0
+
+
 def test_longmemeval_handles_backend_failure() -> None:
     adapter = FailingFakeAdapter()
     judge = LLMJudge()
@@ -277,6 +367,29 @@ def test_locomo_runs_offline_and_reports_no_accuracy(monkeypatch: pytest.MonkeyP
     result = run_locomo(adapter, judge)
     assert len(result.case_results) == 3
     assert result.accuracy is None
+
+
+def test_locomo_sets_records_empty_on_empty_query_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same distinction as LongMemEval: a backend that succeeds but
+    returns zero records must be flagged via records_empty, not scored
+    identically to a normal judge-graded miss."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    adapter = EmptyButCapableFakeAdapter()
+    judge = LLMJudge()
+    result = run_locomo(adapter, judge)
+    assert len(result.case_results) == 3
+    assert all(c.records_empty for c in result.case_results)
+    assert result.n_records_empty == 3
+
+
+def test_locomo_records_empty_false_when_records_returned() -> None:
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_locomo(adapter, judge)
+    assert all(not c.records_empty for c in result.case_results)
+    assert result.n_records_empty == 0
 
 
 def test_locomo_accuracy_by_category(

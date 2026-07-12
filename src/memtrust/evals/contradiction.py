@@ -19,6 +19,12 @@ does the backend:
                          exercise (MemoryBackendAdapter.supports_update is
                          False); recorded explicitly, never silently
                          dropped from the results table
+  * EMPTY_OR_LOST    -- the backend DOES have an update primitive and the
+                         store()/update()/query() calls all completed
+                         without error, but the query came back with zero
+                         records -- a silent empty-success, distinct from
+                         NOT_APPLICABLE, and never folded into an ordinary
+                         miss
 
 Design principle: classification is never a blind pass-through of what an
 adapter *claims* happened. Each
@@ -105,6 +111,10 @@ class ContradictionEvalResult:
     def not_applicable_rate(self) -> float | None:
         return self._fraction(ConflictSignal.NOT_APPLICABLE)
 
+    @property
+    def empty_or_lost_rate(self) -> float | None:
+        return self._fraction(ConflictSignal.EMPTY_OR_LOST)
+
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[ContradictionCase]:
     data = json.loads(Path(path).read_text())
@@ -143,11 +153,24 @@ def classify_case(
         one in the actual content is not taken at face value).
       * If it contains only the old value, the backend never picked up
         the update at all from the caller's perspective -- SERVED_STALE.
-      * If it contains neither (backend returned nothing relevant, or
-        genuinely has no update primitite), falls back to the adapter's
-        own NOT_APPLICABLE signal, or SERVED_STALE if the adapter offered
-        no signal and returned no matching content -- an empty, unhelpful
-        response to a direct query is not treated as a pass.
+      * If it contains neither and the adapter returned zero records at
+        all, that is not a genuine "no update primitive" case -- this
+        function is only ever called for adapters where
+        MemoryBackendAdapter.supports_update is True (see
+        run_contradiction_eval below, which short-circuits every case to
+        NOT_APPLICABLE before classify_case is ever invoked when it is
+        False). A capable backend that completed the store/update/query
+        calls with no error and came back with nothing is the "call
+        succeeded but silently produced nothing" failure mode --
+        classified EMPTY_OR_LOST, distinct from NOT_APPLICABLE, and never
+        silently folded into an ordinary miss.
+      * If it contains neither but the adapter DID return records (just
+        not ones containing either value), falls back to the adapter's
+        own NOT_APPLICABLE signal, or NOT_APPLICABLE regardless of what
+        the adapter claimed -- an adapter claiming FLAGGED with zero
+        matching content is not credible evidence of a flag, so that
+        specific combination is downgraded too, not silently upgraded to
+        a passing score.
     """
     content = " ".join(r.content for r in query_result.records).lower()
     has_initial = case.initial_value.lower() in content
@@ -160,13 +183,19 @@ def classify_case(
     if has_initial and not has_updated:
         return ConflictSignal.SERVED_STALE, has_initial, has_updated
 
-    # Neither value is present in the retrieved text. Defer to what the
-    # adapter itself reported (e.g. NOT_APPLICABLE for a backend with no
-    # update primitive) rather than guessing -- but an adapter claiming
-    # FLAGGED with zero matching content is not credible evidence of a
-    # flag, so that specific combination is downgraded to NOT_APPLICABLE
-    # (a genuine "this eval could not observe anything meaningful here"),
-    # not silently upgraded to a passing score.
+    # Neither value is present in the retrieved text.
+    if not query_result.records:
+        # The backend returned zero records for a capable, no-error call.
+        # This is a silent empty-success, not "no update primitive" --
+        # see ConflictSignal.EMPTY_OR_LOST for the distinction.
+        return ConflictSignal.EMPTY_OR_LOST, has_initial, has_updated
+
+    # Records came back, just none of them matched either value. Defer to
+    # what the adapter itself reported rather than guessing -- but an
+    # adapter claiming FLAGGED with zero matching content is not credible
+    # evidence of a flag, so that specific combination is downgraded to
+    # NOT_APPLICABLE (a genuine "this eval could not observe anything
+    # meaningful here"), not silently upgraded to a passing score.
     if query_result.conflict_signal == ConflictSignal.NOT_APPLICABLE:
         return ConflictSignal.NOT_APPLICABLE, has_initial, has_updated
     return ConflictSignal.NOT_APPLICABLE, has_initial, has_updated
