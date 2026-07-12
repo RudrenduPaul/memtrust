@@ -1,0 +1,43 @@
+{
+  "_synthetic": true,
+  "_note": "Hand-written sample matching the public LoCoMo dataset schema (snap-research/locomo): conversation with speaker_a/speaker_b, session_<n>/session_<n>_date_time (each session a list of {speaker, text, dia_id} turns), and qa (list of {question, answer, category, evidence}). Facts and conversations below are invented for this repo, not copied from the real dataset. See docs/methodology.md.",
+  "conversations": [
+    {
+      "conversation_id": "mt-locomo-001",
+      "speaker_a": "Mia",
+      "speaker_b": "Jordan",
+      "session_1_date_time": "2026-03-02 10:00",
+      "session_1": [
+        {"speaker": "Mia", "text": "I signed up for a pottery class starting next week.", "dia_id": "D1:1"},
+        {"speaker": "Jordan", "text": "That sounds fun, which studio?", "dia_id": "D1:2"},
+        {"speaker": "Mia", "text": "Clay & Co downtown, Tuesday evenings.", "dia_id": "D1:3"}
+      ],
+      "session_2_date_time": "2026-03-16 18:30",
+      "session_2": [
+        {"speaker": "Jordan", "text": "How's the pottery class going?", "dia_id": "D2:1"},
+        {"speaker": "Mia", "text": "Really good, I made a bowl and a small vase so far.", "dia_id": "D2:2"},
+        {"speaker": "Mia", "text": "The instructor moved us to Thursdays though, scheduling conflict.", "dia_id": "D2:3"}
+      ],
+      "qa": [
+        {
+          "question": "What studio does Mia take pottery classes at?",
+          "answer": "Clay & Co",
+          "category": "single-hop",
+          "evidence": ["D1:3"]
+        },
+        {
+          "question": "What day of the week is Mia's pottery class now held on?",
+          "answer": "Thursday",
+          "category": "temporal",
+          "evidence": ["D1:3", "D2:3"]
+        },
+        {
+          "question": "What has Mia made in her pottery class?",
+          "answer": "A bowl and a small vase",
+          "category": "multi-hop",
+          "evidence": ["D2:2"]
+        }
+      ]
+    }
+  ]
+}
