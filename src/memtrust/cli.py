@@ -29,6 +29,7 @@ from rich.table import Table
 from memtrust import __version__
 from memtrust.adapters import ADAPTER_REGISTRY
 from memtrust.adapters.base import BackendNotConfiguredError, MemoryBackendAdapter
+from memtrust.evals.compression import CompressionEvalResult, run_compression_eval
 from memtrust.evals.contradiction import ContradictionEvalResult, run_contradiction_eval
 from memtrust.evals.locomo import LoCoMoResult, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
@@ -36,14 +37,20 @@ from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_reso
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-console = Console()
+#: Explicit width rather than relying on terminal auto-detection -- with 5
+#: evals now registered, the `report` table has 7 columns; under a
+#: non-tty runner (tests, CI logs) rich's default-width fallback wraps
+#: cell text across lines, which is cosmetic in a real terminal but breaks
+#: substring assertions on rendered output. A fixed wide width keeps
+#: rendering deterministic in both contexts.
+console = Console(width=200)
 
 #: The 4 canonical, non-aliased backend names v0.1 tracks at full eval
 #: depth. "zep" and "graphiti" both resolve to the same adapter in
 #: ADAPTER_REGISTRY; "all" expands to this list, not to every registry key,
 #: so a backend is never silently evaluated twice under two names.
 ALL_BACKENDS = ["mempalace", "mem0", "zep", "openviking"]
-ALL_EVALS = ["longmemeval", "locomo", "contradiction", "resource_sync_safety"]
+ALL_EVALS = ["longmemeval", "locomo", "contradiction", "resource_sync_safety", "compression"]
 
 
 def _resolve_backend_names(backends_arg: str) -> list[str]:
@@ -141,6 +148,23 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for f in result.file_results
             ],
         }
+    if isinstance(result, CompressionEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "modes": result.modes,
+            "mean_fidelity_by_mode": result.mean_fidelity_by_mode(),
+            "fidelity_drop_pp": result.fidelity_drop_pp,
+            "mode_results": {
+                mode: {
+                    "mean_fidelity": mode_result.mean_fidelity,
+                    "n_cases": len(mode_result.case_results),
+                    "n_scored": len(mode_result.scored_cases),
+                    "cases": [asdict(c) for c in mode_result.case_results],
+                }
+                for mode, mode_result in result.mode_results.items()
+            },
+        }
     raise TypeError(f"no serializer for {type(result)!r}")
 
 
@@ -161,7 +185,7 @@ def main() -> None:
     show_default=True,
     help=(
         "Comma-separated eval list "
-        "(longmemeval,locomo,contradiction,resource_sync_safety), or 'all'."
+        "(longmemeval,locomo,contradiction,resource_sync_safety,compression), or 'all'."
     ),
 )
 @click.option(
@@ -273,6 +297,20 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
                 else:
                     console.print("    N/A (no scoreable files)")
 
+        if "compression" in eval_names:
+            console.print(f"  Running Compression/Round-Trip-Fidelity against {backend_name}...")
+            compression_result = run_compression_eval(adapter)
+            backend_report["evals"]["compression"] = _serialize_eval_result(compression_result)
+            means = compression_result.mean_fidelity_by_mode()
+            if means:
+                rendered = "  ".join(
+                    f"{mode}: {value:.1%}" if value is not None else f"{mode}: N/A"
+                    for mode, value in means.items()
+                )
+                console.print(f"    fidelity by mode -- {rendered}")
+            else:
+                console.print("    N/A (no scoreable cases)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -314,10 +352,11 @@ def report(report_path: Path) -> None:
     table.add_column("LoCoMo")
     table.add_column("Contradiction (flagged/overwrite/stale/empty-or-lost)")
     table.add_column("Resource-Sync (user-file deletion rate)")
+    table.add_column("Compression fidelity by mode")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
-            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-")
+            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-")
             continue
 
         evals = backend_data.get("evals", {})
@@ -325,6 +364,7 @@ def report(report_path: Path) -> None:
         locomo = evals.get("locomo", {})
         contra = evals.get("contradiction", {})
         rss = evals.get("resource_sync_safety", {})
+        compression = evals.get("compression", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -343,6 +383,14 @@ def report(report_path: Path) -> None:
             rss_str = _fmt_pct(rss.get("user_file_deletion_rate"))
         else:
             rss_str = "-"
+        compression_str = (
+            "  ".join(
+                f"{mode}: {_fmt_pct(value)}"
+                for mode, value in compression.get("mean_fidelity_by_mode", {}).items()
+            )
+            if compression
+            else "-"
+        )
         table.add_row(
             backend_name,
             "configured",
@@ -350,6 +398,7 @@ def report(report_path: Path) -> None:
             _fmt_pct(locomo.get("accuracy")) if locomo else "-",
             contra_str,
             rss_str,
+            compression_str or "-",
         )
 
     console.print(table)

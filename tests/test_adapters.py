@@ -537,14 +537,22 @@ class FakePalace:
     def __init__(self) -> None:
         self._store: dict[str, dict[str, Any]] = {}
         self._next_id = 0
+        self.remember_modes: list[str | None] = []
+        self.recall_modes: list[str | None] = []
 
-    def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+    def remember(
+        self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+    ) -> str:
+        self.remember_modes.append(mode)
         self._next_id += 1
         memory_id = f"palace-{self._next_id}"
         self._store[memory_id] = {"room": room, "content": content, "metadata": metadata}
         return memory_id
 
-    def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+    def recall(
+        self, room: str, query: str, top_k: int, mode: str | None = None
+    ) -> list[dict[str, Any]]:
+        self.recall_modes.append(mode)
         return [
             {"id": mid, "content": v["content"], "metadata": v["metadata"]}
             for mid, v in self._store.items()
@@ -576,12 +584,38 @@ def test_mempalace_store_query_update_with_fake_palace() -> None:
     assert query_result_2.conflict_signal == ConflictSignal.FLAGGED
 
 
+def test_mempalace_threads_mode_through_to_palace_calls() -> None:
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+
+    adapter.store("room-1", "content", mode="AAAK")
+    adapter.query("room-1", "query", mode="AAAK")
+    assert palace.remember_modes == ["AAAK"]
+    assert palace.recall_modes == ["AAAK"]
+
+    # Not passing `mode` at all (the default) must not change the
+    # underlying call shape -- `None` is forwarded, exactly as before this
+    # parameter existed.
+    adapter.store("room-1", "content")
+    adapter.query("room-1", "query")
+    assert palace.remember_modes == ["AAAK", None]
+    assert palace.recall_modes == ["AAAK", None]
+
+
+def test_mempalace_supported_modes_reports_raw_and_aaak() -> None:
+    assert MemPalaceAdapter.supported_modes == ("raw", "AAAK")
+
+
 def test_mempalace_wraps_vendor_exceptions_in_backend_api_error() -> None:
     class BrokenPalace:
-        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+        def remember(
+            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+        ) -> str:
             raise RuntimeError("vendor exploded")
 
-        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+        def recall(
+            self, room: str, query: str, top_k: int, mode: str | None = None
+        ) -> list[dict[str, Any]]:
             raise RuntimeError("vendor exploded")
 
         def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
@@ -644,10 +678,14 @@ def test_mempalace_verify_true_detects_silently_dropped_write() -> None:
         deadlocked lock silently no-oping the write server-side.
         """
 
-        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+        def remember(
+            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+        ) -> str:
             return "palace-ghost-1"
 
-        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+        def recall(
+            self, room: str, query: str, top_k: int, mode: str | None = None
+        ) -> list[dict[str, Any]]:
             return []
 
         def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
@@ -666,10 +704,14 @@ def test_mempalace_verify_true_detects_wrong_content_on_readback() -> None:
     total drop). Still verified=False, still no exception."""
 
     class CorruptingPalace:
-        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+        def remember(
+            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+        ) -> str:
             return "palace-corrupt-1"
 
-        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+        def recall(
+            self, room: str, query: str, top_k: int, mode: str | None = None
+        ) -> list[dict[str, Any]]:
             return [{"id": "palace-corrupt-1", "content": "\x00\x00\x00", "metadata": {}}]
 
         def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
@@ -689,9 +731,11 @@ def test_mempalace_verify_false_by_default_does_not_call_recall() -> None:
             super().__init__()
             self.recall_call_count = 0
 
-        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+        def recall(
+            self, room: str, query: str, top_k: int, mode: str | None = None
+        ) -> list[dict[str, Any]]:
             self.recall_call_count += 1
-            return super().recall(room, query, top_k)
+            return super().recall(room, query, top_k, mode)
 
     palace = RecallTrackingPalace()
     adapter = MemPalaceAdapter(palace=palace)
@@ -714,10 +758,14 @@ def test_verify_store_raises_backend_api_error_when_query_itself_fails() -> None
     errored."""
 
     class QueryFailsPalace:
-        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+        def remember(
+            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+        ) -> str:
             return "palace-1"
 
-        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+        def recall(
+            self, room: str, query: str, top_k: int, mode: str | None = None
+        ) -> list[dict[str, Any]]:
             raise RuntimeError("vendor exploded during verification query")
 
         def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:

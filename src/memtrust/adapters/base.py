@@ -220,9 +220,26 @@ class MemoryBackendAdapter(ABC):
     #: default NotImplementedError below.
     supports_resource_sync: bool = False
 
+    #: Named operating modes this backend exposes that change how content
+    #: is stored/retrieved (e.g. a vendor's "compressed"/"lossless" write
+    #: path vs. its raw path). Empty by default -- most adapters have no
+    #: mode variants at all, and the compression/round-trip-fidelity eval
+    #: (evals/compression.py) treats an empty tuple as "run once under a
+    #: single synthetic 'default' mode" rather than skipping the backend.
+    #: An adapter that declares a non-empty tuple here is asserting that
+    #: passing each of those strings as `mode=` to store()/query() below
+    #: actually selects a different vendor-side code path -- see
+    #: mempalace_adapter.py for the one adapter that currently does this,
+    #: and the honesty caveat attached to its mode names.
+    supported_modes: tuple[str, ...] = ()
+
     @abstractmethod
     def store(
-        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
     ) -> StoreResult:
         """Store a new memory under the given session/user scope.
 
@@ -230,6 +247,14 @@ class MemoryBackendAdapter(ABC):
             session_id: logical conversation/user scope for this memory.
             content: the text to store.
             metadata: optional vendor-agnostic key/value tags.
+            mode: optional operating-mode selector (see `supported_modes`).
+                Adapters that don't expose mode variants MUST accept this
+                parameter and ignore it (no-op) rather than raising, so
+                that callers written against the shared interface can pass
+                `mode=` uniformly across every backend without special-
+                casing the ones that don't support it. This preserves
+                backward compatibility: any pre-existing call site that
+                never passes `mode` continues to behave identically.
 
         Raises:
             BackendAPIError: on any network or vendor-side failure.
@@ -253,8 +278,15 @@ class MemoryBackendAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
         """Retrieve memories relevant to `query` within `session_id`.
+
+        Args:
+            mode: optional operating-mode selector, same contract as
+                `store()`'s `mode` parameter above -- ignored (no-op) by
+                adapters with no mode variants.
 
         Raises:
             BackendAPIError: on any network or vendor-side failure.
