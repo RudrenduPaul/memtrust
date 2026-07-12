@@ -82,6 +82,7 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
             "judge_unavailable": result.judge_unavailable,
             "n_cases": len(result.case_results),
             "n_graded": len(result.graded_cases),
+            "n_records_empty": result.n_records_empty,
             "cases": [asdict(c) for c in result.case_results],
         }
     if isinstance(result, LoCoMoResult):
@@ -92,6 +93,7 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
             "accuracy_by_category": result.accuracy_by_category(),
             "n_cases": len(result.case_results),
             "n_graded": len(result.graded_cases),
+            "n_records_empty": result.n_records_empty,
             "cases": [asdict(c) for c in result.case_results],
         }
     if isinstance(result, ContradictionEvalResult):
@@ -102,6 +104,7 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
             "silent_overwrite_rate": result.silent_overwrite_rate,
             "served_stale_rate": result.served_stale_rate,
             "not_applicable_rate": result.not_applicable_rate,
+            "empty_or_lost_rate": result.empty_or_lost_rate,
             "n_cases": len(result.case_results),
             "cases": [
                 {
@@ -193,6 +196,12 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
                 console.print(f"    accuracy: {acc:.1%}")
             else:
                 console.print("    accuracy: N/A (judge not configured)")
+            if lme_result.n_records_empty:
+                console.print(
+                    f"    [yellow]records_empty: {lme_result.n_records_empty}/"
+                    f"{len(lme_result.case_results)}[/yellow] "
+                    "(backend call succeeded but returned nothing)"
+                )
 
         if "locomo" in eval_names:
             console.print(f"  Running LoCoMo against {backend_name}...")
@@ -203,6 +212,12 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
                 console.print(f"    accuracy: {acc:.1%}")
             else:
                 console.print("    accuracy: N/A (judge not configured)")
+            if locomo_result.n_records_empty:
+                console.print(
+                    f"    [yellow]records_empty: {locomo_result.n_records_empty}/"
+                    f"{len(locomo_result.case_results)}[/yellow] "
+                    "(backend call succeeded but returned nothing)"
+                )
 
         if "contradiction" in eval_names:
             console.print(f"  Running Contradiction-Detection against {backend_name}...")
@@ -211,9 +226,11 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
             fr = contra_result.flagged_rate
             so = contra_result.silent_overwrite_rate
             ss = contra_result.served_stale_rate
+            eol = contra_result.empty_or_lost_rate
             if fr is not None:
                 console.print(
                     f"    flagged: {fr:.1%}  silent-overwrite: {so:.1%}  served-stale: {ss:.1%}"
+                    f"  empty-or-lost: {eol:.1%}"
                 )
             else:
                 console.print("    N/A (no scoreable cases)")
@@ -257,7 +274,7 @@ def report(report_path: Path) -> None:
     table.add_column("Status")
     table.add_column("LongMemEval")
     table.add_column("LoCoMo")
-    table.add_column("Contradiction (flagged/overwrite/stale)")
+    table.add_column("Contradiction (flagged/overwrite/stale/empty-or-lost)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
@@ -275,7 +292,8 @@ def report(report_path: Path) -> None:
         contra_str = (
             f"{_fmt_pct(contra.get('flagged_rate'))} / "
             f"{_fmt_pct(contra.get('silent_overwrite_rate'))} / "
-            f"{_fmt_pct(contra.get('served_stale_rate'))}"
+            f"{_fmt_pct(contra.get('served_stale_rate'))} / "
+            f"{_fmt_pct(contra.get('empty_or_lost_rate'))}"
             if contra
             else "-"
         )
