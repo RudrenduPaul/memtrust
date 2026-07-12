@@ -23,6 +23,20 @@ filesystem write/search, this adapter's behavior should be corrected by
 whoever verifies it against a live instance -- flagged explicitly here
 and in docs/methodology.md rather than presented as confirmed.
 
+list_resource_paths()/trigger_resync() (supports_resource_sync = True)
+are written against the same `viking://` filesystem paradigm, guessing a
+`/v1/fs/list` listing endpoint and a `/v1/fs/resync` resync-trigger
+endpoint by analogy with the confirmed `/v1/fs/write` and `/v1/search`
+paths above. Neither endpoint was confirmed in this build's research
+pass -- confidence is LOW on the exact paths, same flag as store's
+memory-write endpoint above. This is the capability that lets the
+resource-sync-safety eval (evals/resource_sync_safety.py) exercise
+OpenViking at all; it exists specifically because OpenViking's Feishu
+resync mechanism has a reported data-loss bug (a resync silently
+deleting user-owned files the ingestion watcher did not generate --
+volcengine/OpenViking#3029) that the store/query/update model alone
+cannot observe.
+
 Gated on OPENVIKING_API_KEY, matching the project's hosted "OpenViking
 Studio" offering; OPENVIKING_BASE_URL may override the default host to
 point at a self-hosted server instead.
@@ -53,6 +67,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
     name = "openviking"
     env_var = "OPENVIKING_API_KEY"
     supports_update = True
+    supports_resource_sync = True
 
     def __init__(self, base_url: str | None = None, timeout: float = 30.0) -> None:
         api_key = os.environ.get(self.env_var)
@@ -157,6 +172,31 @@ class OpenVikingAdapter(MemoryBackendAdapter):
         return DeleteResult(
             success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data
         )
+
+    def list_resource_paths(self, prefix: str) -> list[str]:
+        payload = {"path_prefix": f"viking://{prefix}"}
+        try:
+            resp = self._http.post("/v1/fs/list", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as exc:
+            raise BackendAPIError(self.name, str(exc)) from exc
+        entries = data.get("paths", data.get("entries", []))
+        paths: list[str] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                paths.append(str(entry.get("path", "")))
+            else:
+                paths.append(str(entry))
+        return [p for p in paths if p]
+
+    def trigger_resync(self, prefix: str) -> None:
+        payload = {"path_prefix": f"viking://{prefix}"}
+        try:
+            resp = self._http.post("/v1/fs/resync", json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise BackendAPIError(self.name, str(exc)) from exc
 
     def close(self) -> None:
         self._http.close()
