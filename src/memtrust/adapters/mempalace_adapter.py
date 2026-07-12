@@ -52,11 +52,9 @@ class _PalaceProtocol(Protocol):
 
     def remember(self, room: str, content: str, metadata: dict[str, str]) -> str: ...
 
-    def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
-        ...
+    def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]: ...
 
-    def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
-        ...
+    def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]: ...
 
 
 class MemPalaceAdapter(MemoryBackendAdapter):
@@ -131,10 +129,10 @@ class MemPalaceAdapter(MemoryBackendAdapter):
         # Mem0's opaque pipeline or a plain vector store's overwrite:
         # a query result carrying an "invalidated" marker means the
         # backend itself flagged that fact as superseded.
-        conflict_signal = (
-            ConflictSignal.FLAGGED if invalidated else ConflictSignal.NOT_APPLICABLE
+        conflict_signal = ConflictSignal.FLAGGED if invalidated else ConflictSignal.NOT_APPLICABLE
+        return QueryResult(
+            records=records, conflict_signal=conflict_signal, latency_ms=timer.elapsed_ms()
         )
-        return QueryResult(records=records, conflict_signal=conflict_signal, latency_ms=timer.elapsed_ms())
 
     def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
         timer = self._timed()
@@ -144,4 +142,6 @@ class MemPalaceAdapter(MemoryBackendAdapter):
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
         new_id = str(result.get("id", memory_id))
-        return UpdateResult(memory_id=new_id, acknowledged=True, latency_ms=timer.elapsed_ms(), raw=result)
+        return UpdateResult(
+            memory_id=new_id, acknowledged=True, latency_ms=timer.elapsed_ms(), raw=result
+        )

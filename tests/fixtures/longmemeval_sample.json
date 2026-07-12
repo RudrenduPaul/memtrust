@@ -1,0 +1,70 @@
+{
+  "_synthetic": true,
+  "_note": "Hand-written sample matching the public LongMemEval dataset schema (xiaowu0162/longmemeval on Hugging Face): question_id, question_type, question, answer, question_date, haystack_session_ids, haystack_dates, haystack_sessions (list of {role, content} turns), answer_session_ids. Facts and conversations below are invented for this repo, not copied from the real dataset. See docs/methodology.md.",
+  "examples": [
+    {
+      "question_id": "mt-lme-001",
+      "question_type": "single-session-user",
+      "question": "What is the name of my dog?",
+      "answer": "Baxter",
+      "question_date": "2026-05-14",
+      "haystack_session_ids": ["s1", "s2", "s3"],
+      "haystack_dates": ["2026-04-01", "2026-04-15", "2026-05-01"],
+      "answer_session_ids": ["s1"],
+      "haystack_sessions": [
+        [
+          {"role": "user", "content": "I just adopted a golden retriever puppy named Baxter."},
+          {"role": "assistant", "content": "Congratulations on adopting Baxter! Golden retrievers are wonderful companions."}
+        ],
+        [
+          {"role": "user", "content": "I'm thinking about repainting my kitchen a light blue."},
+          {"role": "assistant", "content": "Light blue is a calming choice for a kitchen."}
+        ],
+        [
+          {"role": "user", "content": "Work has been busy lately, lots of client meetings."},
+          {"role": "assistant", "content": "That sounds demanding. Make sure to take breaks."}
+        ]
+      ]
+    },
+    {
+      "question_id": "mt-lme-002",
+      "question_type": "temporal-reasoning",
+      "question": "Which city did I move to most recently?",
+      "answer": "Austin",
+      "question_date": "2026-06-01",
+      "haystack_session_ids": ["s1", "s2"],
+      "haystack_dates": ["2026-01-10", "2026-05-20"],
+      "answer_session_ids": ["s2"],
+      "haystack_sessions": [
+        [
+          {"role": "user", "content": "I moved to Denver last month for a new job."},
+          {"role": "assistant", "content": "How is Denver treating you so far?"}
+        ],
+        [
+          {"role": "user", "content": "Update: I relocated again, this time to Austin, for the same company's new office."},
+          {"role": "assistant", "content": "Austin has a great tech scene, I hope the move went smoothly."}
+        ]
+      ]
+    },
+    {
+      "question_id": "mt-lme-003",
+      "question_type": "knowledge-update",
+      "question": "What is my current job title?",
+      "answer": "Senior Data Engineer",
+      "question_date": "2026-06-10",
+      "haystack_session_ids": ["s1", "s2"],
+      "haystack_dates": ["2026-02-01", "2026-05-01"],
+      "answer_session_ids": ["s2"],
+      "haystack_sessions": [
+        [
+          {"role": "user", "content": "I'm a Data Engineer at a logistics startup."},
+          {"role": "assistant", "content": "Nice, what kind of pipelines do you build?"}
+        ],
+        [
+          {"role": "user", "content": "I got promoted to Senior Data Engineer last week."},
+          {"role": "assistant", "content": "Congratulations on the promotion!"}
+        ]
+      ]
+    }
+  ]
+}

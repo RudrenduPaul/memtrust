@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 
 class BackendNotConfiguredError(Exception):
@@ -51,7 +51,7 @@ class BackendAPIError(Exception):
         super().__init__(f"{backend_name} API error: {detail}")
 
 
-class ConflictSignal(str, Enum):
+class ConflictSignal(StrEnum):
     """How a backend responded when a query touched a fact that had been
     contradicted by a later store()/update() call.
 

@@ -1,0 +1,56 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case stores an initial fact, then stores a contradicting fact for the same slot, then queries for it. See docs/methodology.md for the full case design and scoring logic in evals/contradiction.py.",
+  "cases": [
+    {
+      "case_id": "mt-contra-001",
+      "session_id": "contra-session-1",
+      "subject": "meeting time",
+      "initial_fact": "My meeting with the design team is at 2pm on Friday.",
+      "contradicting_fact": "Correction: the design team meeting moved to 3pm on Friday.",
+      "query": "What time is my meeting with the design team on Friday?",
+      "initial_value": "2pm",
+      "updated_value": "3pm"
+    },
+    {
+      "case_id": "mt-contra-002",
+      "session_id": "contra-session-2",
+      "subject": "dietary restriction",
+      "initial_fact": "I'm vegetarian, please don't suggest meat dishes.",
+      "contradicting_fact": "Update: I started eating fish again, so pescatarian is fine now.",
+      "query": "What are my current dietary restrictions?",
+      "initial_value": "vegetarian",
+      "updated_value": "pescatarian"
+    },
+    {
+      "case_id": "mt-contra-003",
+      "session_id": "contra-session-3",
+      "subject": "project deadline",
+      "initial_fact": "The Q3 report is due on August 15th.",
+      "contradicting_fact": "The Q3 report deadline was pushed back to September 1st.",
+      "query": "When is the Q3 report due?",
+      "initial_value": "August 15",
+      "updated_value": "September 1"
+    },
+    {
+      "case_id": "mt-contra-004",
+      "session_id": "contra-session-4",
+      "subject": "home address",
+      "initial_fact": "I live at 42 Birch Street in Portland.",
+      "contradicting_fact": "I moved. My new address is 118 Cedar Avenue in Portland.",
+      "query": "What is my current home address?",
+      "initial_value": "42 Birch",
+      "updated_value": "118 Cedar"
+    },
+    {
+      "case_id": "mt-contra-005",
+      "session_id": "contra-session-5",
+      "subject": "team lead",
+      "initial_fact": "Priya is the lead on the payments team.",
+      "contradicting_fact": "Priya moved teams. Sam is now the lead on the payments team.",
+      "query": "Who leads the payments team?",
+      "initial_value": "Priya",
+      "updated_value": "Sam"
+    }
+  ]
+}
