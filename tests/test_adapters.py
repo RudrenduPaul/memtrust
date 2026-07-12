@@ -233,14 +233,22 @@ class FakePalace:
     def __init__(self) -> None:
         self._store: dict[str, dict[str, Any]] = {}
         self._next_id = 0
+        self.remember_modes: list[str | None] = []
+        self.recall_modes: list[str | None] = []
 
-    def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+    def remember(
+        self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+    ) -> str:
+        self.remember_modes.append(mode)
         self._next_id += 1
         memory_id = f"palace-{self._next_id}"
         self._store[memory_id] = {"room": room, "content": content, "metadata": metadata}
         return memory_id
 
-    def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+    def recall(
+        self, room: str, query: str, top_k: int, mode: str | None = None
+    ) -> list[dict[str, Any]]:
+        self.recall_modes.append(mode)
         return [
             {"id": mid, "content": v["content"], "metadata": v["metadata"]}
             for mid, v in self._store.items()
@@ -272,12 +280,38 @@ def test_mempalace_store_query_update_with_fake_palace() -> None:
     assert query_result_2.conflict_signal == ConflictSignal.FLAGGED
 
 
+def test_mempalace_threads_mode_through_to_palace_calls() -> None:
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+
+    adapter.store("room-1", "content", mode="AAAK")
+    adapter.query("room-1", "query", mode="AAAK")
+    assert palace.remember_modes == ["AAAK"]
+    assert palace.recall_modes == ["AAAK"]
+
+    # Not passing `mode` at all (the default) must not change the
+    # underlying call shape -- `None` is forwarded, exactly as before this
+    # parameter existed.
+    adapter.store("room-1", "content")
+    adapter.query("room-1", "query")
+    assert palace.remember_modes == ["AAAK", None]
+    assert palace.recall_modes == ["AAAK", None]
+
+
+def test_mempalace_supported_modes_reports_raw_and_aaak() -> None:
+    assert MemPalaceAdapter.supported_modes == ("raw", "AAAK")
+
+
 def test_mempalace_wraps_vendor_exceptions_in_backend_api_error() -> None:
     class BrokenPalace:
-        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+        def remember(
+            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+        ) -> str:
             raise RuntimeError("vendor exploded")
 
-        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+        def recall(
+            self, room: str, query: str, top_k: int, mode: str | None = None
+        ) -> list[dict[str, Any]]:
             raise RuntimeError("vendor exploded")
 
         def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:

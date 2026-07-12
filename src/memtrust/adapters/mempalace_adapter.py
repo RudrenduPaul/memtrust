@@ -24,6 +24,25 @@ Because MemPalace needs no cloud API key, this adapter's "configuration"
 requirement is a local storage path (MEMPALACE_STORAGE_PATH) rather than
 a secret -- a deliberate, documented deviation from the API-key pattern
 the other three adapters use, not an oversight.
+
+Mode variants ("raw" vs "AAAK"): mempalace/mempalace#27 (cited in
+README.md and docs/methodology.md as founding rationale for this project)
+documents a "lossless" compression claim for MemPalace's default write
+path that community testing showed is actually lossy -- a reported 12.4
+percentage-point accuracy drop between an uncompressed mode and the
+compressed mode the issue calls "AAAK". `supported_modes` below exposes
+those two mode names so `evals/compression.py` can request each one via
+`store()`/`query()`'s `mode` parameter and directly measure round-trip
+fidelity per mode. The mode *names* come from that community issue, not
+from a confirmed constructor/method parameter in the installed
+`mempalace` package -- exactly the same LOW-confidence caveat that
+already applies to every other method name in this file (see the module
+confidence note above and docs/methodology.md's adapter-confidence
+table). If the real package's `remember()`/`recall()` do not accept a
+`mode` keyword, passing a non-None mode fails loudly as a
+`BackendAPIError` (via the existing generic `except Exception` wrapping
+below), not silently -- it never falls back to pretending the mode was
+honored.
 """
 
 from __future__ import annotations
@@ -50,9 +69,13 @@ class _PalaceProtocol(Protocol):
     package installed -- see tests/test_adapters.py.
     """
 
-    def remember(self, room: str, content: str, metadata: dict[str, str]) -> str: ...
+    def remember(
+        self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+    ) -> str: ...
 
-    def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]: ...
+    def recall(
+        self, room: str, query: str, top_k: int, mode: str | None = None
+    ) -> list[dict[str, Any]]: ...
 
     def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]: ...
 
@@ -61,6 +84,10 @@ class MemPalaceAdapter(MemoryBackendAdapter):
     name = "mempalace"
     env_var = "MEMPALACE_STORAGE_PATH"
     supports_update = True
+    #: See the module docstring's "Mode variants" section above -- these
+    #: names come from mempalace/mempalace#27, not a confirmed API
+    #: reference.
+    supported_modes = ("raw", "AAAK")
 
     def __init__(self, palace: _PalaceProtocol | None = None) -> None:
         storage_path = os.environ.get(self.env_var)
@@ -94,21 +121,29 @@ class MemPalaceAdapter(MemoryBackendAdapter):
         return self._palace
 
     def store(
-        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
     ) -> StoreResult:
         timer = self._timed()
         palace = self._get_palace()
         try:
-            memory_id = palace.remember(room=session_id, content=content, metadata=metadata or {})
+            memory_id = palace.remember(
+                room=session_id, content=content, metadata=metadata or {}, mode=mode
+            )
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
         return StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms())
 
-    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
         timer = self._timed()
         palace = self._get_palace()
         try:
-            results = palace.recall(room=session_id, query=query, top_k=top_k)
+            results = palace.recall(room=session_id, query=query, top_k=top_k, mode=mode)
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
 

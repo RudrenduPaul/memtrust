@@ -145,7 +145,30 @@ def test_run_against_configured_backend_full_flow(
     assert "longmemeval" in data["results"]["mem0"]["evals"]
     assert "locomo" in data["results"]["mem0"]["evals"]
     assert "contradiction" in data["results"]["mem0"]["evals"]
+    assert "compression" in data["results"]["mem0"]["evals"]
 
     report_result = runner.invoke(main, ["report", str(out_path)])
     assert report_result.exit_code == 0
     assert "configured" in report_result.output
+
+
+def test_compression_eval_is_registered_in_all_evals() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "compression" in ALL_EVALS
+
+
+def test_run_accepts_compression_as_a_single_eval_selection(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        ["run", "--backends", "mem0", "--eval", "compression", "--output", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    # mem0 is unconfigured (autouse fixture strips credentials), so it's
+    # skipped -- this just confirms "compression" resolves as a known eval
+    # name and the command doesn't crash, matching the "never crash on
+    # missing credentials" contract exercised elsewhere in this file.
+    assert data["results"]["mem0"]["status"] == "skipped"
