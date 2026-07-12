@@ -47,6 +47,16 @@ class LongMemEvalCaseResult:
     actual_answer: str
     verdict: JudgeVerdict
     reasoning: str
+    records_empty: bool = False
+    """True when adapter.query() completed without error but returned zero
+    records for this question. A judge then grades an empty actual_answer
+    as an ordinary miss (wrong/incorrect) same as any other wrong answer --
+    this field exists so a run can distinguish "the model reasoned about
+    retrieved content and got it wrong" from "the backend silently gave
+    back nothing to reason about," which is a diagnostically different
+    failure the underlying vendor call may share across many questions.
+    See adapters/base.py's ConflictSignal.EMPTY_OR_LOST for the analogous
+    signal in the contradiction eval."""
     error: str | None = None
 
 
@@ -73,6 +83,12 @@ class LongMemEvalResult:
     @property
     def judge_unavailable(self) -> bool:
         return len(self.graded_cases) == 0 and len(self.case_results) > 0
+
+    @property
+    def n_records_empty(self) -> int:
+        """Count of cases where the backend call succeeded but returned
+        zero records -- see LongMemEvalCaseResult.records_empty."""
+        return sum(1 for c in self.case_results if c.records_empty)
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[dict[str, Any]]:
@@ -123,6 +139,7 @@ def run_longmemeval(
                 actual_answer=actual_answer,
                 verdict=judge_result.verdict,
                 reasoning=judge_result.reasoning,
+                records_empty=not query_result.records,
             )
         )
 

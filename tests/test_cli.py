@@ -56,6 +56,51 @@ def test_run_with_single_backend(tmp_path: Path) -> None:
     assert list(data["results"].keys()) == ["mem0"]
 
 
+def test_run_surfaces_empty_or_lost_signal_in_json_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """A configured backend whose store()/update() calls succeed (200, no
+    exception) but whose search always comes back empty must surface the
+    new EMPTY_OR_LOST/records_empty signal in the JSON report -- not get
+    silently folded into not_applicable_rate or an ordinary miss."""
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/",
+        json={"id": "mem-x"},
+        is_reusable=True,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/search/",
+        json={"results": []},
+        is_reusable=True,
+    )
+    httpx_mock.add_response(
+        method="PUT",
+        is_reusable=True,
+        json={"id": "mem-x"},
+    )
+
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main, ["run", "--backends", "mem0", "--eval", "all", "--output", str(out_path)]
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    evals = data["results"]["mem0"]["evals"]
+
+    assert evals["contradiction"]["empty_or_lost_rate"] == 1.0
+    assert evals["contradiction"]["not_applicable_rate"] == 0.0
+    assert all(c["signal"] == "empty_or_lost" for c in evals["contradiction"]["cases"])
+
+    assert evals["longmemeval"]["n_records_empty"] == len(evals["longmemeval"]["cases"])
+    assert all(c["records_empty"] for c in evals["longmemeval"]["cases"])
+    assert evals["locomo"]["n_records_empty"] == len(evals["locomo"]["cases"])
+    assert all(c["records_empty"] for c in evals["locomo"]["cases"])
+
+
 def test_run_rejects_unknown_backend() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["run", "--backends", "not-a-real-backend"])
