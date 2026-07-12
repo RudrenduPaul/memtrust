@@ -94,15 +94,36 @@ class MemPalaceAdapter(MemoryBackendAdapter):
         return self._palace
 
     def store(
-        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        *,
+        verify: bool = False,
     ) -> StoreResult:
+        """Store a memory, optionally confirming it durably landed.
+
+        `verify` is opt-in and defaults to False -- this adapter is the
+        reference implementation for MemoryBackendAdapter.verify_store()
+        specifically because MemPalace is the vendor whose silent-write
+        bugs (NUL-byte checkpoint corruption, stale/self-deadlocked
+        locks) motivated adding it: both bugs let `remember()` return
+        normally while the write itself was dropped or corrupted, which
+        looked identical to weaker model recall until now. Passing
+        `verify=True` costs one extra `recall()` call per `store()` call
+        -- see docs/methodology.md for why that stays opt-in rather than
+        the default.
+        """
         timer = self._timed()
         palace = self._get_palace()
         try:
             memory_id = palace.remember(room=session_id, content=content, metadata=metadata or {})
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
-        return StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms())
+        result = StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms())
+        if verify:
+            result.verified = self.verify_store(result, session_id, content)
+        return result
 
     def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
         timer = self._timed()

@@ -152,6 +152,39 @@ relying on its output.
 | `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** |
 | `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). **This is the adapter most likely to need correction against a live instance.** |
 
+## Read-after-write verification (opt-in, off by default)
+
+`store()` returning without raising `BackendAPIError` has never been proof that a write is
+durable or even retrievable. A vendor can return a normal success response while silently
+dropping or corrupting the write server-side -- this is not hypothetical: two independently
+root-caused MemPalace bug classes did exactly this (checkpoint corruption via NUL bytes in
+stored content; stale/self-deadlocked locks that no-op a write). Neither raises an exception.
+Left undetected, a silently dropped write just looks like weaker recall on whatever eval touches
+it later, and gets misattributed to model quality instead of a backend durability bug.
+
+`MemoryBackendAdapter.verify_store()` (in `src/memtrust/adapters/base.py`) closes that gap: it
+issues a `query()` immediately after a `store()` call and checks whether the just-written content
+is actually retrievable, reporting the result on `StoreResult.verified` (`True`/`False`). If an
+adapter never attempts verification, `StoreResult.verified` stays `None` -- read as "not measured,"
+never as an implicit pass, the same rule this document already applies to `JudgeVerdict.NOT_RUN`
+and `accuracy=None` above.
+
+**Why this is opt-in, not automatic.** Turning read-after-write verification on unconditionally
+for every `store()` call would silently double the number of vendor API calls (and latency) memtrust
+itself makes against every backend under test on every eval run. A benchmark harness that quietly
+doubled its own cost footprint without the caller asking for it would be its own credibility
+problem -- exactly the kind of unstated cost this document exists to surface, not hide. So
+verification only runs when a caller explicitly passes `verify=True` to an adapter's `store()`; the
+default behavior of every adapter, including MemPalace, is completely unchanged from before this
+was added.
+
+**Reference implementation:** `mempalace_adapter.py`'s `store()` accepts a keyword-only
+`verify: bool = False` parameter and calls `verify_store()` when `verify=True`, since MemPalace is
+the specific vendor whose silent-write bugs motivated this feature. The other three adapters
+(`mem0_adapter.py`, `zep_graphiti_adapter.py`, `openviking_adapter.py`) have not been wired up yet --
+`verify_store()` is available on the shared base class for any of them to adopt the same way, but
+doing so is a separate, adapter-by-adapter contribution, not implied by this change.
+
 None of the above uncertainty is hidden behind a passing test. The adapters' unit tests mock the
 adapter's own HTTP layer (or inject a fake object matching the documented interface for MemPalace)
 -- they confirm the adapter's *internal logic* is correct given a response shape, not that the
