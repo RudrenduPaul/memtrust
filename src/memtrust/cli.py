@@ -32,6 +32,7 @@ from memtrust.adapters.base import BackendNotConfiguredError, MemoryBackendAdapt
 from memtrust.evals.contradiction import ContradictionEvalResult, run_contradiction_eval
 from memtrust.evals.locomo import LoCoMoResult, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
+from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_resource_sync_eval
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
@@ -42,7 +43,7 @@ console = Console()
 #: ADAPTER_REGISTRY; "all" expands to this list, not to every registry key,
 #: so a backend is never silently evaluated twice under two names.
 ALL_BACKENDS = ["mempalace", "mem0", "zep", "openviking"]
-ALL_EVALS = ["longmemeval", "locomo", "contradiction"]
+ALL_EVALS = ["longmemeval", "locomo", "contradiction", "resource_sync_safety"]
 
 
 def _resolve_backend_names(backends_arg: str) -> list[str]:
@@ -119,6 +120,27 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for c in result.case_results
             ],
         }
+    if isinstance(result, ResourceSyncEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "user_file_deletion_rate": result.user_file_deletion_rate,
+            "preserved_rate": result.preserved_rate,
+            "overwritten_unchanged_rate": result.overwritten_unchanged_rate,
+            "n_files": len(result.file_results),
+            "files": [
+                {
+                    "case_id": f.case_id,
+                    "path_suffix": f.path_suffix,
+                    "origin": f.origin,
+                    "signal": str(f.signal),
+                    "error": f.error,
+                }
+                for f in result.file_results
+            ],
+        }
     raise TypeError(f"no serializer for {type(result)!r}")
 
 
@@ -137,7 +159,10 @@ def main() -> None:
     "eval_arg",
     default="all",
     show_default=True,
-    help="Comma-separated eval list (longmemeval,locomo,contradiction), or 'all'.",
+    help=(
+        "Comma-separated eval list "
+        "(longmemeval,locomo,contradiction,resource_sync_safety), or 'all'."
+    ),
 )
 @click.option(
     "--output",
@@ -235,6 +260,19 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
             else:
                 console.print("    N/A (no scoreable cases)")
 
+        if "resource_sync_safety" in eval_names:
+            console.print(f"  Running Resource-Sync Safety against {backend_name}...")
+            rss_result = run_resource_sync_eval(adapter)
+            backend_report["evals"]["resource_sync_safety"] = _serialize_eval_result(rss_result)
+            if rss_result.skipped:
+                console.print(f"    SKIPPED: {rss_result.skip_reason}")
+            else:
+                dr = rss_result.user_file_deletion_rate
+                if dr is not None:
+                    console.print(f"    user-file deletion rate: {dr:.1%}")
+                else:
+                    console.print("    N/A (no scoreable files)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -275,16 +313,18 @@ def report(report_path: Path) -> None:
     table.add_column("LongMemEval")
     table.add_column("LoCoMo")
     table.add_column("Contradiction (flagged/overwrite/stale/empty-or-lost)")
+    table.add_column("Resource-Sync (user-file deletion rate)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
-            table.add_row(backend_name, "SKIPPED", "-", "-", "-")
+            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-")
             continue
 
         evals = backend_data.get("evals", {})
         lme = evals.get("longmemeval", {})
         locomo = evals.get("locomo", {})
         contra = evals.get("contradiction", {})
+        rss = evals.get("resource_sync_safety", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -297,12 +337,19 @@ def report(report_path: Path) -> None:
             if contra
             else "-"
         )
+        if rss.get("skipped"):
+            rss_str = "SKIPPED (unsupported)"
+        elif rss:
+            rss_str = _fmt_pct(rss.get("user_file_deletion_rate"))
+        else:
+            rss_str = "-"
         table.add_row(
             backend_name,
             "configured",
             _fmt_pct(lme.get("accuracy")) if lme else "-",
             _fmt_pct(locomo.get("accuracy")) if locomo else "-",
             contra_str,
+            rss_str,
         )
 
     console.print(table)

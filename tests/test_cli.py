@@ -12,7 +12,7 @@ import pytest
 from click.testing import CliRunner
 from pytest_httpx import HTTPXMock
 
-from memtrust.cli import main
+from memtrust.cli import ALL_EVALS, main
 
 
 @pytest.fixture(autouse=True)
@@ -153,6 +153,32 @@ def test_default_output_path_when_not_specified(
     assert result.exit_code == 0
     generated = list(tmp_path.glob("memtrust-report-*.json"))
     assert len(generated) == 1
+
+
+def test_resource_sync_safety_registered_in_eval_list() -> None:
+    assert "resource_sync_safety" in ALL_EVALS
+
+
+def test_run_resource_sync_safety_skips_cleanly_for_unsupported_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mem0 has no resource-mirror concept (supports_resource_sync defaults
+    to False), so this exercises the CLI's end-to-end skip path for the
+    new eval without needing any HTTP mocking -- the eval must never call
+    the unimplemented list_resource_paths()/trigger_resync() methods."""
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        ["run", "--backends", "mem0", "--eval", "resource_sync_safety", "--output", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    rss = data["results"]["mem0"]["evals"]["resource_sync_safety"]
+    assert rss["skipped"] is True
+    assert rss["user_file_deletion_rate"] is None
+    assert rss["n_files"] == 0
 
 
 def test_run_against_configured_backend_full_flow(
