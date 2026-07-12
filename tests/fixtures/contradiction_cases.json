@@ -47,7 +47,7 @@
       "session_id": "contra-session-5",
       "subject": "team lead",
       "initial_fact": "Priya is the lead on the payments team.",
-      "contradicting_fact": "Priya moved teams. Sam is now the lead on the payments team.",
+      "contradicting_fact": "Leadership on the payments team changed. Sam is now the lead.",
       "query": "Who leads the payments team?",
       "initial_value": "Priya",
       "updated_value": "Sam"
