@@ -35,6 +35,7 @@ from memtrust.adapters.base import (
     BackendAPIError,
     BackendNotConfiguredError,
     ConflictSignal,
+    DeleteResult,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -144,4 +145,29 @@ class MemPalaceAdapter(MemoryBackendAdapter):
         new_id = str(result.get("id", memory_id))
         return UpdateResult(
             memory_id=new_id, acknowledged=True, latency_ms=timer.elapsed_ms(), raw=result
+        )
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        """NOT IMPLEMENTED for MemPalace.
+
+        Unlike store/query/update, which are written against MemPalace's
+        documented *concepts* (remember/recall/invalidate) even though
+        the exact Python method names are unverified (see module
+        docstring), no delete/forget concept was surfaced in this build's
+        research pass at all -- there is nothing to reconstruct a
+        best-effort call against, not even an uncertain one. Rather than
+        guess a `palace.forget(...)` call that may not exist on the real
+        package, this raises a clear, typed error so callers (and the
+        eval layer) can distinguish "not supported yet" from a network
+        failure, same as every other BackendAPIError.
+
+        A contributor who confirms MemPalace's real deletion API should
+        implement this properly and remove this docstring/raise -- see
+        docs/methodology.md for the uncertainty-tracking convention.
+        """
+        raise BackendAPIError(
+            self.name,
+            "delete() is not implemented for MemPalace: no documented "
+            "delete/forget primitive was confirmed for the `mempalace` "
+            "package during this adapter's build. See docs/methodology.md.",
         )

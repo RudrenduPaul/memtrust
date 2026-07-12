@@ -35,6 +35,7 @@ from memtrust.adapters.base import (
     BackendAPIError,
     BackendNotConfiguredError,
     ConflictSignal,
+    DeleteResult,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -144,6 +145,26 @@ class ZepGraphitiAdapter(MemoryBackendAdapter):
             acknowledged=True,
             latency_ms=timer.elapsed_ms(),
             raw=result.raw,
+        )
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        # Best-effort reconstruction, same confidence level as store()'s
+        # /graph/episodes path above: Zep's hosted API is not confirmed
+        # here to expose a documented "delete episode" verb distinct from
+        # its bi-temporal invalidate-on-contradiction behavior (see the
+        # module docstring). This targets the REST path symmetrical with
+        # store()'s POST /graph/episodes -- DELETE /graph/episodes/{uuid}
+        # -- and should be corrected by whoever verifies it against a
+        # live Zep instance if the real surface differs.
+        timer = self._timed()
+        try:
+            resp = self._http.delete(f"/graph/episodes/{memory_id}")
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+        except httpx.HTTPError as exc:
+            raise BackendAPIError(self.name, str(exc)) from exc
+        return DeleteResult(
+            success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data
         )
 
     def close(self) -> None:
