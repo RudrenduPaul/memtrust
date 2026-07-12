@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
@@ -21,7 +22,7 @@ from memtrust.adapters.base import (
     StoreResult,
     UpdateResult,
 )
-from memtrust.adapters.mem0_adapter import Mem0Adapter
+from memtrust.adapters.mem0_adapter import Mem0Adapter, Mem0SelfHostedAdapter
 from memtrust.adapters.mempalace_adapter import MemPalaceAdapter
 from memtrust.adapters.openviking_adapter import OpenVikingAdapter
 from memtrust.adapters.zep_graphiti_adapter import ZepGraphitiAdapter
@@ -165,6 +166,203 @@ def test_mem0_delete_many_aggregates_all_results_via_real_http_calls(
     assert len(results) == 3
     assert [r.memory_id for r in results] == ["mem-1", "mem-2", "mem-3"]
     assert [r.success for r in results] == [True, False, True]
+
+
+def test_mem0_hosted_adapter_unaffected_by_selfhosted_addition(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Regression guard: adding Mem0SelfHostedAdapter must not change one
+    byte of Mem0Adapter's request shape. Base URL stays api.mem0.ai, the
+    route stays under /v1/, and query() still only accepts the base
+    (session_id, query, top_k) signature -- passing run_id would be a
+    TypeError, proving hosted and self-hosted did not merge into a single
+    branchy method.
+    """
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    adapter = Mem0Adapter()
+    assert adapter._http.base_url == "https://api.mem0.ai"
+
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/search/",
+        json={"results": [{"id": "mem-1", "memory": "I like tea.", "score": 0.9}]},
+    )
+    query_result = adapter.query("session-1", "what do I like?")
+    assert len(query_result.records) == 1
+
+    with pytest.raises(TypeError):
+        adapter.query("session-1", "what do I like?", run_id="")  # type: ignore[call-arg]
+    adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# Mem0SelfHostedAdapter
+# ---------------------------------------------------------------------------
+
+
+def test_mem0_selfhosted_raises_when_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MEM0_SELFHOSTED_BASE_URL", raising=False)
+    with pytest.raises(BackendNotConfiguredError) as excinfo:
+        Mem0SelfHostedAdapter()
+    assert excinfo.value.missing_env_var == "MEM0_SELFHOSTED_BASE_URL"
+    assert excinfo.value.backend_name == "mem0_selfhosted"
+
+
+def test_mem0_selfhosted_store_query_update_use_unprefixed_routes(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """The self-hosted OSS server mounts its FastAPI router at unprefixed
+    paths (POST /memories, POST /search, PUT /memories/{id}), confirmed
+    against the real server/main.py source -- not /v1/memories/... like
+    the hosted Platform API. pytest-httpx matches the exact URL, so this
+    fails loudly if the adapter ever regresses to the hosted route shape.
+    """
+    monkeypatch.setenv("MEM0_SELFHOSTED_BASE_URL", "http://localhost:8888")
+    adapter = Mem0SelfHostedAdapter()
+    assert adapter._http.base_url == "http://localhost:8888"
+
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:8888/memories",
+        json={"id": "mem-1"},
+    )
+    store_result = adapter.store("session-1", "I like tea.")
+    assert store_result.memory_id == "mem-1"
+
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:8888/search",
+        json={"results": [{"id": "mem-1", "memory": "I like tea.", "score": 0.9}]},
+    )
+    query_result = adapter.query("session-1", "what do I like?")
+    assert len(query_result.records) == 1
+    assert query_result.records[0].content == "I like tea."
+    assert query_result.conflict_signal == ConflictSignal.NOT_APPLICABLE
+
+    httpx_mock.add_response(
+        method="PUT",
+        url="http://localhost:8888/memories/mem-1",
+        json={"id": "mem-1"},
+    )
+    update_result = adapter.update("session-1", "mem-1", "I like coffee now.")
+    assert update_result.acknowledged is True
+    adapter.close()
+
+
+def test_mem0_selfhosted_query_with_empty_string_run_id_and_agent_id(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Deliberately-empty-string run_id/agent_id must not crash, and must
+    reach the server as literal empty strings inside `filters` (an
+    `is not None` check, not a truthy check) -- this is the exact filter
+    shape mem0ai/mem0#5973 (entity-id filter scoping) describes, and the
+    self-hosted server's own deprecated-field merge path is documented
+    (see module docstring) to silently drop falsy values here instead.
+    memtrust must not reproduce that same drop itself, or the eval could
+    never observe the vendor's behavior.
+    """
+    monkeypatch.setenv("MEM0_SELFHOSTED_BASE_URL", "http://localhost:8888")
+    adapter = Mem0SelfHostedAdapter()
+
+    captured_request: dict[str, Any] = {}
+
+    def _capture(request: Any) -> Any:
+        import json as _json
+
+        captured_request.update(_json.loads(request.content))
+        return httpx.Response(status_code=200, json={"results": []})
+
+    httpx_mock.add_callback(_capture, method="POST", url="http://localhost:8888/search")
+
+    result = adapter.query("session-1", "what do I like?", run_id="", agent_id="")
+
+    assert result.records == []
+    assert captured_request["filters"] == {"user_id": "session-1", "run_id": "", "agent_id": ""}
+    adapter.close()
+
+
+def test_mem0_selfhosted_query_omits_run_id_and_agent_id_when_not_passed(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("MEM0_SELFHOSTED_BASE_URL", "http://localhost:8888")
+    adapter = Mem0SelfHostedAdapter()
+
+    captured_request: dict[str, Any] = {}
+
+    def _capture(request: Any) -> Any:
+        import json as _json
+
+        captured_request.update(_json.loads(request.content))
+        return httpx.Response(status_code=200, json={"results": []})
+
+    httpx_mock.add_callback(_capture, method="POST", url="http://localhost:8888/search")
+
+    adapter.query("session-1", "what do I like?")
+
+    assert captured_request["filters"] == {"user_id": "session-1"}
+    adapter.close()
+
+
+def test_mem0_selfhosted_query_passes_threshold_when_given(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("MEM0_SELFHOSTED_BASE_URL", "http://localhost:8888")
+    adapter = Mem0SelfHostedAdapter()
+
+    captured_request: dict[str, Any] = {}
+
+    def _capture(request: Any) -> Any:
+        import json as _json
+
+        captured_request.update(_json.loads(request.content))
+        return httpx.Response(status_code=200, json={"results": []})
+
+    httpx_mock.add_callback(_capture, method="POST", url="http://localhost:8888/search")
+
+    adapter.query("session-1", "what do I like?", threshold=0.4)
+
+    assert captured_request["threshold"] == 0.4
+    adapter.close()
+
+
+def test_mem0_selfhosted_store_raises_backend_api_error_on_http_failure(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("MEM0_SELFHOSTED_BASE_URL", "http://localhost:8888")
+    adapter = Mem0SelfHostedAdapter()
+    httpx_mock.add_response(status_code=500)
+    with pytest.raises(BackendAPIError):
+        adapter.store("session-1", "content")
+    adapter.close()
+
+
+def test_mem0_selfhosted_uses_explicit_base_url_and_api_key_over_env(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.delenv("MEM0_SELFHOSTED_BASE_URL", raising=False)
+    monkeypatch.delenv("MEM0_SELFHOSTED_API_KEY", raising=False)
+    adapter = Mem0SelfHostedAdapter(base_url="http://example-host:9000", api_key="secret-key")
+    assert adapter._http.base_url == "http://example-host:9000"
+    assert adapter._http.headers["x-api-key"] == "secret-key"
+    adapter.close()
+
+
+def test_mem0_selfhosted_delete_uses_unprefixed_route(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    # Same delete_many() aggregation contract as the hosted adapter, but
+    # against the self-hosted server's unprefixed DELETE /memories/{id}
+    # route rather than /v1/memories/{id}/.
+    monkeypatch.setenv("MEM0_SELFHOSTED_BASE_URL", "http://localhost:8888")
+    adapter = Mem0SelfHostedAdapter()
+    httpx_mock.add_response(
+        method="DELETE",
+        url="http://localhost:8888/memories/mem-1",
+        json={"message": "deleted"},
+    )
+    result = adapter.delete("mem-1")
+    assert result.success is True
+    assert result.memory_id == "mem-1"
     adapter.close()
 
 

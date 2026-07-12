@@ -147,7 +147,8 @@ relying on its output.
 
 | Adapter | Confidence | What's confirmed | What's best-effort |
 |---|---|---|---|
-| `mem0_adapter.py` | **High** | `MemoryClient(api_key=...)` reading `MEM0_API_KEY`, `.add()`/`.search()`/`.update()` method names and behavior, confirmed via docs.mem0.ai and the June 2026 SDK v2.0.8 release notes. Mem0's internal ADD/UPDATE/DELETE memory-pipeline decision is documented vendor behavior. | Exact REST path strings (`/v1/memories/`, `/v1/memories/search/`) are a best-effort reconstruction of what the documented SDK wraps, not copied from an OpenAPI spec. |
+| `mem0_adapter.py` (`Mem0Adapter`, hosted Platform API) | **High** | `MemoryClient(api_key=...)` reading `MEM0_API_KEY`, `.add()`/`.search()`/`.update()` method names and behavior, confirmed via docs.mem0.ai and the June 2026 SDK v2.0.8 release notes. Mem0's internal ADD/UPDATE/DELETE memory-pipeline decision is documented vendor behavior. | Exact REST path strings (`/v1/memories/`, `/v1/memories/search/`) are a best-effort reconstruction of what the documented SDK wraps, not copied from an OpenAPI spec. |
+| `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
 | `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** |
 | `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). **This is the adapter most likely to need correction against a live instance.** |
@@ -199,6 +200,39 @@ hosted API (`ZEP_API_KEY`) wraps Graphiti and fits that contract. If self-hosted
 is wanted later, it should be a second adapter (e.g. `zep_graphiti_selfhosted_adapter.py`) with its
 own configuration story, not a silent branch inside this one.
 
+**Why Mem0 has two adapters, `Mem0Adapter` and `Mem0SelfHostedAdapter`, not one with a deployment
+flag.** Mem0 ships two materially different deployment shapes: the hosted Platform API
+(`api.mem0.ai`, `/v1/...` routes, `MEM0_API_KEY` required) and a self-hosted OSS `server/` FastAPI
+wrapper (unprefixed routes, no auth by default, run by the user on their own infrastructure). A
+meaningful fraction of the most rigorous, best-evidenced Mem0 bug reports memtrust's outreach
+turned up -- entity-id filter scoping (mem0ai/mem0#5973), multi-entity-delete truncation
+(#5936/#5970), embedding-dimension mismatch (#4297), and search-threshold inversion (#4453) -- live
+entirely in the self-hosted server/`Memory` class code paths that `Mem0Adapter` never talks to and,
+before this change, had no configuration surface to reach. Following the same precedent this
+document already sets for Zep below ("a second adapter ... with its own configuration story, not a
+silent branch inside this one"), `Mem0SelfHostedAdapter` is a separate class, gated on
+`MEM0_SELFHOSTED_BASE_URL` (a base URL, not an API key -- the server has no auth by default, the
+same reasoning given below for MemPalace's storage-path gate) with an optional
+`MEM0_SELFHOSTED_API_KEY` for deployments that do front it with auth.
+
+Of the four bug classes above, this change makes two directly exercisable through the adapter's own
+code: `Mem0SelfHostedAdapter.query()` accepts optional `run_id`/`agent_id` parameters, including a
+deliberately empty string, and always places them inside the JSON `filters` dict using an
+`is not None` check rather than a truthy check -- so a caller's empty string reaches the server
+intact instead of being silently dropped the way the server's own deprecated top-level-field merge
+path drops falsy values (this asymmetry is the concrete, source-confirmed shape of #5973, described
+in full in `mem0_adapter.py`'s module docstring). The same method accepts an optional `threshold`
+parameter, passed straight through to the confirmed `SearchRequest.threshold` field, which is what
+makes #4453 (threshold inversion) reachable -- `Mem0Adapter` (hosted) has no equivalent parameter.
+The other two bug classes become reachable only in the weaker sense that eval traffic now has a
+route to a self-hosted instance at all: #4297 (dimension mismatch) lives in self-hosted vector-store
+configuration this adapter has no parameter surface to trigger directly, and #5936/#5970
+(multi-entity-delete truncation) requires a `delete()` operation that does not exist on
+`MemoryBackendAdapter` today -- adding one is a larger interface change than this backlog item
+scopes to, and is called out here as unfinished rather than silently left out. See the confidence
+table above and `mem0_adapter.py`'s module docstring for exactly what was and was not confirmed
+against live source.
+
 **Why MemPalace's "configuration" is a storage path, not an API key.** MemPalace is genuinely
 local-first and documented as requiring no API key at all. Forcing it to read a fake API key
 env var to match the other three adapters would misrepresent how the product actually works.
@@ -222,9 +256,20 @@ Before publishing any run's numbers, the honest question is asked and answered h
 methodology, could they point to a specific,
 defensible flaw?*
 
-As of this writing, the most defensible objection would be: two of the four adapters
+As of this writing, the most defensible objection would be: two of the five adapters
 (MemPalace, OpenViking) are built against best-effort interpretations of documented concepts
 rather than a confirmed API reference, and their output should not be treated as authoritative
 until someone verifies the exact wire format against a live instance. That objection is valid,
 which is exactly why it's stated plainly in the confidence table above rather than left for a
 vendor or a user to discover on their own.
+
+`Mem0SelfHostedAdapter` deserves its own version of the same objection, even though its route
+shape was confirmed against real source rather than documentation: it has never been run against a
+live self-hosted Mem0 instance in this environment, `main` is a moving target that can drift from
+any given deployment, and two of the four bug classes motivating this adapter's addition
+(dimension mismatch, multi-entity-delete truncation) are not directly exercised by any code this
+adapter adds -- only made reachable in principle by routing traffic at a self-hosted server at all,
+and in the delete case, not reachable at all without an interface change this backlog item did not
+make. Anyone relying on this adapter to reproduce a specific self-hosted bug report should verify
+against a live instance first, not take the source-code read as equivalent to a live-tested
+integration.
