@@ -142,15 +142,27 @@ def classify_case(
     Returns (final_signal, contains_initial_value, contains_updated_value).
 
     Cross-checks the adapter's self-reported `conflict_signal` against the
-    actual retrieved text rather than trusting it outright:
+    actual retrieved text rather than trusting it outright, and -- where
+    the text alone is ambiguous -- consults per-record adapter metadata
+    (`MemoryRecord.metadata`) as corroborating evidence rather than a bare
+    self-report. A bi-temporal backend like Graphiti/Zep stamps a
+    superseded edge's `invalid_at` field in that metadata even when the
+    edge's raw text doesn't literally contain the case's old-value string
+    (paraphrased extraction) or when the fixed-size top-k window makes the
+    plain substring signal unreliable. That per-record marker is concrete
+    adapter-reported evidence, unlike the adapter's bare top-level
+    `conflict_signal` enum, which is never trusted on its own:
 
       * If the retrieved content contains BOTH the old and new value, the
         contradiction is visible in the response regardless of what the
         adapter claims -- classified FLAGGED.
-      * If it contains only the new value, the backend resolved the
-        conflict invisibly -- SILENT_OVERWRITE, even if the adapter
-        reported FLAGGED (an adapter claiming a flag with no evidence of
-        one in the actual content is not taken at face value).
+      * If it contains only the new value, that normally reads as a
+        silent overwrite -- SILENT_OVERWRITE. But if any retrieved record
+        carries invalidation metadata (e.g. Graphiti's `invalid_at`), the
+        backend did preserve the old fact bi-temporally even though this
+        eval's literal substring match on the case's old-value string
+        didn't pick it up -- that corroborated signal reclassifies the
+        case as FLAGGED instead of a false-negative silent overwrite.
       * If it contains only the old value, the backend never picked up
         the update at all from the caller's perspective -- SERVED_STALE.
       * If it contains neither and the adapter returned zero records at
@@ -165,20 +177,29 @@ def classify_case(
         classified EMPTY_OR_LOST, distinct from NOT_APPLICABLE, and never
         silently folded into an ordinary miss.
       * If it contains neither but the adapter DID return records (just
-        not ones containing either value), falls back to the adapter's
-        own NOT_APPLICABLE signal, or NOT_APPLICABLE regardless of what
-        the adapter claimed -- an adapter claiming FLAGGED with zero
-        matching content is not credible evidence of a flag, so that
-        specific combination is downgraded too, not silently upgraded to
-        a passing score.
+        not ones containing either value): if any retrieved record
+        carries invalidation metadata, that is still concrete evidence of
+        bi-temporal preservation even though neither value's literal text
+        matched -- FLAGGED. Otherwise this falls back to NOT_APPLICABLE (a
+        genuine "this eval could not observe anything meaningful here").
+        An adapter's bare top-level `conflict_signal` claim with no
+        corroborating record metadata and no matching text is not
+        credible evidence on its own and is not upgraded to a passing
+        score. This branch used to collapse to NOT_APPLICABLE
+        unconditionally regardless of metadata (dead code -- see git
+        history); it now genuinely differentiates on concrete, per-record
+        adapter metadata.
     """
     content = " ".join(r.content for r in query_result.records).lower()
     has_initial = case.initial_value.lower() in content
     has_updated = case.updated_value.lower() in content
+    has_invalidation_metadata = any(r.metadata.get("invalid_at") for r in query_result.records)
 
     if has_initial and has_updated:
         return ConflictSignal.FLAGGED, has_initial, has_updated
     if has_updated and not has_initial:
+        if has_invalidation_metadata:
+            return ConflictSignal.FLAGGED, has_initial, has_updated
         return ConflictSignal.SILENT_OVERWRITE, has_initial, has_updated
     if has_initial and not has_updated:
         return ConflictSignal.SERVED_STALE, has_initial, has_updated
@@ -190,14 +211,14 @@ def classify_case(
         # see ConflictSignal.EMPTY_OR_LOST for the distinction.
         return ConflictSignal.EMPTY_OR_LOST, has_initial, has_updated
 
-    # Records came back, just none of them matched either value. Defer to
-    # what the adapter itself reported rather than guessing -- but an
-    # adapter claiming FLAGGED with zero matching content is not credible
-    # evidence of a flag, so that specific combination is downgraded to
-    # NOT_APPLICABLE (a genuine "this eval could not observe anything
-    # meaningful here"), not silently upgraded to a passing score.
-    if query_result.conflict_signal == ConflictSignal.NOT_APPLICABLE:
-        return ConflictSignal.NOT_APPLICABLE, has_initial, has_updated
+    # Records came back, just none of them matched either value as plain
+    # text. This used to collapse straight to NOT_APPLICABLE regardless of
+    # what the adapter reported (dead code -- see git history). It now
+    # genuinely differentiates on concrete, per-record adapter metadata: a
+    # bi-temporal backend can still have preserved the old fact even when
+    # neither value's literal text matched.
+    if has_invalidation_metadata:
+        return ConflictSignal.FLAGGED, has_initial, has_updated
     return ConflictSignal.NOT_APPLICABLE, has_initial, has_updated
 
 
