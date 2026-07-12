@@ -16,6 +16,7 @@ This matters because it changes what a number *means*.
 | Eval runners against the bundled synthetic fixtures | Yes, one vendor API key per backend under test | `store()`/`query()`/`update()` call the real vendor API. Without a key, the adapter raises `BackendNotConfiguredError` and the CLI reports SKIPPED. |
 | LLM-judge scoring (LongMemEval, LoCoMo) | Yes, `MEMTRUST_JUDGE_API_KEY` | Without it, `judge_answer()` returns `JudgeVerdict.NOT_RUN` for every case. The eval still runs (facts get stored and queried against the real backend) but nothing gets graded, and `accuracy` is reported as `None`, not as 0%. |
 | Contradiction-detection eval | Yes, one vendor API key | No LLM judge involved -- classification is done by direct substring comparison against the known fixture values (see below), which is cheaper and more auditable than an LLM judge for this specific eval. |
+| Compression/round-trip-fidelity eval | Yes, one vendor API key (more if the backend declares more than one `supported_modes` entry) | No LLM judge involved -- fidelity is scored by a direct, deterministic text-similarity ratio against the literal stored content (see below). **Has not been run against any live backend as of this writing.** |
 | Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
@@ -79,6 +80,32 @@ vendor's real API, or is explicitly labeled as not yet measured.
 - **Extending this eval:** adding more cases means adding entries to the fixture file with the
   same five fields. No code change is required. See CONTRIBUTING.md.
 
+### MemTrust Compression/Round-Trip-Fidelity Eval (original)
+
+- **Not derived from any published dataset.** Built specifically to test the second overclaim
+  mempalace/mempalace#27 documents (see README.md's "Why this exists" section): a "lossless"
+  compression claim that measured 12.4 percentage points lower in practice under a compressed
+  operating mode. Neither LongMemEval, LoCoMo, nor the contradiction eval measures literal
+  reconstruction fidelity -- they measure recall and conflict-handling, not "did the exact text
+  survive the round trip."
+- **Fixture:** `tests/fixtures/compression_cases.json` -- 5 hand-written cases covering short,
+  long/multi-sentence, special-character/unicode, and structured/numeric content, each just a
+  `case_id` and a `content` string (see Scoring logic below).
+- **Requires the new `mode` parameter.** `MemoryBackendAdapter.store()`/`query()` (see
+  `src/memtrust/adapters/base.py`) accept an optional `mode: str | None = None` parameter, and
+  `MemoryBackendAdapter.supported_modes` lets an adapter declare which mode strings it actually
+  understands. Adapters without mode variants (the default: `supported_modes == ()`) accept and
+  ignore the parameter -- a purely additive, backward-compatible change to the shared interface.
+  `MemPalaceAdapter.supported_modes` is `("raw", "AAAK")`, the two mode names
+  mempalace/mempalace#27 itself uses; those names come from that community issue, not a confirmed
+  API parameter in the installed `mempalace` package -- see `mempalace_adapter.py`'s module
+  docstring for the full caveat, which follows the same LOW-confidence pattern already documented
+  for that adapter's method names below.
+- **Extending this eval:** adding more cases means adding entries to the fixture file with a
+  `case_id` and `content` field. Adding a mode to an adapter means adding a string to that
+  adapter's `supported_modes` tuple and threading `mode` through to the real vendor call -- no
+  change to `evals/compression.py` itself is required either way. See CONTRIBUTING.md.
+
 ## Contradiction-detection scoring logic (the eval this project exists for)
 
 Implemented in `src/memtrust/evals/contradiction.py`, function `classify_case()`. For every case:
@@ -106,6 +133,35 @@ adapter that reports `FLAGGED` while the actual returned content contains neithe
 downgraded to `NOT_APPLICABLE`, not credited with a pass it did not earn. No backend gets a
 "verified" claim it cannot support -- that rule applies at the eval-scoring level, not just the
 README level.
+
+## Compression/round-trip-fidelity scoring logic
+
+Implemented in `src/memtrust/evals/compression.py`, function `run_compression_eval()`. For every
+mode an adapter reports supporting (`adapter.supported_modes`, or a single synthetic `"default"`
+mode if that tuple is empty), and for every case in the fixture:
+
+1. Store the case's `content` via `adapter.store(session_id, content, mode=mode)` (`mode=None`
+   for the synthetic `"default"` mode).
+2. Query for it via `adapter.query(session_id, content, top_k=5, mode=mode)`.
+3. Select the retrieved text: prefer the record whose `memory_id` matches what `store()` returned,
+   falling back to the top-ranked result -- the shared adapter interface has no get-by-id, only
+   `query()`, so this eval retrieves the same way any other caller would.
+4. Score `fidelity_ratio(original, retrieved)`: a character-level `difflib.SequenceMatcher.ratio()`
+   between the stored and retrieved text. 1.0 means byte-for-byte identical (a genuinely lossless
+   round trip); measurably lower values mean measurable reconstruction loss.
+
+**Why this doesn't use the LLM judge.** A "lossless"/compression-ratio claim is a claim about
+literal reconstruction fidelity, not semantic equivalence -- an LLM judge might rate a paraphrased,
+information-dropping reconstruction as "close enough," which is exactly the leniency this eval
+exists to avoid. `fidelity_ratio()` is deterministic, free, and reproducible without any judge
+credentials, unlike LongMemEval/LoCoMo's accuracy scores.
+
+**What a real run would show.** `CompressionEvalResult.fidelity_drop_pp` reports the percentage-
+point gap between the best- and worst-scoring mode, once at least two modes produce a scoreable
+mean -- this is the number that would reproduce a "96.6% raw vs 84.2% AAAK, 12.4pp drop" style
+comparison. **No such run has been performed against any live backend as of this writing**; every
+number this eval could report is currently unmeasured, the same as every other eval's Benchmarks
+section in the README until live credentials are configured.
 
 ## LLM-judge prompt template
 
@@ -150,7 +206,7 @@ relying on its output.
 | `mem0_adapter.py` (`Mem0Adapter`, hosted Platform API) | **High** | `MemoryClient(api_key=...)` reading `MEM0_API_KEY`, `.add()`/`.search()`/`.update()` method names and behavior, confirmed via docs.mem0.ai and the June 2026 SDK v2.0.8 release notes. Mem0's internal ADD/UPDATE/DELETE memory-pipeline decision is documented vendor behavior. | Exact REST path strings (`/v1/memories/`, `/v1/memories/search/`) are a best-effort reconstruction of what the documented SDK wraps, not copied from an OpenAPI spec. |
 | `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
-| `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** |
+| `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** |
 | `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). **This is the adapter most likely to need correction against a live instance.** |
 
 ## Read-after-write verification (opt-in, off by default)

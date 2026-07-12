@@ -87,8 +87,16 @@ class OpenVikingAdapter(MemoryBackendAdapter):
         return f"memory/{session_id}/{key}"
 
     def store(
-        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
     ) -> StoreResult:
+        # OpenViking's filesystem paradigm has no documented operating-mode
+        # variant -- accepted and ignored (no-op); see
+        # MemoryBackendAdapter.supported_modes.
+        del mode
         timer = self._timed()
         memory_key = _slugify(content)
         payload: dict[str, object] = {
@@ -105,7 +113,10 @@ class OpenVikingAdapter(MemoryBackendAdapter):
         memory_id = str(data.get("path", payload["path"]))
         return StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data)
 
-    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
+        del mode  # no-op, see store() above
         timer = self._timed()
         payload = {"path_prefix": f"viking://memory/{session_id}/", "query": query, "limit": top_k}
         try:

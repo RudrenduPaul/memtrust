@@ -65,8 +65,15 @@ class ZepGraphitiAdapter(MemoryBackendAdapter):
         )
 
     def store(
-        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
     ) -> StoreResult:
+        # Graphiti has no documented operating-mode variant -- accepted
+        # and ignored (no-op); see MemoryBackendAdapter.supported_modes.
+        del mode
         timer = self._timed()
         payload: dict[str, object] = {
             "group_id": session_id,
@@ -85,7 +92,10 @@ class ZepGraphitiAdapter(MemoryBackendAdapter):
         episode_id = str(data.get("uuid", data.get("episode_id", "")))
         return StoreResult(memory_id=episode_id, latency_ms=timer.elapsed_ms(), raw=data)
 
-    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
+        del mode  # no-op, see store() above
         timer = self._timed()
         payload = {"group_id": session_id, "query": query, "limit": top_k}
         try:
