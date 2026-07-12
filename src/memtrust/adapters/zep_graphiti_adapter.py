@@ -123,7 +123,10 @@ class ZepGraphitiAdapter(MemoryBackendAdapter):
         # eval fixture, not this adapter.
         conflict_signal = ConflictSignal.FLAGGED if any_invalidated else ConflictSignal.SERVED_STALE
         return QueryResult(
-            records=records, conflict_signal=conflict_signal, latency_ms=timer.elapsed_ms(), raw=data
+            records=records,
+            conflict_signal=conflict_signal,
+            latency_ms=timer.elapsed_ms(),
+            raw=data,
         )
 
     def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
