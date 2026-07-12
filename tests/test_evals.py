@@ -13,6 +13,7 @@ from pytest_httpx import HTTPXMock
 from memtrust.adapters.base import (
     BackendAPIError,
     ConflictSignal,
+    DeleteResult,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -65,6 +66,9 @@ class RecallAllFakeAdapter(MemoryBackendAdapter):
         result = self.store(session_id, content)
         return UpdateResult(memory_id=result.memory_id, acknowledged=True, latency_ms=0.1)
 
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
 
 class OverwriteFakeAdapter(RecallAllFakeAdapter):
     """Only ever returns the single most recent fact -- simulates a
@@ -115,6 +119,9 @@ class FailingFakeAdapter(MemoryBackendAdapter):
         raise BackendAPIError(self.name, "simulated network failure")
 
     def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        raise BackendAPIError(self.name, "simulated network failure")
+
+    def delete(self, memory_id: str) -> DeleteResult:
         raise BackendAPIError(self.name, "simulated network failure")
 
 

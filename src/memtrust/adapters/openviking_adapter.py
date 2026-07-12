@@ -38,6 +38,7 @@ from memtrust.adapters.base import (
     BackendAPIError,
     BackendNotConfiguredError,
     ConflictSignal,
+    DeleteResult,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -135,6 +136,26 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             raise BackendAPIError(self.name, str(exc)) from exc
         return UpdateResult(
             memory_id=memory_id, acknowledged=True, latency_ms=timer.elapsed_ms(), raw=data
+        )
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        # Best-effort reconstruction against the same viking:// filesystem
+        # paradigm store()/update() above are written against: this build's
+        # research pass did not surface a confirmed "delete a memory"
+        # method name (see module docstring), so this targets the plain
+        # filesystem-delete symmetrical with /v1/fs/write. Whoever verifies
+        # this adapter against a live instance should correct the path if
+        # OpenViking's real client exposes something else.
+        timer = self._timed()
+        payload = {"path": memory_id}
+        try:
+            resp = self._http.post("/v1/fs/delete", json=payload)
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+        except httpx.HTTPError as exc:
+            raise BackendAPIError(self.name, str(exc)) from exc
+        return DeleteResult(
+            success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data
         )
 
     def close(self) -> None:
