@@ -58,8 +58,16 @@ class Mem0Adapter(MemoryBackendAdapter):
         )
 
     def store(
-        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
     ) -> StoreResult:
+        # Mem0 has no documented operating-mode variant to select -- `mode`
+        # is accepted and ignored (no-op) so callers can pass it uniformly
+        # across every adapter. See MemoryBackendAdapter.supported_modes.
+        del mode
         timer = self._timed()
         payload: dict[str, object] = {
             "messages": [{"role": "user", "content": content}],
@@ -76,7 +84,10 @@ class Mem0Adapter(MemoryBackendAdapter):
         memory_id = _extract_memory_id(data)
         return StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data)
 
-    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
+        del mode  # no-op, see store() above
         timer = self._timed()
         payload = {"query": query, "filters": {"user_id": session_id}, "top_k": top_k}
         try:
