@@ -303,3 +303,122 @@ def test_mempalace_get_palace_raises_clear_error_when_package_missing(
     adapter = MemPalaceAdapter()
     with pytest.raises(BackendAPIError, match="not installed"):
         adapter.store("room-1", "content")
+
+
+# ---------------------------------------------------------------------------
+# Read-after-write verification (StoreResult.verified / verify_store)
+# ---------------------------------------------------------------------------
+
+
+def test_store_result_defaults_to_verified_none() -> None:
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    result = adapter.store("room-1", "My dog is named Baxter.")
+    assert result.verified is None
+
+
+def test_mempalace_verify_true_confirms_readable_write() -> None:
+    """(a) verify=True with a mock adapter that returns the just-stored
+    content confirms verified=True."""
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    result = adapter.store("room-1", "My dog is named Baxter.", verify=True)
+    assert result.verified is True
+
+
+def test_mempalace_verify_true_detects_silently_dropped_write() -> None:
+    """(b) verify=True with a mock returning empty/wrong content sets
+    verified=False rather than raising -- this is the exact "store()
+    didn't raise, but the write was silently dropped/corrupted" failure
+    mode (MemPalace issues #1929, #1977) this feature exists to catch.
+    """
+
+    class SilentlyDroppingPalace:
+        """remember() returns a normal memory_id and never raises, but
+        the write never actually lands -- recall() always comes back
+        empty, simulating checkpoint corruption or a stale/self-
+        deadlocked lock silently no-oping the write server-side.
+        """
+
+        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+            return "palace-ghost-1"
+
+        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+            return []
+
+        def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
+            raise NotImplementedError
+
+    adapter = MemPalaceAdapter(palace=SilentlyDroppingPalace())
+    result = adapter.store("room-1", "My dog is named Baxter.", verify=True)
+    assert result.verified is False
+    # Crucially, this must not raise -- a failed verification is a
+    # reported fact about the write, not an exception.
+
+
+def test_mempalace_verify_true_detects_wrong_content_on_readback() -> None:
+    """Same failure mode as above, but recall() returns *something* --
+    just not the content that was actually stored (corruption, not a
+    total drop). Still verified=False, still no exception."""
+
+    class CorruptingPalace:
+        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+            return "palace-corrupt-1"
+
+        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+            return [{"id": "palace-corrupt-1", "content": "\x00\x00\x00", "metadata": {}}]
+
+        def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
+            raise NotImplementedError
+
+    adapter = MemPalaceAdapter(palace=CorruptingPalace())
+    result = adapter.store("room-1", "My dog is named Baxter.", verify=True)
+    assert result.verified is False
+
+
+def test_mempalace_verify_false_by_default_does_not_call_recall() -> None:
+    """(c) verify=False (default) behavior is unchanged from before this
+    fix -- no query() call happens, verified stays None."""
+
+    class RecallTrackingPalace(FakePalace):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recall_call_count = 0
+
+        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+            self.recall_call_count += 1
+            return super().recall(room, query, top_k)
+
+    palace = RecallTrackingPalace()
+    adapter = MemPalaceAdapter(palace=palace)
+
+    result = adapter.store("room-1", "My dog is named Baxter.")
+    assert result.verified is None
+    assert palace.recall_call_count == 0
+
+    # Explicit verify=False must behave identically to the omitted default.
+    result_explicit = adapter.store("room-1", "My cat is named Whiskers.", verify=False)
+    assert result_explicit.verified is None
+    assert palace.recall_call_count == 0
+
+
+def test_verify_store_raises_backend_api_error_when_query_itself_fails() -> None:
+    """A genuine vendor/network failure during the verification query()
+    call must still propagate as BackendAPIError, not be swallowed into
+    verified=False -- only an absent/wrong record on a successful query
+    means "the write was silently dropped," not a query that itself
+    errored."""
+
+    class QueryFailsPalace:
+        def remember(self, room: str, content: str, metadata: dict[str, str]) -> str:
+            return "palace-1"
+
+        def recall(self, room: str, query: str, top_k: int) -> list[dict[str, Any]]:
+            raise RuntimeError("vendor exploded during verification query")
+
+        def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
+            raise NotImplementedError
+
+    adapter = MemPalaceAdapter(palace=QueryFailsPalace())
+    with pytest.raises(BackendAPIError):
+        adapter.store("room-1", "content", verify=True)
