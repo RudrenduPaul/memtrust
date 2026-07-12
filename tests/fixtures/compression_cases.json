@@ -1,0 +1,31 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case is a single piece of content stored once per mode the adapter reports supporting (see MemoryBackendAdapter.supported_modes), then retrieved and scored by evals/compression.py's fidelity_ratio() for direct round-trip reconstruction loss. This is the eval built to reproduce the kind of 'raw vs compressed mode' accuracy-drop comparison documented in mempalace/mempalace#27 (see README.md and docs/methodology.md) against a live backend -- no live run has been performed against any backend as of this fixture's creation; see docs/methodology.md for what requires live credentials.",
+  "cases": [
+    {
+      "case_id": "mt-compress-001",
+      "description": "short content",
+      "content": "The meeting is at 2pm on Friday."
+    },
+    {
+      "case_id": "mt-compress-002",
+      "description": "long content -- multi-sentence paragraph",
+      "content": "Baxter is a three-year-old golden retriever who loves chasing tennis balls at the park every morning before breakfast. He is afraid of thunderstorms and vacuum cleaners, but gets along well with the neighbor's cat. His vet appointment for the annual checkup and updated rabies vaccination is scheduled for the second Tuesday of next month, and he needs to fast for eight hours beforehand because the vet also wants to run a routine bloodwork panel."
+    },
+    {
+      "case_id": "mt-compress-003",
+      "description": "special characters, punctuation, emoji, and unicode",
+      "content": "Café receipt total: $42.17 (incl. 8.5% tax) — paid via Visa ••••4821. Note: “extra shot, oat milk” ☕️👍. Übercool — 100% would return!"
+    },
+    {
+      "case_id": "mt-compress-004",
+      "description": "structured content -- numbered list with numeric precision",
+      "content": "Q3 budget line items: 1) Engineering: $128,450.00  2) Marketing: $76,200.50  3) Ops: $19,999.99  4) Contingency: $5,000.00. Total: $229,650.49. Approved by finance on 2026-07-01."
+    },
+    {
+      "case_id": "mt-compress-005",
+      "description": "very short content -- edge case near-empty",
+      "content": "Baxter."
+    }
+  ]
+}

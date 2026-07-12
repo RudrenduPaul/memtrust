@@ -24,12 +24,19 @@ attempting to fix the reporting problem (#433 and #729) were both closed without
 None of that means MemPalace, or any other backend, doesn't work. It means nobody outside the
 vendor had run the same test, the same way, against every option, and published the raw logs.
 
-memtrust does that. It runs LongMemEval, LoCoMo, and a third eval built specifically for this
-project, because neither of the first two tests the question that actually matters once a memory
-system sits underneath a production agent: what happens when a new fact contradicts an old one?
-Does the backend flag the conflict? Silently overwrite the old fact with no audit trail? Serve
-whichever version it happens to retrieve first? None of the four backends this project tracks
-publish a number for that. memtrust built the eval that measures it.
+memtrust does that. It runs LongMemEval, LoCoMo, and two evals built specifically for this project.
+The first is a contradiction-detection eval, because neither LongMemEval nor LoCoMo tests the
+question that actually matters once a memory system sits underneath a production agent: what
+happens when a new fact contradicts an old one? Does the backend flag the conflict? Silently
+overwrite the old fact with no audit trail? Serve whichever version it happens to retrieve first?
+None of the four backends this project tracks publish a number for that. The second is a
+compression/round-trip-fidelity eval, built to directly test claims like the "lossless" one above:
+it stores content, retrieves it, and scores literal reconstruction fidelity rather than semantic
+accuracy, per operating mode a backend exposes (see `MemoryBackendAdapter.supported_modes`) -- the
+mechanism that would let a contributor with live MemPalace credentials actually reproduce the
+12.4-point compressed-mode accuracy drop mempalace/mempalace#27 documents, instead of just citing
+it. **It has not been run against any live backend as of this writing** -- see
+`docs/methodology.md`.
 
 ## What it does
 
@@ -38,16 +45,16 @@ produce the output shown. Nothing here is simulated.
 
 ```
 $ memtrust run --backends mempalace,mem0,zep,openviking --eval all
-memtrust 0.1.0 -- run_id=mt_2026-07-12T004755Z
-Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction
+memtrust 0.1.0 -- run_id=mt_2026-07-12T015520Z
+Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction, compression
 
 mempalace: SKIPPED (not configured) -- mempalace is not configured: environment variable
 MEMPALACE_STORAGE_PATH is not set. Skipping this backend. See docs/methodology.md for setup
 instructions.
-mem0: SKIPPED (not configured) -- mem0 is not configured: environment variable MEM0_API_KEY is
-not set. Skipping this backend. See docs/methodology.md for setup instructions.
-zep: SKIPPED (not configured) -- zep is not configured: environment variable ZEP_API_KEY is not
+mem0: SKIPPED (not configured) -- mem0 is not configured: environment variable MEM0_API_KEY is not
 set. Skipping this backend. See docs/methodology.md for setup instructions.
+zep: SKIPPED (not configured) -- zep is not configured: environment variable ZEP_API_KEY is not set.
+Skipping this backend. See docs/methodology.md for setup instructions.
 openviking: SKIPPED (not configured) -- openviking is not configured: environment variable
 OPENVIKING_API_KEY is not set. Skipping this backend. See docs/methodology.md for setup
 instructions.
@@ -71,20 +78,20 @@ $ pytest --cov=memtrust --cov-report=term-missing
 ...
 Name                                    Stmts   Miss  Cover
 -----------------------------------------------------------
-src/memtrust/adapters/base.py             69      0   100%
+src/memtrust/adapters/base.py             70      0   100%
 src/memtrust/evals/contradiction.py       87      0   100%
+src/memtrust/evals/compression.py         86      3    97%
 src/memtrust/evals/longmemeval.py         58      0   100%
 src/memtrust/scoring/cost_tracker.py      40      0   100%
-src/memtrust/scoring/llm_judge.py         64      0   100%
 -----------------------------------------------------------
-TOTAL                                    773     38    95%
+TOTAL                                    882     42    95%
 
-57 passed in 0.16s
+72 passed in 0.35s
 ```
 
-57 tests, 95% overall coverage, 100% on the adapter interface, the contradiction-detection eval,
-and the scoring pipeline. Every test mocks its HTTP layer or uses an in-memory fake backend --
-none of them touch a real network.
+72 tests, 95% overall coverage, 100% on the adapter interface and the contradiction-detection eval,
+97% on the new compression/round-trip-fidelity eval. Every test mocks its HTTP layer or uses an
+in-memory fake backend -- none of them touch a real network.
 
 ## How this differs from trusting a vendor's own numbers
 
@@ -111,6 +118,28 @@ a fact, stores a contradicting fact, queries for it, then checks the actual retr
 both values, rather than trusting whatever conflict signal the adapter itself reports. See
 `src/memtrust/evals/contradiction.py` and the scoring-logic section of `docs/methodology.md` for
 exactly how that classification works.
+
+## The eval built for the other headline overclaim: compression fidelity
+
+mempalace/mempalace#27 documents two separate overclaims, not one: the LongMemEval score gap
+described above, and a "lossless" compression claim that measured 12.4 percentage points lower in
+practice under a compressed operating mode. memtrust could not previously reproduce that second
+number at all -- there was no way to tell an adapter "run this under mode X vs mode Y" through the
+shared interface. `MemoryBackendAdapter.store()`/`query()` now accept an optional `mode: str |
+None` parameter, and `MemoryBackendAdapter.supported_modes` lets an adapter declare which mode
+strings it actually understands (`MemPalaceAdapter.supported_modes` is `("raw", "AAAK")`, the two
+names mempalace/mempalace#27 itself uses -- see `src/memtrust/adapters/mempalace_adapter.py` for
+the exact provenance and confidence caveat on those names). Adapters with no mode variants accept
+and ignore the parameter, so this is a purely additive, backward-compatible interface change.
+
+`src/memtrust/evals/compression.py` runs the same store-then-retrieve round trip once per mode a
+backend reports, and scores each round trip with a direct, deterministic character-level
+similarity ratio (`fidelity_ratio()`, via `difflib.SequenceMatcher` -- not an LLM judge, since a
+"lossless" claim is a literal-reconstruction claim, not a semantic one). This is what would let a
+contributor with live MemPalace credentials point `memtrust run --eval compression` at it and
+reproduce a "raw vs AAAK" fidelity gap directly. **As of this writing this eval has not been run
+against any live backend** -- see `docs/methodology.md` for the same live-credentials caveat that
+applies to every other eval in this table.
 
 ## Benchmarks
 
