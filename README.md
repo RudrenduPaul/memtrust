@@ -1,3 +1,226 @@
 # memtrust
 
-Independent, reproducible benchmark harness for agent-memory backends. (Draft placeholder, replaced in a later commit.)
+Standardized, reproducible benchmarks for agent-memory backends, run against the vendors, not
+published by them.
+
+```bash
+pip install -e ".[dev]"
+memtrust run --backends mempalace,mem0,zep,openviking --eval all
+```
+
+## Why this exists
+
+If you've compared agent-memory backends recently, you've probably noticed each one leads with a
+different accuracy number, on a different benchmark, measured a different way. MemPalace's own
+community already flagged the problem in public. Issue [#27](https://github.com/mempalace/mempalace/issues/27)
+on the MemPalace repository, opened April 7, 2026 and still open, documents a widely-cited 100%
+LongMemEval score that came from hand-tuning on the failed test questions themselves. The held-out
+score is 98.4%, not 100%. A separate 96.6% figure people cite everywhere turns out to be mostly
+ChromaDB's default embeddings doing the work, not MemPalace's own architecture. A "lossless"
+compression claim drops accuracy by 12.4 percentage points in practice. Two internal pull requests
+attempting to fix the reporting problem (#433 and #729) were both closed without merging on April
+12, 2026. As of this writing, the issue has 233 thumbs-up reactions and 39 comments.
+
+None of that means MemPalace, or any other backend, doesn't work. It means nobody outside the
+vendor had run the same test, the same way, against every option, and published the raw logs.
+
+memtrust does that. It runs LongMemEval, LoCoMo, and a third eval built specifically for this
+project, because neither of the first two tests the question that actually matters once a memory
+system sits underneath a production agent: what happens when a new fact contradicts an old one?
+Does the backend flag the conflict? Silently overwrite the old fact with no audit trail? Serve
+whichever version it happens to retrieve first? None of the four backends this project tracks
+publish a number for that. memtrust built the eval that measures it.
+
+## What it does
+
+Every command below was actually run against this repo, with zero vendor API keys configured, to
+produce the output shown. Nothing here is simulated.
+
+```
+$ memtrust run --backends mempalace,mem0,zep,openviking --eval all
+memtrust 0.1.0 -- run_id=mt_2026-07-12T004755Z
+Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction
+
+mempalace: SKIPPED (not configured) -- mempalace is not configured: environment variable
+MEMPALACE_STORAGE_PATH is not set. Skipping this backend. See docs/methodology.md for setup
+instructions.
+mem0: SKIPPED (not configured) -- mem0 is not configured: environment variable MEM0_API_KEY is
+not set. Skipping this backend. See docs/methodology.md for setup instructions.
+zep: SKIPPED (not configured) -- zep is not configured: environment variable ZEP_API_KEY is not
+set. Skipping this backend. See docs/methodology.md for setup instructions.
+openviking: SKIPPED (not configured) -- openviking is not configured: environment variable
+OPENVIKING_API_KEY is not set. Skipping this backend. See docs/methodology.md for setup
+instructions.
+
+Cost: $0.00 (no LLM-judged evals ran -- structural evals only, or judge not configured)
+
+Full report: memtrust-report-2026-07-12.json
+```
+
+That's the real, reproducible behavior of a fresh clone with no credentials: every backend reports
+SKIPPED, the command exits cleanly, and a valid JSON report is still written. Set the relevant
+environment variable for any backend you want to actually test (`MEM0_API_KEY`, `ZEP_API_KEY`,
+`OPENVIKING_API_KEY`, `MEMPALACE_STORAGE_PATH`) and that backend runs for real against its live
+API instead of being skipped.
+
+The eval logic itself is proven offline, against the bundled synthetic fixtures, by the test
+suite:
+
+```
+$ pytest --cov=memtrust --cov-report=term-missing
+...
+Name                                    Stmts   Miss  Cover
+-----------------------------------------------------------
+src/memtrust/adapters/base.py             69      0   100%
+src/memtrust/evals/contradiction.py       87      0   100%
+src/memtrust/evals/longmemeval.py         58      0   100%
+src/memtrust/scoring/cost_tracker.py      40      0   100%
+src/memtrust/scoring/llm_judge.py         64      0   100%
+-----------------------------------------------------------
+TOTAL                                    773     38    95%
+
+57 passed in 0.16s
+```
+
+57 tests, 95% overall coverage, 100% on the adapter interface, the contradiction-detection eval,
+and the scoring pipeline. Every test mocks its HTTP layer or uses an in-memory fake backend --
+none of them touch a real network.
+
+## How this differs from trusting a vendor's own numbers
+
+Every backend memtrust tracks publishes its own benchmark numbers. None of them publish the same
+benchmark, scored the same way, with the same held-out discipline. memtrust doesn't ask you to
+trust it instead: it asks you to read the raw logs. Every run's methodology, prompt templates,
+dataset versions, and scoring rubric are published in `docs/methodology.md`, versioned alongside
+the code that produced them. If the methodology has a flaw, it's a flaw you can point to in a
+specific file and line, not something buried in a vendor's internal eval pipeline.
+
+General-purpose LLM eval frameworks (promptfoo, DeepEval, RAGAS, and similar tools) are mature and
+widely used, but none of them ship a memory-backend adapter abstraction or a contradiction-
+detection eval out of the box -- they're built for RAG quality, red-teaming, and general prompt
+evaluation, not for comparing how different memory systems handle a fact that changes over time.
+memtrust is narrower and more specific on purpose.
+
+## The eval that actually matters: contradiction detection
+
+LongMemEval and LoCoMo both measure recall: can the backend remember a fact you told it earlier.
+That's necessary but not sufficient. The harder question is what a backend does when two facts
+conflict: you tell it your meeting is at 2pm, then later say it moved to 3pm. Does it flag the
+change? Overwrite silently? Serve whichever one it retrieves first? `memtrust`'s classifier stores
+a fact, stores a contradicting fact, queries for it, then checks the actual retrieved content for
+both values, rather than trusting whatever conflict signal the adapter itself reports. See
+`src/memtrust/evals/contradiction.py` and the scoring-logic section of `docs/methodology.md` for
+exactly how that classification works.
+
+## Benchmarks
+
+**Not yet measured against live backends.** This repo was built without API credentials for
+MemPalace, Mem0, Zep, or OpenViking. Publishing a number here without actually running the harness
+against a live backend would be exactly the kind of unverifiable claim this project exists to
+push back on, so there isn't one.
+
+To produce real numbers:
+
+```bash
+export MEM0_API_KEY=...          # and/or
+export ZEP_API_KEY=...
+export OPENVIKING_API_KEY=...
+export MEMPALACE_STORAGE_PATH=...
+export MEMTRUST_JUDGE_API_KEY=...   # needed for LongMemEval/LoCoMo grading; contradiction-detection doesn't need it
+
+memtrust run --backends mempalace,mem0,zep,openviking --eval all
+memtrust report memtrust-report-<date>.json
+```
+
+The command prints per-backend accuracy and contradiction-handling rates, writes a full JSON
+report, and prints an estimated cost for any LLM-judged evals that ran. Two of the four adapters
+(MemPalace and OpenViking) are built against best-effort interpretations of documented product
+concepts rather than a confirmed API reference -- see the confidence table in
+`docs/methodology.md` before treating their output as authoritative, and consider that table's
+gaps a standing invitation to contribute a fix.
+
+## GitHub Actions usage
+
+Run the suite on a schedule and publish results to the leaderboard:
+
+```yaml
+name: memtrust-leaderboard
+on:
+  schedule:
+    - cron: "0 9 * * 1"  # weekly
+  workflow_dispatch: {}
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install memtrust
+      - run: memtrust run --backends mempalace,mem0,zep,openviking --eval all --output leaderboard/data.json
+        env:
+          MEM0_API_KEY: ${{ secrets.MEM0_API_KEY }}
+          ZEP_API_KEY: ${{ secrets.ZEP_API_KEY }}
+          OPENVIKING_API_KEY: ${{ secrets.OPENVIKING_API_KEY }}
+          MEMTRUST_JUDGE_API_KEY: ${{ secrets.MEMTRUST_JUDGE_API_KEY }}
+      - run: git add leaderboard/data.json && git commit -m "Update leaderboard" && git push
+```
+
+This repo's own CI (`.github/workflows/ci.yml`) runs lint, type-check, test, and a dependency
+security audit on every push and pull request -- no vendor credentials required, since every test
+runs fully offline.
+
+## Self-host
+
+```bash
+git clone https://github.com/RudrenduPaul/memtrust
+cd memtrust
+pip install -e ".[dev]"
+export MEM0_API_KEY=...
+memtrust run --backends mem0 --eval all
+```
+
+Point an adapter at your own backend, or run the suite against your own conversation data instead
+of the bundled synthetic fixtures (see `docs/methodology.md`'s note on swapping in the real
+LongMemEval/LoCoMo datasets). Nothing leaves your machine unless you choose to publish it.
+
+## What a hosted trust layer would add
+
+The harness, adapters, and leaderboard in this repo are the entire OSS surface, and they're
+sufficient on their own to compare backends. A hosted layer on top of this -- described here, not
+built -- would add continuous regression monitoring that re-runs the suite automatically whenever
+a tracked backend ships a new release, private scorecards that run the same methodology against a
+team's own data shape instead of the public sample fixtures, and a compliance-report export for
+teams whose security or legal review needs a documented third-party artifact rather than a
+free-text summary. None of that exists yet. If it's ever built, it stays additive to the free
+harness, never a requirement for using it.
+
+## Backend coverage
+
+| Backend | Adapter status | Confidence (see docs/methodology.md) |
+|---|---|---|
+| MemPalace | Implemented | Medium on behavior, low on exact method names -- needs verification against a live instance |
+| Mem0 | Implemented | High -- documented Python SDK and REST behavior |
+| Zep / Graphiti | Implemented | Medium-high -- documented contradiction-handling behavior, best-effort wire format |
+| OpenViking | Implemented | Medium on architecture, low on exact memory-write/query paths |
+
+Adding a backend adapter is the primary contribution path -- see `CONTRIBUTING.md`.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+ruff check . && ruff format --check .
+mypy --strict src/memtrust
+pytest --cov=memtrust --cov-report=term-missing --cov-fail-under=80
+pip-audit
+```
+
+`.pre-commit-config.yaml` wires ruff and mypy into `pre-commit` if you'd rather run these on every
+commit than remember to run them by hand.
+
+## License
+
+Apache 2.0. See `LICENSE`.
