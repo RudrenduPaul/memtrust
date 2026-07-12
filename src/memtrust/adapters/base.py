@@ -117,6 +117,26 @@ class StoreResult:
     memory_id: str
     latency_ms: float
     raw: dict[str, object] = field(default_factory=dict)
+    verified: bool | None = None
+    """Whether a post-write read-back confirmed the content is actually
+    retrievable. `None` means the adapter did not attempt verification
+    (the default -- see MemoryBackendAdapter.verify_store) -- this is
+    deliberately distinct from `False`. `None` is "we don't know," and
+    must never be treated as "verified passed" by scoring or reporting
+    code. `True`/`False` mean an adapter actually called verify_store()
+    (or equivalent) and got a definitive answer.
+
+    Why this field exists at all: store() raising no exception has never
+    been proof that a write was durable -- a vendor can return 200 OK (or
+    a fake in-process success) while silently dropping or corrupting the
+    write server-side. Two independently root-caused MemPalace bug
+    classes did exactly this (checkpoint corruption via NUL bytes;
+    stale/self-deadlocked locks silently no-oping a write). Without this
+    field, that failure mode is indistinguishable from "the model just
+    didn't recall the fact," which misattributes a backend durability bug
+    to model quality. See docs/methodology.md for why verification is
+    opt-in rather than automatic.
+    """
 
 
 @dataclass
@@ -174,6 +194,22 @@ class MemoryBackendAdapter(ABC):
 
         Raises:
             BackendAPIError: on any network or vendor-side failure.
+
+        Note on durability: returning without raising is *not* proof the
+        write is durable or even retrievable -- a vendor can silently
+        drop or corrupt a write server-side and still return a normal
+        response (this is exactly what happened in two independently
+        root-caused MemPalace bugs: NUL-byte checkpoint corruption and
+        stale/self-deadlocked locks). Implementers that want to guard
+        against this should accept an opt-in `verify: bool = False`
+        keyword-only parameter and, when True, call `self.verify_store()`
+        after the write succeeds and set `StoreResult.verified` from its
+        return value. This is intentionally NOT part of every adapter's
+        required signature (existing callers that never pass `verify`
+        must keep working unchanged against any adapter), and it is
+        intentionally NOT on by default anywhere -- see verify_store()
+        and docs/methodology.md for why (it doubles API calls per store()
+        when enabled).
         """
         raise NotImplementedError
 
@@ -204,6 +240,57 @@ class MemoryBackendAdapter(ABC):
     @staticmethod
     def _timed() -> _Timer:
         return _Timer()
+
+    def verify_store(self, store_result: StoreResult, session_id: str, content: str) -> bool:
+        """Opt-in read-after-write check: query() immediately after a
+        store() call and confirm the just-written content is actually
+        retrievable, instead of trusting "store() didn't raise" as proof
+        of a durable write.
+
+        This is a helper, not something store() calls automatically --
+        no adapter's default `store()` behavior changes by this method
+        existing. An adapter opts in by accepting a `verify: bool = False`
+        keyword-only parameter on its own store() and calling this
+        explicitly when `verify=True` (see mempalace_adapter.py for the
+        reference implementation). Left off by default because it costs
+        one extra vendor API call (a query()) for every store() call made
+        with verify=True -- turning that on unconditionally for every eval
+        run would silently double memtrust's own API/latency cost against
+        every backend under test. See docs/methodology.md.
+
+        Args:
+            store_result: the StoreResult just returned by this adapter's
+                own store() call, used for its memory_id.
+            session_id: the same session/scope the content was stored
+                under.
+            content: the exact text that was just stored.
+
+        Returns:
+            True only if a query() call for `session_id` returns a record
+            whose *content* actually contains `content` -- either the
+            record matching `store_result.memory_id` by id (checked
+            first, and its content must still match: a record that comes
+            back under the right id but with corrupted content is a
+            failed verification, not a pass) or, if no record shares that
+            id (some backends don't echo a stable id on the query path),
+            any returned record whose content contains `content`. False
+            covers both "no matching record at all" (dropped write) and
+            "a record came back but the content doesn't match" (corrupted
+            write) -- both are reported as a normal `False` return, never
+            raised as an error.
+
+        Raises:
+            BackendAPIError: if the verification query() call itself
+                fails (a real network/vendor error is a different failure
+                mode than "the write was silently dropped," and should
+                still surface as an error rather than being swallowed
+                into `False`).
+        """
+        result = self.query(session_id, content)
+        for record in result.records:
+            if record.memory_id and record.memory_id == store_result.memory_id:
+                return bool(content) and content in record.content
+        return any(content and content in record.content for record in result.records)
 
 
 class _Timer:
