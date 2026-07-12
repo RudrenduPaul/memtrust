@@ -31,6 +31,14 @@ from memtrust.evals.locomo import load_dataset as load_locomo_dataset
 from memtrust.evals.locomo import run_locomo
 from memtrust.evals.longmemeval import load_dataset as load_longmemeval_dataset
 from memtrust.evals.longmemeval import run_longmemeval
+from memtrust.evals.resource_sync_safety import (
+    ResourceSyncSignal,
+    classify_resource_sync_file,
+    run_resource_sync_eval,
+)
+from memtrust.evals.resource_sync_safety import (
+    load_dataset as load_resource_sync_dataset,
+)
 from memtrust.scoring.llm_judge import LLMJudge
 
 
@@ -99,6 +107,57 @@ class StaleFakeAdapter(RecallAllFakeAdapter):
 class NoUpdateFakeAdapter(RecallAllFakeAdapter):
     name = "fake-no-update"
     supports_update = False
+
+
+class ResourceSyncFakeAdapter(MemoryBackendAdapter):
+    """In-memory adapter that models a directory/resource mirror, used to
+    exercise the resource-sync-safety eval without a real OpenViking-shaped
+    backend. `drop_origin`, when set, makes trigger_resync() silently
+    remove every stored file whose seeded `origin` metadata matches it --
+    this is the exact volcengine/OpenViking#3029 shape: a resync mechanism
+    dropping files it did not itself generate, with no error raised."""
+
+    name = "fake-resource-sync"
+    env_var = "FAKE_API_KEY"
+    supports_update = True
+    supports_resource_sync = True
+
+    def __init__(self, drop_origin: str | None = None) -> None:
+        self._files: dict[str, dict[str, tuple[str, str]]] = {}
+        self._drop_origin = drop_origin
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        metadata = metadata or {}
+        path = f"{session_id}/{metadata.get('resource_path', content[:12])}"
+        origin = metadata.get("origin", "unknown")
+        self._files.setdefault(session_id, {})[path] = (content, origin)
+        return StoreResult(memory_id=path, latency_ms=0.1)
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        matches = [
+            MemoryRecord(memory_id=p, content=c)
+            for p, (c, _origin) in self._files.get(session_id, {}).items()
+            if query.lower() in c.lower()
+        ][:top_k]
+        return QueryResult(
+            records=matches, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def list_resource_paths(self, prefix: str) -> list[str]:
+        return list(self._files.get(prefix, {}).keys())
+
+    def trigger_resync(self, prefix: str) -> None:
+        if self._drop_origin is None:
+            return
+        files = self._files.get(prefix, {})
+        self._files[prefix] = {
+            path: value for path, value in files.items() if value[1] != self._drop_origin
+        }
 
 
 class FailingFakeAdapter(MemoryBackendAdapter):
@@ -206,6 +265,69 @@ def test_classify_case_matrix(
     assert signal == expected
     assert got_initial == has_initial
     assert got_updated == has_updated
+
+
+# ---------------------------------------------------------------------------
+# Resource-Sync Safety -- catches volcengine/OpenViking#3029-shaped bugs
+# ---------------------------------------------------------------------------
+
+
+def test_resource_sync_dataset_loads() -> None:
+    cases = load_resource_sync_dataset()
+    assert len(cases) == 3
+    assert all(len(c.seed_files) >= 2 for c in cases)
+
+
+def test_resource_sync_skips_cleanly_for_unsupported_adapter() -> None:
+    adapter = RecallAllFakeAdapter()  # supports_resource_sync defaults to False
+    result = run_resource_sync_eval(adapter)
+    assert result.skipped is True
+    assert result.skip_reason is not None
+    assert result.file_results == []
+    assert result.user_file_deletion_rate is None
+
+
+def test_resource_sync_all_files_preserved_when_resync_is_safe() -> None:
+    adapter = ResourceSyncFakeAdapter(drop_origin=None)
+    result = run_resource_sync_eval(adapter)
+    assert result.skipped is False
+    assert result.user_file_deletion_rate == 0.0
+    assert result.preserved_rate == 1.0
+    assert all(f.signal == ResourceSyncSignal.PRESERVED for f in result.file_results)
+
+
+def test_resource_sync_detects_deleted_user_files_matching_issue_3029() -> None:
+    adapter = ResourceSyncFakeAdapter(drop_origin="user")
+    result = run_resource_sync_eval(adapter)
+    assert result.user_file_deletion_rate == 1.0
+
+    user_results = [f for f in result.file_results if f.origin == "user"]
+    generated_results = [f for f in result.file_results if f.origin == "generated"]
+    assert user_results  # fixture actually seeds user-origin files
+    assert generated_results  # fixture actually seeds generated-origin files
+    assert all(f.signal == ResourceSyncSignal.DELETED_USER_FILE for f in user_results)
+    assert all(f.signal == ResourceSyncSignal.PRESERVED for f in generated_results)
+
+
+@pytest.mark.parametrize(
+    ("present_before", "present_after", "content_matches", "expected"),
+    [
+        (True, True, True, ResourceSyncSignal.PRESERVED),
+        (True, True, None, ResourceSyncSignal.PRESERVED),
+        (True, False, None, ResourceSyncSignal.DELETED_USER_FILE),
+        (True, True, False, ResourceSyncSignal.OVERWRITTEN_UNCHANGED),
+        (False, False, None, ResourceSyncSignal.NOT_APPLICABLE),
+        (False, True, True, ResourceSyncSignal.PRESERVED),
+    ],
+)
+def test_classify_resource_sync_file_matrix(
+    present_before: bool,
+    present_after: bool,
+    content_matches: bool | None,
+    expected: ResourceSyncSignal,
+) -> None:
+    signal = classify_resource_sync_file(present_before, present_after, content_matches)
+    assert signal == expected
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,64 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case seeds a mix of 'generated' files (standing in for files an ingestion watcher itself produced) and 'user' files (standing in for files a person added to the same resource path independently of the watcher) under one resource prefix, then the eval triggers a resync and re-lists the prefix to see what survived. Modeled directly on volcengine/OpenViking#3029, where a Feishu resync silently deleted user-owned files the ingestion watcher had not generated. See evals/resource_sync_safety.py for the classification logic and docs/methodology.md for the eval design.",
+  "cases": [
+    {
+      "case_id": "mt-resync-001",
+      "prefix": "resync-session-1/knowledge-base",
+      "seed_files": [
+        {
+          "path_suffix": "generated/watcher-ingested-roadmap.md",
+          "origin": "generated",
+          "content": "Auto-ingested by the watcher: Q3 roadmap notes synced from the source doc."
+        },
+        {
+          "path_suffix": "user-notes/personal-meeting-notes.md",
+          "origin": "user",
+          "content": "User-authored meeting notes added directly to this folder, never produced by any ingestion watcher."
+        }
+      ]
+    },
+    {
+      "case_id": "mt-resync-002",
+      "prefix": "resync-session-2/project-docs",
+      "seed_files": [
+        {
+          "path_suffix": "generated/watcher-ingested-spec.md",
+          "origin": "generated",
+          "content": "Auto-ingested by the watcher: API spec pulled from the linked source repository."
+        },
+        {
+          "path_suffix": "generated/watcher-ingested-changelog.md",
+          "origin": "generated",
+          "content": "Auto-ingested by the watcher: changelog entries synced from the source repository."
+        },
+        {
+          "path_suffix": "user-uploads/scratch-draft.md",
+          "origin": "user",
+          "content": "A user-uploaded scratch draft that lives alongside the synced files but was never part of the source the watcher ingests from."
+        }
+      ]
+    },
+    {
+      "case_id": "mt-resync-003",
+      "prefix": "resync-session-3/team-wiki",
+      "seed_files": [
+        {
+          "path_suffix": "generated/watcher-ingested-onboarding.md",
+          "origin": "generated",
+          "content": "Auto-ingested by the watcher: onboarding guide synced from the team wiki source."
+        },
+        {
+          "path_suffix": "user-notes/private-todo.md",
+          "origin": "user",
+          "content": "A private user todo list stored under the same wiki resource path, independent of the watcher's source."
+        },
+        {
+          "path_suffix": "user-notes/vacation-plan.md",
+          "origin": "user",
+          "content": "A user's vacation plan notes, also stored under the wiki resource path and also independent of the watcher's source."
+        }
+      ]
+    }
+  ]
+}

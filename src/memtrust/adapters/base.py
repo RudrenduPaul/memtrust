@@ -161,6 +161,16 @@ class MemoryBackendAdapter(ABC):
     #: results table.
     supports_update: bool = True
 
+    #: Whether this backend exposes a directory/resource mirror that a
+    #: multi-file resync operation can act on (list_resource_paths /
+    #: trigger_resync below). Defaults to False -- the store/query/update
+    #: model most adapters implement has no concept of a resync, so most
+    #: backends genuinely cannot be exercised here. If False, the
+    #: resource-sync-safety eval records the backend as skipped instead of
+    #: calling list_resource_paths/trigger_resync and crashing on the
+    #: default NotImplementedError below.
+    supports_resource_sync: bool = False
+
     @abstractmethod
     def store(
         self, session_id: str, content: str, metadata: dict[str, str] | None = None
@@ -200,6 +210,46 @@ class MemoryBackendAdapter(ABC):
             BackendAPIError: on any network or vendor-side failure.
         """
         raise NotImplementedError
+
+    def list_resource_paths(self, prefix: str) -> list[str]:
+        """List resource/file paths currently present under `prefix`.
+
+        Optional capability -- only meaningful for backends that model a
+        directory/resource mirror (see supports_resource_sync). Unlike
+        store()/query()/update(), this is NOT an abstract method: most
+        adapters have no resource-mirror concept at all, so the default
+        implementation raises NotImplementedError rather than forcing
+        every adapter to stub it out. Implementers that set
+        supports_resource_sync = True must override this.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_resource_sync is False).
+            BackendAPIError: on any network or vendor-side failure.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement list_resource_paths() "
+            f"(supports_resource_sync={self.supports_resource_sync})"
+        )
+
+    def trigger_resync(self, prefix: str) -> None:
+        """Trigger whatever native mechanism this backend uses to reconcile
+        its resource mirror under `prefix` against the source it ingests
+        from (e.g. a directory watcher's resync/rescan pass).
+
+        Optional capability, same convention as list_resource_paths()
+        above -- default raises NotImplementedError, only backends with
+        supports_resource_sync = True are expected to override it.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_resource_sync is False).
+            BackendAPIError: on any network or vendor-side failure.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement trigger_resync() "
+            f"(supports_resource_sync={self.supports_resource_sync})"
+        )
 
     @staticmethod
     def _timed() -> _Timer:
