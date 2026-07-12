@@ -208,6 +208,123 @@ def test_classify_case_matrix(
     assert got_updated == has_updated
 
 
+def _contradiction_case() -> ContradictionCase:
+    return ContradictionCase(
+        case_id="c1",
+        session_id="s1",
+        subject="test",
+        initial_fact="the meeting is at 2pm",
+        contradicting_fact="the meeting moved to 3pm",
+        query="what time is the meeting?",
+        initial_value="2pm",
+        updated_value="3pm",
+    )
+
+
+def test_classify_case_neither_value_present_no_metadata_stays_not_applicable() -> None:
+    """The 'neither value observed' branch with zero adapter-reported
+    metadata and zero text evidence has genuinely nothing to read --
+    NOT_APPLICABLE is the only defensible verdict here."""
+    case = _contradiction_case()
+    records = [MemoryRecord(memory_id="m0", content="totally unrelated content")]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, has_initial, has_updated = classify_case(case, query_result)
+    assert signal == ConflictSignal.NOT_APPLICABLE
+    assert has_initial is False
+    assert has_updated is False
+
+
+def test_classify_case_neither_value_present_but_invalidation_metadata_flags() -> None:
+    """Same 'neither value observed via substring match' shape as the test
+    above, but this time a record carries adapter-reported invalidation
+    metadata (Graphiti's invalid_at). This must NOT collapse to the same
+    NOT_APPLICABLE verdict as the no-metadata case above -- proving the
+    formerly dead-code branch now genuinely differentiates two distinct
+    inputs into two distinct outputs, not just a renamed no-op."""
+    case = _contradiction_case()
+    records = [
+        MemoryRecord(
+            memory_id="m0",
+            content="totally unrelated content",
+            metadata={"invalid_at": "2026-06-01T00:00:00Z"},
+        )
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, has_initial, has_updated = classify_case(case, query_result)
+    assert signal == ConflictSignal.FLAGGED
+    assert has_initial is False
+    assert has_updated is False
+
+
+def test_classify_case_graphiti_invalid_at_overrides_silent_overwrite() -> None:
+    """Reproduces the getzep/graphiti#1489-shaped false negative: the
+    top-k search window surfaces the live edge (new value) plus an
+    invalidated edge whose extracted text doesn't literally contain the
+    case's old-value substring (paraphrased extraction is realistic for
+    a knowledge-graph backend). Naive substring classification alone
+    would call this SILENT_OVERWRITE even though the backend genuinely
+    preserved the old fact bi-temporally. Consulting record metadata
+    must classify this as FLAGGED instead."""
+    case = _contradiction_case()
+    records = [
+        MemoryRecord(
+            memory_id="e1",
+            content="the meeting was rescheduled",
+            metadata={"invalid_at": "2026-06-01T00:00:00Z"},
+        ),
+        MemoryRecord(memory_id="e2", content="the meeting is at 3pm", metadata={}),
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.SERVED_STALE, latency_ms=0.1
+    )
+    signal, has_initial, has_updated = classify_case(case, query_result)
+    assert signal == ConflictSignal.FLAGGED
+    assert has_initial is False
+    assert has_updated is True
+
+
+@pytest.mark.parametrize(
+    ("has_initial", "has_updated", "expected"),
+    [
+        (True, True, ConflictSignal.FLAGGED),
+        (False, True, ConflictSignal.SILENT_OVERWRITE),
+        (True, False, ConflictSignal.SERVED_STALE),
+        (False, False, ConflictSignal.NOT_APPLICABLE),
+    ],
+)
+def test_classify_case_no_metadata_adapters_unaffected_by_fix(
+    has_initial: bool, has_updated: bool, expected: ConflictSignal
+) -> None:
+    """Mem0, OpenViking, and MemPalace's query() responses (as currently
+    implemented, aside from MemPalace's own separate 'invalidated' key
+    which this fix does not touch) never populate MemoryRecord.metadata
+    with an 'invalid_at' entry. This locks in that the metadata-aware
+    fix is a strict addition -- it must not change any classification
+    outcome for records with empty/unrelated metadata."""
+    case = _contradiction_case()
+    content_parts: list[str] = []
+    if has_initial:
+        content_parts.append(case.initial_value)
+    if has_updated:
+        content_parts.append(case.updated_value)
+    records = (
+        [MemoryRecord(memory_id="m0", content=" ".join(content_parts), metadata={})]
+        if content_parts
+        else []
+    )
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, got_initial, got_updated = classify_case(case, query_result)
+    assert signal == expected
+    assert got_initial == has_initial
+    assert got_updated == has_updated
+
+
 # ---------------------------------------------------------------------------
 # LongMemEval
 # ---------------------------------------------------------------------------
