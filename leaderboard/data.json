@@ -1,0 +1,60 @@
+{
+  "_schema_note": "This file documents the shape `memtrust run` output maps into for the static leaderboard site. The entries below are an EXAMPLE / SCHEMA REFERENCE, not measured results -- no live vendor API keys were available when this repo was built. Run `memtrust run --backends mempalace,mem0,zep,openviking --eval all` yourself and replace this file with real output to populate a live leaderboard. See docs/methodology.md and the README's Benchmarks section.",
+  "example_data": true,
+  "generated_at": null,
+  "memtrust_version": "0.1.0",
+  "backends": [
+    {
+      "name": "mempalace",
+      "status": "not_measured",
+      "longmemeval_accuracy": null,
+      "locomo_accuracy": null,
+      "contradiction": {
+        "flagged_rate": null,
+        "silent_overwrite_rate": null,
+        "served_stale_rate": null,
+        "not_applicable_rate": null
+      },
+      "last_run": null
+    },
+    {
+      "name": "mem0",
+      "status": "not_measured",
+      "longmemeval_accuracy": null,
+      "locomo_accuracy": null,
+      "contradiction": {
+        "flagged_rate": null,
+        "silent_overwrite_rate": null,
+        "served_stale_rate": null,
+        "not_applicable_rate": null
+      },
+      "last_run": null
+    },
+    {
+      "name": "zep",
+      "status": "not_measured",
+      "longmemeval_accuracy": null,
+      "locomo_accuracy": null,
+      "contradiction": {
+        "flagged_rate": null,
+        "silent_overwrite_rate": null,
+        "served_stale_rate": null,
+        "not_applicable_rate": null
+      },
+      "last_run": null
+    },
+    {
+      "name": "openviking",
+      "status": "not_measured",
+      "longmemeval_accuracy": null,
+      "locomo_accuracy": null,
+      "contradiction": {
+        "flagged_rate": null,
+        "silent_overwrite_rate": null,
+        "served_stale_rate": null,
+        "not_applicable_rate": null
+      },
+      "last_run": null
+    }
+  ]
+}

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>memtrust leaderboard</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --border: #d0d0d0;
+      --muted: #666;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      max-width: 900px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.5;
+    }
+    h1 { margin-bottom: 0.25rem; }
+    p.subtitle { color: var(--muted); margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; }
+    th, td { border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left; }
+    th { background: rgba(127, 127, 127, 0.08); }
+    .status-not-measured { color: var(--muted); font-style: italic; }
+    .example-banner {
+      border: 1px solid #b58900;
+      background: rgba(181, 137, 0, 0.1);
+      padding: 0.75rem 1rem;
+      border-radius: 4px;
+      margin-top: 1rem;
+    }
+    code { background: rgba(127, 127, 127, 0.15); padding: 0.1rem 0.3rem; border-radius: 3px; }
+    footer { margin-top: 2rem; color: var(--muted); font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>memtrust leaderboard</h1>
+  <p class="subtitle">Standardized, reproducible benchmarks for agent-memory backends.</p>
+
+  <div id="banner"></div>
+  <table id="results">
+    <thead>
+      <tr>
+        <th>Backend</th>
+        <th>LongMemEval</th>
+        <th>LoCoMo</th>
+        <th>Contradiction (flagged / overwrite / stale)</th>
+        <th>Last run</th>
+      </tr>
+    </thead>
+    <tbody id="results-body">
+      <tr><td colspan="5">Loading data.json...</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    This page reads <code>data.json</code> in this same directory, which is exactly the shape
+    <code>memtrust run</code> produces. No build step, no framework -- open this file over any
+    static file server (browsers block <code>fetch()</code> against <code>file://</code> URLs, so
+    use e.g. <code>python -m http.server</code> from this directory rather than double-clicking
+    the file) and it renders whatever is in <code>data.json</code>, including a clearly-marked
+    example when no live run has been published yet.
+  </footer>
+
+  <script>
+    function formatPct(value) {
+      return value === null || value === undefined ? "N/A" : (value * 100).toFixed(1) + "%";
+    }
+
+    fetch("data.json")
+      .then((r) => r.json())
+      .then((data) => {
+        const banner = document.getElementById("banner");
+        if (data.example_data) {
+          banner.innerHTML =
+            '<div class="example-banner">This is example/schema data, not measured results. ' +
+            "Run <code>memtrust run --backends mempalace,mem0,zep,openviking --eval all</code> " +
+            "and replace <code>data.json</code> to populate a live leaderboard.</div>";
+        }
+
+        const tbody = document.getElementById("results-body");
+        tbody.innerHTML = "";
+        for (const backend of data.backends) {
+          const tr = document.createElement("tr");
+          const contra = backend.contradiction || {};
+          const contraStr =
+            backend.status === "not_measured"
+              ? "N/A"
+              : `${formatPct(contra.flagged_rate)} / ${formatPct(contra.silent_overwrite_rate)} / ${formatPct(contra.served_stale_rate)}`;
+          tr.innerHTML = `
+            <td>${backend.name}</td>
+            <td class="${backend.status === "not_measured" ? "status-not-measured" : ""}">${formatPct(backend.longmemeval_accuracy)}</td>
+            <td class="${backend.status === "not_measured" ? "status-not-measured" : ""}">${formatPct(backend.locomo_accuracy)}</td>
+            <td class="${backend.status === "not_measured" ? "status-not-measured" : ""}">${contraStr}</td>
+            <td>${backend.last_run || "never"}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+      })
+      .catch((err) => {
+        document.getElementById("results-body").innerHTML =
+          '<tr><td colspan="5">Could not load data.json: ' + err + "</td></tr>";
+      });
+  </script>
+</body>
+</html>
