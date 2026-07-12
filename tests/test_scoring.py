@@ -5,10 +5,13 @@ response (no real network / vendor credentials used).
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 from pytest_httpx import HTTPXMock
 
-from memtrust.scoring.cost_tracker import CostTracker
+from memtrust.scoring.cost_tracker import CostEntry, CostTracker
 from memtrust.scoring.llm_judge import JudgeVerdict, LLMJudge
 
 # ---------------------------------------------------------------------------
@@ -51,6 +54,61 @@ def test_cost_tracker_summary_lines_nonempty() -> None:
     tracker.record("a", "deepseek-chat", 1000, 1000)
     lines = tracker.summary_lines()
     assert any("deepseek-chat" in line for line in lines)
+
+
+class _NonAtomicEntryList(list[CostEntry]):
+    """Test double standing in for ``CostTracker.entries``.
+
+    Plain CPython ``list.append()`` happens to be a single, GIL-atomic
+    bytecode op, so hammering it with threads doesn't reliably expose a
+    missing lock on this interpreter -- a bare (unlocked) append test was
+    verified by hand to pass even with ``CostTracker``'s lock removed.
+    This double instead does a realistic read-copy-mutate-write-back
+    append (the shape a future refactor of ``entries`` could easily take),
+    with a scheduler yield in the middle of the window, so a race is
+    actually observable if the surrounding code fails to serialize
+    access.
+    """
+
+    def append(self, item: CostEntry) -> None:
+        snapshot = list(self)
+        time.sleep(0)  # yield so another thread can interleave right here
+        snapshot.append(item)
+        self[:] = snapshot
+
+
+def test_cost_tracker_record_is_thread_safe() -> None:
+    """Preventive concurrency test: memtrust's runners are sequential today,
+    but CostTracker.record() is now guarded by a lock so it stays safe if
+    concurrent eval execution is added later (see the class docstring and
+    the OpenViking PR #3091 precedent that motivated this).
+
+    ``entries`` is swapped for ``_NonAtomicEntryList`` so the test proves
+    CostTracker's own lock -- not incidental atomicity of CPython's
+    built-in ``list.append`` -- is what keeps concurrent record() calls
+    from dropping entries. This was confirmed to fail reliably (final
+    count short of the expected total) when the ``with self._lock:``
+    guard is removed from record(), and to pass reliably with it in
+    place.
+    """
+    tracker = CostTracker()
+    tracker.entries = _NonAtomicEntryList()
+    num_threads = 16
+    records_per_thread = 25
+    expected_total = num_threads * records_per_thread
+
+    def worker() -> None:
+        for _ in range(records_per_thread):
+            tracker.record("case", "deepseek-chat", 100, 100)
+
+    threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(tracker.entries) == expected_total
+    assert tracker.total_input_tokens == expected_total * 100
 
 
 # ---------------------------------------------------------------------------
