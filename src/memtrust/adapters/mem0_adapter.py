@@ -29,6 +29,7 @@ from memtrust.adapters.base import (
     BackendAPIError,
     BackendNotConfiguredError,
     ConflictSignal,
+    DeleteResult,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -127,6 +128,29 @@ class Mem0Adapter(MemoryBackendAdapter):
             raise BackendAPIError(self.name, str(exc)) from exc
         return UpdateResult(
             memory_id=memory_id, acknowledged=True, latency_ms=timer.elapsed_ms(), raw=data
+        )
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        """Delete a memory via Mem0's documented DELETE /v1/memories/{id}/
+        endpoint (docs.mem0.ai/platform/quickstart lists delete alongside
+        add/search/update on the same REST surface this adapter targets).
+
+        This is the primitive an eval needs to reproduce the real,
+        merged mem0ai/mem0#5936 / #5970 bug class: a multi-entity delete
+        whose client-side aggregation silently truncated to only the
+        last response instead of all N. memtrust's own delete_many() in
+        base.py is what constructs that N-entity scenario against this
+        single-id delete() call.
+        """
+        timer = self._timed()
+        try:
+            resp = self._http.delete(f"/v1/memories/{memory_id}/")
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+        except httpx.HTTPError as exc:
+            raise BackendAPIError(self.name, str(exc)) from exc
+        return DeleteResult(
+            success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data
         )
 
     def close(self) -> None:
