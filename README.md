@@ -253,3 +253,54 @@ commit than remember to run them by hand.
 ## License
 
 Apache 2.0. See `LICENSE`.
+
+## Success stories
+
+Nine real bugs, reported by real contributors against MemPalace, mem0, Zep/Graphiti, and
+OpenViking, that memtrust's own harness either couldn't have caught before this work or can now
+catch directly. Each one below has been re-verified live against the current codebase, not just
+cited from a changelog. Full write-ups, live-validation evidence, and outreach status live in
+`research-strategy-memtrust/customer-outreach/issue-analysis/memtrust-outreach-comment-drafts.md`
+for the project's own tracking; the summary here is for anyone deciding whether this harness would
+have caught their own bug.
+
+**MemPalace**
+- [#1754](https://github.com/MemPalace/mempalace/pull/1754) (@rodboev): a checkpoint recovery fix
+  for silently quarantined dim-None pickles. memtrust's contradiction eval couldn't previously tell
+  "silently quarantined" apart from "no update primitive at all"; it now can
+  (`ConflictSignal.EMPTY_OR_LOST`).
+- [#1929](https://github.com/MemPalace/mempalace/pull/1929) (@jrzmurray): a fix for NUL bytes
+  silently corrupting a ChromaDB index. memtrust's `store()` used to trust "no exception" as proof
+  of a durable write; an opt-in read-after-write verification step now catches this.
+- [#1450](https://github.com/MemPalace/mempalace/pull/1450) (@lealbrunocalhau): a fix for an empty
+  embedding response getting scored as a wrong answer instead of flagged as infra failure. Same
+  fix as #1754 above.
+- [#1823](https://github.com/MemPalace/mempalace/pull/1823) / [#1543](https://github.com/MemPalace/mempalace/pull/1543)
+  (@fatkobra): lock and write-integrity fixes that pointed at the same read-after-write gap #1929
+  closed.
+
+**mem0**
+- [#5973](https://github.com/mem0ai/mem0/pull/5973) (@abhay-codes07, superseded by
+  [#5992](https://github.com/mem0ai/mem0/pull/5992)): an empty-string entity-id filter scoping bug.
+  memtrust's mem0 adapter only reached the hosted Platform API and had no delete operation at all,
+  so it couldn't have caught this. A self-hosted adapter with tested delete/delete_many primitives
+  now can.
+- [#4297](https://github.com/mem0ai/mem0/pull/4297) (@utkarsh240799): a dimension auto-detection
+  fix. The self-hosted adapter now routes to the right deployment, though no test yet reproduces
+  this specific bug end to end, so this one is partial, not fully caught.
+
+**Zep / Graphiti**
+- [#1489](https://github.com/getzep/graphiti/issues/1489) (@brentkearney): a bi-temporal
+  `invalid_at` correctness gap. memtrust's contradiction classifier used to discard Graphiti's own
+  `invalid_at` metadata and infer everything from a fixed top-5 text match, misreading a correctly
+  flagged case as a silent overwrite. It now checks the metadata first.
+
+**OpenViking**
+- [#3029](https://github.com/volcengine/OpenViking/issues/3029) (@dfwgj, still open): Feishu resync
+  silently deleting user-managed files. memtrust had no way to observe this failure mode at all; a
+  dedicated resource-sync-safety eval now seeds generated and user files, triggers a resync, and
+  checks what survives.
+- [#2850](https://github.com/volcengine/OpenViking/issues/2850) (@lg320531124, still open): BM25
+  search silently returning empty results at scale. memtrust now flags an empty result as distinct
+  from an ordinary miss, though it doesn't yet attribute the cause or reproduce the scale
+  condition, so this one stays partial too.
