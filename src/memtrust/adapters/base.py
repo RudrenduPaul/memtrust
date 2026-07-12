@@ -79,6 +79,19 @@ class ConflictSignal(StrEnum):
     explicitly rather than silently dropping the backend from the eval
     table -- see CLAUDE.md anti-sycophancy rule #2."""
 
+    EMPTY_OR_LOST = "empty_or_lost"
+    """The backend DOES have an update/contradiction-relevant primitive
+    (MemoryBackendAdapter.supports_update is True), the store()/update()/
+    query() calls all completed without raising BackendAPIError, but the
+    query response came back with zero records -- no exception, no error,
+    just nothing. This is distinct from NOT_APPLICABLE, which means the
+    backend structurally cannot be evaluated here at all: EMPTY_OR_LOST
+    means the backend *should* have had something to say and silently
+    didn't. This is the "call succeeded but produced nothing" failure mode
+    the benchmark exists to catch -- see evals/contradiction.py's
+    classify_case for exactly when this is assigned, never a vendor's own
+    self-report."""
+
 
 @dataclass
 class MemoryRecord:
