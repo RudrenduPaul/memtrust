@@ -279,19 +279,26 @@ LongMemEval/LoCoMo datasets). Nothing leaves your machine unless you choose to p
 ### npx (agent-native)
 
 > **Coming soon -- requires PyPI + npm publish, not live yet.** memtrust has not been published to
-> PyPI or npm as of this writing (`pip install memtrust` and `npm install memtrust` both 404
+> PyPI or npm as of this writing (`pip install memtrust` and `npm install memtrust-cli` both 404
 > today). The command below describes the planned distribution path; see `npm/` in this repo for
 > the actual wrapper source.
 
 For CI and agent runners that have Node.js available but not necessarily a Python toolchain:
 
 ```bash
-npx memtrust run --backends mempalace,mem0,zep,openviking --eval all
+npx memtrust-cli run --backends mempalace,mem0,zep,openviking --eval all
 ```
 
-This is not a zero-dependency install: `npx memtrust` still fetches `memtrust` from PyPI on first
-use. What it removes is no Python toolchain to provision by hand -- `npx memtrust` handles the
-interpreter and package fetch for you via a bundled, verified copy of Astral's
+The npm package is named `memtrust-cli` so it is unambiguous as a CLI tool at a glance (and so it
+doesn't collide with any future `memtrust` JS library package). `npx` always resolves the package
+name to its matching `bin` entry automatically, so `npx memtrust-cli ...` is what reliably works
+for a zero-install first run. Once installed, the package also exposes the shorter `memtrust`
+command as a second `bin` alias -- matching the underlying Python CLI's own command name -- so you
+are not stuck typing `memtrust-cli` for every subsequent invocation; `memtrust run ...` works too.
+
+This is not a zero-dependency install: `npx memtrust-cli` still fetches `memtrust` from PyPI on
+first use. What it removes is no Python toolchain to provision by hand -- `npx memtrust-cli`
+handles the interpreter and package fetch for you via a bundled, verified copy of Astral's
 [`uv`](https://github.com/astral-sh/uv). Each platform package bundles a genuine, SHA-256-verified
 copy of `uv`'s own GitHub release binary (fetched at npm package-publish time, never at end-user
 install time), and its `bin` shim runs `uv tool run --from memtrust memtrust <args>`, which
