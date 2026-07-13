@@ -4,8 +4,8 @@ Standardized, reproducible benchmarks for agent-memory backends, run against the
 published by them.
 
 [![CI](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](pyproject.toml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/pyproject.toml)
 
 ```bash
 pip install -e ".[dev]"
