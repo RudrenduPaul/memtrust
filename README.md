@@ -3,10 +3,23 @@
 Standardized, reproducible benchmarks for agent-memory backends, run against the vendors, not
 published by them.
 
+[![CI](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](pyproject.toml)
+
 ```bash
 pip install -e ".[dev]"
 memtrust run --backends mempalace,mem0,zep,openviking --eval all
 ```
+
+**Contents:** [Why this exists](#why-this-exists) · [What it does](#what-it-does) ·
+[Commands](#commands) · [How this differs](#how-this-differs-from-trusting-a-vendors-own-numbers) ·
+[Contradiction detection](#the-eval-that-actually-matters-contradiction-detection) ·
+[Compression fidelity](#the-eval-built-for-the-other-headline-overclaim-compression-fidelity) ·
+[The landscape](#the-landscape-verified-not-benchmarked) · [Benchmarks](#benchmarks) ·
+[GitHub Actions usage](#github-actions-usage) · [Self-host](#self-host) · [Install](#install) ·
+[Hosted layer](#what-a-hosted-trust-layer-would-add) · [Backend coverage](#backend-coverage) ·
+[Development](#development) · [License](#license) · [Success stories](#success-stories)
 
 ## Why this exists
 
@@ -45,8 +58,9 @@ produce the output shown. Nothing here is simulated.
 
 ```
 $ memtrust run --backends mempalace,mem0,zep,openviking --eval all
-memtrust 0.1.0 -- run_id=mt_2026-07-12T015520Z
-Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction, compression
+memtrust 0.1.0 -- run_id=mt_2026-07-13T053844Z
+Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction,
+resource_sync_safety, compression
 
 mempalace: SKIPPED (not configured) -- mempalace is not configured: environment variable
 MEMPALACE_STORAGE_PATH is not set. Skipping this backend. See docs/methodology.md for setup
@@ -61,7 +75,7 @@ instructions.
 
 Cost: $0.00 (no LLM-judged evals ran -- structural evals only, or judge not configured)
 
-Full report: memtrust-report-2026-07-12.json
+Full report: memtrust-report-2026-07-13.json
 ```
 
 That's the real, reproducible behavior of a fresh clone with no credentials: every backend reports
@@ -76,22 +90,51 @@ suite:
 ```
 $ pytest --cov=memtrust --cov-report=term-missing
 ...
-Name                                    Stmts   Miss  Cover
------------------------------------------------------------
-src/memtrust/adapters/base.py             70      0   100%
-src/memtrust/evals/contradiction.py       87      0   100%
-src/memtrust/evals/compression.py         86      3    97%
-src/memtrust/evals/longmemeval.py         58      0   100%
-src/memtrust/scoring/cost_tracker.py      40      0   100%
------------------------------------------------------------
-TOTAL                                    882     42    95%
+Name                                          Stmts   Miss  Cover
+-------------------------------------------------------------------
+src/memtrust/adapters/base.py                   105      6    94%
+src/memtrust/evals/contradiction.py              95      0   100%
+src/memtrust/evals/compression.py                86      1    99%
+src/memtrust/evals/longmemeval.py                63      0   100%
+src/memtrust/evals/resource_sync_safety.py      111      6    95%
+src/memtrust/scoring/cost_tracker.py             43      0   100%
+-------------------------------------------------------------------
+TOTAL                                          1195     86    93%
 
-72 passed in 0.35s
+127 passed in 0.61s
 ```
 
-72 tests, 95% overall coverage, 100% on the adapter interface and the contradiction-detection eval,
-97% on the new compression/round-trip-fidelity eval. Every test mocks its HTTP layer or uses an
-in-memory fake backend -- none of them touch a real network.
+127 tests, 93% overall coverage, 100% on the contradiction-detection eval, 99% on the
+compression/round-trip-fidelity eval, 95% on the resource-sync-safety eval, 94% on the shared
+adapter interface. Every test mocks its HTTP layer or uses an in-memory fake backend -- none of
+them touch a real network.
+
+## Commands
+
+```
+$ memtrust --help
+Usage: memtrust [OPTIONS] COMMAND [ARGS]...
+
+  memtrust: an independent, reproducible benchmark harness for agent-memory
+  backends.
+
+Options:
+  --version  Show the version and exit.
+  --help     Show this message and exit.
+
+Commands:
+  report  Read a prior `memtrust run` JSON report and print a formatted...
+  run     Run the eval suite against the requested backends.
+```
+
+| Command | Flags | What it does |
+|---|---|---|
+| `memtrust run` | `--backends TEXT` comma-separated list or `all` (default `all`) · `--eval TEXT` comma-separated from `longmemeval,locomo,contradiction,resource_sync_safety,compression`, or `all` (default `all`) · `--output FILE` (defaults to `./memtrust-report-<date>.json`) | Runs the eval suite against the requested backends. A backend without its credential env var set prints `SKIPPED` and the run continues -- this command never crashes on missing credentials. |
+| `memtrust report REPORT_PATH` | positional path to a prior JSON report | Reads a report written by `memtrust run` and prints a formatted summary. |
+| `memtrust --version` | -- | Prints the installed version (`memtrust, version 0.1.0`). |
+
+Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
+`memtrust report --help` against this repo. Nothing here is invented.
 
 ## How this differs from trusting a vendor's own numbers
 
@@ -107,6 +150,22 @@ widely used, but none of them ship a memory-backend adapter abstraction or a con
 detection eval out of the box -- they're built for RAG quality, red-teaming, and general prompt
 evaluation, not for comparing how different memory systems handle a fact that changes over time.
 memtrust is narrower and more specific on purpose.
+
+## The landscape (verified, not benchmarked)
+
+Real, publicly checkable numbers as of this writing (`gh api repos/<org>/<repo>`), not
+memtrust-run scores -- accuracy and contradiction-handling comparisons stay in the "Benchmarks"
+section below until a live run actually produces them:
+
+| Backend | GitHub stars | Self-reported description |
+|---|---|---|
+| [MemPalace](https://github.com/MemPalace/mempalace) | 57,268 | "The best-benchmarked open-source AI memory system. And it's free." |
+| [Mem0](https://github.com/mem0ai/mem0) | 60,688 | "Universal memory layer for AI Agents" |
+| [Zep / Graphiti](https://github.com/getzep/graphiti) | 28,648 | "Build Real-Time Knowledge Graphs for AI Agents" |
+| [OpenViking](https://github.com/volcengine/OpenViking) | 26,639 | "Self-evolving Context Database for AI Agents. Unify Agent Memory, Knowledge RAG and Skills." |
+
+None of these numbers say anything about which backend handles a contradicted fact correctly --
+that's the whole reason the harness exists. Star count measures adoption, not correctness.
 
 ## The eval that actually matters: contradiction detection
 
