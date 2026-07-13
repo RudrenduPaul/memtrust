@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `npm/` -- an unpublished npm-distributable CLI wrapper (`npx memtrust ...`) for CI and agent
+  runners that have Node.js but not necessarily a Python toolchain. Six per-platform optional
+  packages (`@memtrust/darwin-arm64`, `darwin-x64`, `linux-arm64`, `linux-x64`, `win32-arm64`,
+  `win32-x64`) each bundle a genuine, SHA-256-verified copy of Astral's `uv` binary
+  (github.com/astral-sh/uv, dual-licensed MIT OR Apache-2.0), fetched from uv's own GitHub
+  release 0.11.28 at npm package-publish time via a `prepack` script, never at end-user install
+  time. The `memtrust` bin shim runs `uv tool run --from memtrust memtrust <args>`, which
+  bootstraps a Python interpreter and installs `memtrust` from PyPI on first use. Not yet
+  published to npm -- gated on a separate publish step. See the README's "npx (agent-native)"
+  section and `npm/` for the wrapper source and third-party attribution.
+
 ## [0.1.0] - 2026-07-11
 
 Initial release.
