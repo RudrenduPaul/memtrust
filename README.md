@@ -215,6 +215,30 @@ Point an adapter at your own backend, or run the suite against your own conversa
 of the bundled synthetic fixtures (see `docs/methodology.md`'s note on swapping in the real
 LongMemEval/LoCoMo datasets). Nothing leaves your machine unless you choose to publish it.
 
+## Install
+
+### npx (agent-native)
+
+> **Coming soon -- requires PyPI + npm publish, not live yet.** memtrust has not been published to
+> PyPI or npm as of this writing (`pip install memtrust` and `npm install memtrust` both 404
+> today). The command below describes the planned distribution path; see `npm/` in this repo for
+> the actual wrapper source.
+
+For CI and agent runners that have Node.js available but not necessarily a Python toolchain:
+
+```bash
+npx memtrust run --backends mempalace,mem0,zep,openviking --eval all
+```
+
+This is not a zero-dependency install: `npx memtrust` still fetches `memtrust` from PyPI on first
+use. What it removes is no Python toolchain to provision by hand -- `npx memtrust` handles the
+interpreter and package fetch for you via a bundled, verified copy of Astral's
+[`uv`](https://github.com/astral-sh/uv). Each platform package bundles a genuine, SHA-256-verified
+copy of `uv`'s own GitHub release binary (fetched at npm package-publish time, never at end-user
+install time), and its `bin` shim runs `uv tool run --from memtrust memtrust <args>`, which
+transparently bootstraps a Python interpreter and installs `memtrust` from PyPI, caching it after
+the first run.
+
 ## What a hosted trust layer would add
 
 The harness, adapters, and leaderboard in this repo are the entire OSS surface, and they're

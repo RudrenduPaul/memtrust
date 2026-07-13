@@ -1,0 +1,26 @@
+{
+  "name": "memtrust",
+  "version": "0.1.0",
+  "description": "npx-runnable wrapper for the memtrust agent-memory benchmark harness. Bootstraps a verified copy of Astral's uv to fetch and run memtrust from PyPI -- no Python toolchain to provision by hand.",
+  "bin": { "memtrust": "bin/memtrust.js" },
+  "files": ["bin/"],
+  "engines": { "node": ">=16" },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RudrenduPaul/memtrust.git"
+  },
+  "homepage": "https://github.com/RudrenduPaul/memtrust",
+  "bugs": "https://github.com/RudrenduPaul/memtrust/issues",
+  "keywords": ["llm", "agent", "memory", "benchmark", "eval", "evaluation", "uv"],
+  "optionalDependencies": {
+    "@memtrust/darwin-x64": "0.1.0",
+    "@memtrust/darwin-arm64": "0.1.0",
+    "@memtrust/linux-x64": "0.1.0",
+    "@memtrust/linux-arm64": "0.1.0",
+    "@memtrust/win32-x64": "0.1.0",
+    "@memtrust/win32-arm64": "0.1.0"
+  }
+}
