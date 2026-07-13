@@ -1,8 +1,8 @@
 {
-  "name": "memtrust",
+  "name": "memtrust-cli",
   "version": "0.1.0",
   "description": "npx-runnable wrapper for the memtrust agent-memory benchmark harness. Bootstraps a verified copy of Astral's uv to fetch and run memtrust from PyPI -- no Python toolchain to provision by hand.",
-  "bin": { "memtrust": "bin/memtrust.js" },
+  "bin": { "memtrust-cli": "bin/memtrust.js", "memtrust": "bin/memtrust.js" },
   "files": ["bin/"],
   "engines": { "node": ">=16" },
   "os": ["darwin", "linux", "win32"],
@@ -16,11 +16,11 @@
   "bugs": "https://github.com/RudrenduPaul/memtrust/issues",
   "keywords": ["llm", "agent", "memory", "benchmark", "eval", "evaluation", "uv"],
   "optionalDependencies": {
-    "@memtrust/darwin-x64": "0.1.0",
-    "@memtrust/darwin-arm64": "0.1.0",
-    "@memtrust/linux-x64": "0.1.0",
-    "@memtrust/linux-arm64": "0.1.0",
-    "@memtrust/win32-x64": "0.1.0",
-    "@memtrust/win32-arm64": "0.1.0"
+    "@memtrust-cli/darwin-x64": "0.1.0",
+    "@memtrust-cli/darwin-arm64": "0.1.0",
+    "@memtrust-cli/linux-x64": "0.1.0",
+    "@memtrust-cli/linux-arm64": "0.1.0",
+    "@memtrust-cli/win32-x64": "0.1.0",
+    "@memtrust-cli/win32-arm64": "0.1.0"
   }
 }
