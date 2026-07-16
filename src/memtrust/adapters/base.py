@@ -92,6 +92,43 @@ class ConflictSignal(StrEnum):
     classify_case for exactly when this is assigned, never a vendor's own
     self-report."""
 
+    EDGE_INTEGRITY_VIOLATION = "edge_integrity_violation"
+    """A returned record is edge-shaped (its `raw` fragment carries both a
+    `source_node_uuid` and a `target_node_uuid` key -- the property names
+    graphiti_core's `EntityEdge` writes on every relationship) but at
+    least one of those two values is missing or falsy. This is a
+    structural integrity check, not a value-classification one: it exists
+    because two independently root-caused, real graphiti_core bugs
+    produced exactly this shape --
+
+      * getzep/graphiti#1013: the Neo4j bulk edge-save Cypher query built
+        its SET clause from an enumerated field list that omitted
+        `EntityEdge.attributes` and `reference_time`, so a bulk-saved edge
+        could come back missing properties a single-edge save() would
+        have written. Confirmed fixed upstream (merged) by switching the
+        bulk query to `SET e = edge` (Neo4j's default-case Cypher
+        variable; FalkorDB's branch of the same function uses `SET r =
+        edge`) -- see
+        graphiti_core/models/edges/edge_db_queries.py's
+        `get_entity_edge_save_bulk_query()` on the `main` branch as of
+        2026-07-16.
+      * getzep/graphiti#1001: FalkorDB's `add_triplet()`-era edge-creation
+        path used a `MATCH` (not `MERGE`/`CREATE`) for the endpoint nodes,
+        which silently no-ops if either node is absent, and never set
+        `source_node_uuid`/`target_node_uuid` as edge properties at all.
+        Closed via the same #1013 refactor; the FalkorDB driver has since
+        been rewritten (see `graphiti_core/driver/falkordb/operations/`)
+        and no longer exposes the old `add_triplet()` method.
+
+    Both are described upstream as already fixed/closed on `main` as of
+    this adapter's build -- this signal exists so the harness can *detect*
+    the failure shape if it ever reproduces against an older/pinned
+    graphiti-core version, or against a different backend that has the
+    same class of bug, not because memtrust has reproduced either bug
+    live against a running Neo4j/FalkorDB instance. See
+    docs/methodology.md and zep_graphiti_selfhosted_adapter.py for the
+    honesty caveat on what this repo has and has not actually run."""
+
 
 class RankingSignal(StrEnum):
     """Whether a backend's claimed result ordering is actually driven by a
@@ -163,6 +200,20 @@ class MemoryRecord:
     score: float | None = None
     created_at: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    attributes: dict[str, object] = field(default_factory=dict)
+    """Structured, non-string-coerced properties this record's backend
+    attaches to it -- e.g. graphiti_core's `EntityEdge.attributes` dict,
+    which can hold arbitrary typed values (not just strings) describing
+    the edge/entity. Distinct from `metadata` above (harness-derived,
+    string-only markers like `invalid_at`) and from `raw` below (the
+    entire unmodified response fragment, kept for audit purposes only).
+    `attributes` exists specifically so a backend's own structured
+    per-record properties survive the adapter boundary in a typed-enough
+    shape for an eval to inspect programmatically, rather than forcing
+    every consumer to dig through `raw`. Defaults to empty for every
+    adapter that has no such concept -- most backends don't, and an empty
+    dict here is a normal, expected value, not a gap.
+    """
     raw: dict[str, object] = field(default_factory=dict)
     """Unmodified vendor response fragment for this record, kept for
     audit/raw-log purposes. Never used for scoring -- scoring only reads
