@@ -17,20 +17,23 @@ from memtrust.adapters.mem0_adapter import Mem0Adapter, Mem0SelfHostedAdapter
 from memtrust.adapters.mempalace_adapter import MemPalaceAdapter
 from memtrust.adapters.openviking_adapter import OpenVikingAdapter
 from memtrust.adapters.zep_graphiti_adapter import ZepGraphitiAdapter
+from memtrust.adapters.zep_graphiti_selfhosted_adapter import ZepGraphitiSelfHostedAdapter
 
 #: Registry the CLI resolves --backends names against. Keys are the
 #: user-facing backend names used on the command line.
 #:
-#: "mem0_selfhosted" is intentionally not part of cli.ALL_BACKENDS (the
-#: set "all" expands to) -- it targets a self-run local server rather than
-#: a hosted vendor API, so it is opt-in only, never auto-included. See
-#: docs/methodology.md for its confidence level.
+#: "mem0_selfhosted" and "graphiti_selfhosted" are intentionally not part
+#: of cli.ALL_BACKENDS (the set "all" expands to) -- both target a
+#: self-run local deployment rather than a hosted vendor API, so both are
+#: opt-in only, never auto-included. See docs/methodology.md for their
+#: confidence levels.
 ADAPTER_REGISTRY: dict[str, type[MemoryBackendAdapter]] = {
     "mempalace": MemPalaceAdapter,
     "mem0": Mem0Adapter,
     "mem0_selfhosted": Mem0SelfHostedAdapter,
     "zep": ZepGraphitiAdapter,
     "graphiti": ZepGraphitiAdapter,
+    "graphiti_selfhosted": ZepGraphitiSelfHostedAdapter,
     "openviking": OpenVikingAdapter,
 }
 
@@ -50,4 +53,5 @@ __all__ = [
     "MemPalaceAdapter",
     "OpenVikingAdapter",
     "ZepGraphitiAdapter",
+    "ZepGraphitiSelfHostedAdapter",
 ]
