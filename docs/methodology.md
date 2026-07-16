@@ -130,9 +130,9 @@ method also returns a `ConflictSignal` it derived from vendor-specific evidence 
 `invalid_at` timestamp, MemPalace's `invalidated` marker, etc.). The classifier in step 4 above
 cross-checks that signal against the literal retrieved text rather than accepting it outright. An
 adapter that reports `FLAGGED` while the actual returned content contains neither value is
-downgraded to `NOT_APPLICABLE`, not credited with a pass it did not earn. This mirrors [redacted]
-[redacted] (no backend gets a "verified" claim it cannot support) applied at the
-eval-scoring level, not just the README level.
+downgraded to `NOT_APPLICABLE`, not credited with a pass it did not earn. No backend gets a
+"verified" claim it cannot support -- that rule applies at the eval-scoring level, not just the
+README level.
 
 ## Compression/round-trip-fidelity scoring logic
 
@@ -307,9 +307,9 @@ rather than silently reporting $0.00.
 
 ## Vendor-pushback self-check
 
-Before publishing any run's numbers, the honest question from [redacted] [redacted] is
-asked and answered here, not skipped: *if MemPalace's, Mem0's, or Zep's own team read this
-methodology, could they point to a specific, defensible flaw?*
+Before publishing any run's numbers, the honest question is asked and answered here, not skipped:
+*if MemPalace's, Mem0's, or Zep's own team read this methodology, could they point to a specific,
+defensible flaw?*
 
 As of this writing, the most defensible objection would be: two of the five adapters
 (MemPalace, OpenViking) are built against best-effort interpretations of documented concepts
