@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.2] - 2026-07-16
 
 ### Added
 
@@ -17,6 +17,10 @@ All notable changes to this project are documented here. Format loosely follows
   bootstraps a Python interpreter and installs `memtrust` from PyPI on first use. Not yet
   published to npm -- gated on a separate publish step. See the README's "npx (agent-native)"
   section and `npm/` for the wrapper source and third-party attribution.
+
+### Fixed
+
+- PyPI `project.urls` now link each author to their GitHub profile instead of leaving the `Author` field email-less with no way to reach either maintainer
 
 ## [0.1.0] - 2026-07-11
 
