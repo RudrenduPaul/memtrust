@@ -37,6 +37,28 @@ deleting user-owned files the ingestion watcher did not generate --
 volcengine/OpenViking#3029) that the store/query/update model alone
 cannot observe.
 
+store() honors a `resource_path` metadata key (e.g.
+"entities/people/jordan-lee.md") when the caller supplies one, writing
+to that real nested `viking://` path instead of always falling back to
+the flat `memory/{session_id}/{sha256(content)[:16]}` single-level
+filename. Without `resource_path` in metadata, the flat-hash behavior
+is unchanged (backward compatible for every existing caller). This
+closes a structural gap found validating volcengine/OpenViking#1703
+(index_resource() in OpenViking's embedding_utils.py skipped every
+subdirectory during reindex, so nested-directory content was never
+vectorized and searches over it silently returned nothing): before this
+change, memtrust's own store() never actually constructed a real nested
+directory tree against OpenViking, so a directory-indexing bug like
+#1703 was structurally unreachable by this harness regardless of how
+good the eval classification logic was. list_resource_paths() now does
+a real recursive tree walk (bounded by an optional `max_depth`) so
+nested paths a listing response reports as directories are actually
+descended into and returned as leaf file paths, not just whatever a
+single flat response happened to contain. See docs/methodology.md for
+the honest scope of what this closes: it makes the #1703 bug class
+reachable by this harness's storage layer, it does not reproduce
+OpenViking's real server-side reindex bug without a live instance.
+
 Gated on OPENVIKING_API_KEY, matching the project's hosted "OpenViking
 Studio" offering; OPENVIKING_BASE_URL may override the default host to
 point at a self-hosted server instead.
@@ -98,11 +120,22 @@ class OpenVikingAdapter(MemoryBackendAdapter):
         # MemoryBackendAdapter.supported_modes.
         del mode
         timer = self._timed()
-        memory_key = _slugify(content)
+        metadata = metadata or {}
+        # A caller (e.g. evals/resource_sync_safety.py) that knows the real
+        # nested path a piece of content belongs under -- "entities/people/
+        # jordan-lee.md", "preferences/user-482/notification-settings.md" --
+        # passes it via the `resource_path` metadata key, and store()
+        # writes to that real path instead of flattening every write to a
+        # single-level content-hash filename. Falls back to the flat hash
+        # when no resource_path is supplied, so every existing caller that
+        # never sets this key keeps its current behavior unchanged. See the
+        # module docstring for why this matters (volcengine/OpenViking#1703).
+        resource_path = metadata.get("resource_path")
+        memory_key = resource_path.strip("/") if resource_path else _slugify(content)
         payload: dict[str, object] = {
             "path": f"viking://{self._path(session_id, memory_key)}",
             "content": content,
-            "metadata": metadata or {},
+            "metadata": metadata,
         }
         try:
             resp = self._http.post("/v1/fs/write", json=payload)
@@ -184,7 +217,27 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data
         )
 
-    def list_resource_paths(self, prefix: str) -> list[str]:
+    def list_resource_paths(self, prefix: str, max_depth: int = 8) -> list[str]:
+        """Recursively list every leaf file path under `prefix`.
+
+        A single `/v1/fs/list` response is not assumed to already contain
+        every nested file -- each returned entry is inspected, and any
+        entry the listing endpoint reports as a directory (a dict with
+        `is_dir`/`type: "directory"`, or a bare path string ending in `/`)
+        is itself descended into with a follow-up `/v1/fs/list` call,
+        rather than being dropped or treated as a leaf. `max_depth` bounds
+        that recursion (default 8) so a misbehaving or cyclic listing
+        response cannot recurse unboundedly.
+
+        This exists because a flat, non-recursive read of whatever the
+        first response happened to contain would make nested content
+        structurally invisible to this harness regardless of what
+        store() actually wrote -- see the module docstring and
+        volcengine/OpenViking#1703.
+        """
+        return self._list_resource_paths_recursive(prefix, depth=0, max_depth=max_depth)
+
+    def _list_resource_paths_recursive(self, prefix: str, depth: int, max_depth: int) -> list[str]:
         payload = {"path_prefix": f"viking://{prefix}"}
         try:
             resp = self._http.post("/v1/fs/list", json=payload)
@@ -196,10 +249,29 @@ class OpenVikingAdapter(MemoryBackendAdapter):
         paths: list[str] = []
         for entry in entries:
             if isinstance(entry, dict):
-                paths.append(str(entry.get("path", "")))
+                entry_path = str(entry.get("path", ""))
+                is_dir = bool(entry.get("is_dir") or entry.get("type") == "directory")
             else:
-                paths.append(str(entry))
-        return [p for p in paths if p]
+                entry_path = str(entry)
+                is_dir = entry_path.endswith("/")
+            if not entry_path:
+                continue
+            if is_dir:
+                if depth >= max_depth:
+                    continue
+                sub_prefix = entry_path
+                if sub_prefix.startswith("viking://"):
+                    sub_prefix = sub_prefix[len("viking://") :]
+                sub_prefix = sub_prefix.rstrip("/")
+                if not sub_prefix or sub_prefix == prefix.rstrip("/"):
+                    # Guard against a listing entry that just echoes the
+                    # queried prefix back as a "directory" -- recursing on
+                    # it would loop forever at constant depth.
+                    continue
+                paths.extend(self._list_resource_paths_recursive(sub_prefix, depth + 1, max_depth))
+            else:
+                paths.append(entry_path)
+        return paths
 
     def trigger_resync(self, prefix: str) -> None:
         payload = {"path_prefix": f"viking://{prefix}"}

@@ -210,6 +210,82 @@ To use it:
   scores an adapter with `supports_update = False`: recorded explicitly, never silently dropped.
   See CONTRIBUTING.md.
 
+### MemTrust Resource-Sync-Safety Eval (original)
+
+- **Not derived from any published dataset.** Modeled directly on volcengine/OpenViking#3029 (a
+  Feishu resync mechanism silently deleting user-owned files an ingestion watcher had not itself
+  generated) and, as of this change, additionally shaped to make volcengine/OpenViking#1703
+  reachable (`index_resource()` in OpenViking's `embedding_utils.py` skipped every subdirectory
+  during reindex, so nested-directory content was never vectorized and searches over it silently
+  returned nothing -- reported by GitHub user SonicBotMan).
+- **Fixture:** `tests/fixtures/resource_sync_cases.json` -- 4 hand-written cases, each seeding a
+  mix of `generated`/`user`-origin files under one resource prefix. Case `mt-resync-004` is the
+  one added for this change: its seed files nest 3 real directory levels deep
+  (`generated/entities/people/jordan-lee.md`, `user-notes/preferences/user-482/notification-
+  settings.md`, `user-notes/preferences/user-482/timezone.md`), mirroring #1703's own
+  `entities/people/` and `preferences/{user_id}/` examples, rather than the single-level
+  `origin-folder/file.md` shape every earlier case used.
+- **Why the earlier fixture couldn't have exercised #1703 at all.** Before this change,
+  `OpenVikingAdapter.store()` ignored the `resource_path` metadata key this eval already passed
+  it and always wrote to a flat `memory/{session_id}/{sha256(content)[:16]}` path -- a single
+  level, regardless of what nested path a seed file's `path_suffix` specified. `store()` now
+  honors `resource_path` and writes to that real nested path when supplied (falling back to the
+  prior flat-hash behavior when it isn't, so every other eval's calls are unaffected).
+  `list_resource_paths()` now does a real recursive tree walk instead of trusting a single flat
+  response, so directory entries a listing response reports are actually descended into. See
+  `src/memtrust/adapters/openviking_adapter.py`'s module docstring for the full detail.
+- **What this closes, precisely, and what it does not.** This change closes the *storage-layer
+  precondition*: memtrust can now construct a real nested directory tree against OpenViking (or
+  any adapter that honors `resource_path`), which is what makes a directory-indexing bug class
+  like #1703 structurally reachable by this harness at all. It does **not** reproduce OpenViking's
+  real server-side reindex bug end-to-end -- that requires `trigger_resync()` to hit a live
+  OpenViking instance whose actual `index_resource()` skips subdirectories, and no test in this
+  repo does that (every HTTP call in `pytest` is mocked; see the table at the top of this
+  document). The new `ResourceSyncSignal.NESTED_CONTENT_UNINDEXED` classification and its
+  covering unit tests (`tests/test_evals.py::test_resource_sync_detects_nested_content_unindexed_matching_issue_1703`)
+  prove the *eval's own classification logic* correctly distinguishes "present on disk but never
+  returned by search" from deletion (#3029's signal) or overwrite, against a fake in-memory
+  adapter built to model #1703's shape -- they do not, and cannot, prove anything about a real
+  OpenViking server's actual reindex code.
+- **Extending this eval:** adding more cases means adding entries to the fixture file with the
+  same `case_id`/`prefix`/`seed_files` shape. Adding a nested case for another adapter to be
+  exercised against requires that adapter's own `store()` to honor `resource_path` metadata the
+  same way `OpenVikingAdapter` now does -- no other adapter has been updated to do this as part of
+  this change, since `supports_resource_sync` is currently only `True` on `OpenVikingAdapter`. See
+  CONTRIBUTING.md.
+
+## Resource-Sync-Safety scoring logic
+
+Implemented in `src/memtrust/evals/resource_sync_safety.py`, function `classify_resource_sync_file()`,
+called from `run_resource_sync_eval()`. For every seed file in every case:
+
+1. Store the file via `adapter.store(case.prefix, seed.content, metadata={"resource_path":
+   seed.path_suffix, "origin": seed.origin})`.
+2. List paths under `case.prefix` before the resync (`paths_before`).
+3. Call `adapter.trigger_resync(case.prefix)`.
+4. List paths under `case.prefix` again (`paths_after`).
+5. If the file's stored path is present in `paths_after`, issue a `query()` for the file's own
+   content and check two independent things: whether *any* returned record's `memory_id` equals
+   the stored path (`indexed_after_resync`), and whether any returned record's content actually
+   contains the seeded content (`content_matches_after_resync`). These are deliberately kept
+   separate -- a record existing under the right id with the wrong content (overwrite) is a
+   different failure from no record existing under that id at all (never indexed).
+
+Classification (first matching rule wins):
+
+| Condition | Signal |
+|---|---|
+| Present before, gone after | **DELETED_USER_FILE** -- the volcengine/OpenViking#3029 shape |
+| Present after, `indexed_after_resync is False` | **NESTED_CONTENT_UNINDEXED** -- the volcengine/OpenViking#1703 shape: on disk, never searchable |
+| Present after, `content_matches_after_resync is False` | **OVERWRITTEN_UNCHANGED** -- a record was found under the right id, but its content had changed |
+| Present after, neither of the above | **PRESERVED** |
+| Never observed present before the resync | **NOT_APPLICABLE** |
+
+`indexed_after_resync=None` (the default when a caller doesn't distinguish the two questions
+above, or when `present_after` is `False` so no query was even attempted) never triggers
+`NESTED_CONTENT_UNINDEXED` -- this keeps `classify_resource_sync_file()` backward compatible with
+callers that only pass the first three positional arguments.
+
 ## Contradiction-detection scoring logic (the eval this project exists for)
 
 Implemented in `src/memtrust/evals/contradiction.py`, function `classify_case()`. For every case:
@@ -357,7 +433,7 @@ relying on its output.
 | `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
 | `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** The `importance`/`emotional_weight`/`weight` metadata keys `_classify_ranking_signal()` checks (see the Ranking-Quality eval above) are the same LOW-confidence category: they come from mempalace/mempalace#1733's own root-cause report on `layers.py`, not a confirmed field-name reference for what `recall()`'s response `metadata` actually contains on a live instance. |
-| `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). **This is the adapter most likely to need correction against a live instance.** |
+| `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). `store()` now honors a `resource_path` metadata key to write to a real nested path (falling back to the prior flat content-hash path otherwise), and `list_resource_paths()` now recursively walks directory entries instead of trusting one flat response -- both are still best-effort against the same unconfirmed `/v1/fs/write`/`/v1/fs/list` paths, not newly-confirmed wire format. **This is the adapter most likely to need correction against a live instance.** |
 
 ## Read-after-write verification (opt-in, off by default)
 
@@ -478,3 +554,18 @@ and in the delete case, not reachable at all without an interface change this ba
 make. Anyone relying on this adapter to reproduce a specific self-hosted bug report should verify
 against a live instance first, not take the source-code read as equivalent to a live-tested
 integration.
+
+The same objection applies, in the same shape, to the `NESTED_CONTENT_UNINDEXED` signal added to
+the resource-sync-safety eval for volcengine/OpenViking#1703. What this change actually verified:
+`OpenVikingAdapter.store()` now constructs a real nested directory tree when given a
+`resource_path`, `list_resource_paths()` now really walks it recursively, and
+`classify_resource_sync_file()` correctly separates "never indexed" from "deleted" and
+"overwritten" against a fake adapter purpose-built to model #1703's shape (see
+`tests/test_evals.py::NestedIndexSkipFakeAdapter`). What it did not verify: that OpenViking's real,
+live server actually has this bug, still has this bug as of any date after #1703 was reported, or
+would produce exactly this signal if run against this eval today. Nobody should read a
+`NESTED_CONTENT_UNINDEXED` result in a report generated by this repo as confirmation that a live
+OpenViking instance is currently affected -- it confirms only that memtrust's storage layer and
+scoring logic are now capable of detecting that failure mode *if* a live instance exhibits it.
+Confirming the live bug itself requires running `resource_sync_safety` against a real, running
+OpenViking server with `OPENVIKING_API_KEY` configured, which this build pass did not do.

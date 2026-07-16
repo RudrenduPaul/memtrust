@@ -561,8 +561,19 @@ def test_classify_case_no_metadata_adapters_unaffected_by_fix(
 
 def test_resource_sync_dataset_loads() -> None:
     cases = load_resource_sync_dataset()
-    assert len(cases) == 3
+    assert len(cases) == 4
     assert all(len(c.seed_files) >= 2 for c in cases)
+
+
+def test_resource_sync_dataset_has_a_case_with_real_two_level_nesting() -> None:
+    """volcengine/OpenViking#1703's own examples were entities/people/ and
+    preferences/{user_id}/ -- at least one fixture case must mirror that
+    shape (>=2 real directory levels in path_suffix, not just a single
+    origin-folder prefix) so the eval can actually exercise nested-path
+    storage, not just flat single-level files under a shared prefix."""
+    cases = load_resource_sync_dataset()
+    nested = [sf for case in cases for sf in case.seed_files if sf.path_suffix.count("/") >= 2]
+    assert nested, "expected at least one seed file with >=2-level real nesting"
 
 
 def test_resource_sync_skips_cleanly_for_unsupported_adapter() -> None:
@@ -597,24 +608,129 @@ def test_resource_sync_detects_deleted_user_files_matching_issue_3029() -> None:
 
 
 @pytest.mark.parametrize(
-    ("present_before", "present_after", "content_matches", "expected"),
+    ("present_before", "present_after", "content_matches", "indexed_after", "expected"),
     [
-        (True, True, True, ResourceSyncSignal.PRESERVED),
-        (True, True, None, ResourceSyncSignal.PRESERVED),
-        (True, False, None, ResourceSyncSignal.DELETED_USER_FILE),
-        (True, True, False, ResourceSyncSignal.OVERWRITTEN_UNCHANGED),
-        (False, False, None, ResourceSyncSignal.NOT_APPLICABLE),
-        (False, True, True, ResourceSyncSignal.PRESERVED),
+        (True, True, True, None, ResourceSyncSignal.PRESERVED),
+        (True, True, None, None, ResourceSyncSignal.PRESERVED),
+        (True, False, None, None, ResourceSyncSignal.DELETED_USER_FILE),
+        (True, True, False, None, ResourceSyncSignal.OVERWRITTEN_UNCHANGED),
+        (False, False, None, None, ResourceSyncSignal.NOT_APPLICABLE),
+        (False, True, True, None, ResourceSyncSignal.PRESERVED),
+        # indexed_after=False -- present on disk, but no query() call ever
+        # returned a record for this path at all: the volcengine/
+        # OpenViking#1703 "never indexed" shape, distinct from
+        # OVERWRITTEN_UNCHANGED (which requires a record to have been
+        # found with the wrong content).
+        (True, True, False, False, ResourceSyncSignal.NESTED_CONTENT_UNINDEXED),
+        (True, True, None, False, ResourceSyncSignal.NESTED_CONTENT_UNINDEXED),
+        # indexed_after=True with matching content still classifies as
+        # PRESERVED -- indexed_after alone does not override a genuine
+        # content match.
+        (True, True, True, True, ResourceSyncSignal.PRESERVED),
+        # A file never observed present before the resync still has
+        # nothing meaningful to classify, regardless of indexed_after.
+        (False, False, None, False, ResourceSyncSignal.NOT_APPLICABLE),
     ],
 )
 def test_classify_resource_sync_file_matrix(
     present_before: bool,
     present_after: bool,
     content_matches: bool | None,
+    indexed_after: bool | None,
     expected: ResourceSyncSignal,
 ) -> None:
-    signal = classify_resource_sync_file(present_before, present_after, content_matches)
+    signal = classify_resource_sync_file(
+        present_before, present_after, content_matches, indexed_after
+    )
     assert signal == expected
+
+
+def test_classify_resource_sync_file_matrix_backward_compatible_three_arg_call() -> None:
+    """Callers that only pass the first three positional args (the
+    pre-existing signature) must keep getting the pre-existing behavior --
+    indexed_after_resync defaults to None, which never triggers
+    NESTED_CONTENT_UNINDEXED."""
+    assert (
+        classify_resource_sync_file(True, True, False) == ResourceSyncSignal.OVERWRITTEN_UNCHANGED
+    )
+    assert classify_resource_sync_file(True, True, True) == ResourceSyncSignal.PRESERVED
+    assert classify_resource_sync_file(True, False, None) == ResourceSyncSignal.DELETED_USER_FILE
+
+
+class NestedIndexSkipFakeAdapter(MemoryBackendAdapter):
+    """Models volcengine/OpenViking#1703 directly: trigger_resync() never
+    deletes or overwrites anything (every path survives on the
+    filesystem-mirror side, exactly like the real bug -- index_resource()
+    skipped subdirectories during *reindex*, it did not touch storage),
+    but query() only ever returns records for paths nested one level deep
+    or shallower. Any path nested two or more directory levels deep
+    (path_suffix.count("/") >= 2, matching #1703's own entities/people/
+    and preferences/{user_id}/ examples) is silently excluded from every
+    query() response -- present on disk, never searchable. This is
+    deliberately not a deletion: list_resource_paths() reports these
+    paths as present both before and after the resync."""
+
+    name = "fake-nested-index-skip"
+    env_var = "FAKE_API_KEY"
+    supports_update = True
+    supports_resource_sync = True
+
+    def __init__(self) -> None:
+        self._files: dict[str, dict[str, str]] = {}
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        metadata = metadata or {}
+        resource_path = metadata.get("resource_path", content[:12])
+        path = f"{session_id}/{resource_path}"
+        self._files.setdefault(session_id, {})[path] = content
+        return StoreResult(memory_id=path, latency_ms=0.1)
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        matches = [
+            MemoryRecord(memory_id=path, content=content)
+            for path, content in self._files.get(session_id, {}).items()
+            # Only paths nested at most one directory level deep (relative
+            # to the session/prefix) get indexed -- mirrors #1703's actual
+            # skip-every-subdirectory shape.
+            if path.removeprefix(f"{session_id}/").count("/") <= 1
+            and query.lower() in content.lower()
+        ][:top_k]
+        return QueryResult(
+            records=matches, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        raise BackendAPIError(self.name, "not implemented for this fake adapter")
+
+    def list_resource_paths(self, prefix: str) -> list[str]:
+        return list(self._files.get(prefix, {}).keys())
+
+    def trigger_resync(self, prefix: str) -> None:
+        return None  # never deletes or overwrites -- only the index lags
+
+
+def test_resource_sync_detects_nested_content_unindexed_matching_issue_1703() -> None:
+    adapter = NestedIndexSkipFakeAdapter()
+    result = run_resource_sync_eval(adapter)
+    assert result.skipped is False
+
+    nested_results = [f for f in result.file_results if f.path_suffix.count("/") >= 2]
+    shallow_results = [f for f in result.file_results if f.path_suffix.count("/") < 2]
+
+    assert nested_results, "fixture must actually seed a >=2-level-nested file"
+    assert shallow_results, "fixture must actually seed a shallow (<2-level) file"
+    assert all(f.signal == ResourceSyncSignal.NESTED_CONTENT_UNINDEXED for f in nested_results)
+    assert all(f.present_after_resync is True for f in nested_results)
+    assert all(f.signal == ResourceSyncSignal.PRESERVED for f in shallow_results)
+    assert result.nested_content_unindexed_rate == len(nested_results) / len(result.scored_files)
+    # Not a deletion -- user_file_deletion_rate stays 0 even though
+    # search is broken for the nested files.
+    assert result.user_file_deletion_rate == 0.0
 
 
 # ---------------------------------------------------------------------------
