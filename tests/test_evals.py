@@ -22,6 +22,7 @@ from memtrust.adapters.base import (
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
+    RankingSignal,
     StoreResult,
     UpdateResult,
 )
@@ -38,6 +39,15 @@ from memtrust.evals.locomo import load_exclude_question_ids as load_locomo_exclu
 from memtrust.evals.locomo import run_locomo
 from memtrust.evals.longmemeval import load_dataset as load_longmemeval_dataset
 from memtrust.evals.longmemeval import run_longmemeval
+from memtrust.evals.ranking_quality import (
+    RankingQualityCase,
+    RankingQualitySeedRecord,
+    classify_ranking_case,
+    run_ranking_quality_eval,
+)
+from memtrust.evals.ranking_quality import (
+    load_dataset as load_ranking_quality_dataset,
+)
 from memtrust.evals.resource_sync_safety import (
     ResourceSyncSignal,
     classify_resource_sync_file,
@@ -171,6 +181,79 @@ class ResourceSyncFakeAdapter(MemoryBackendAdapter):
         self._files[prefix] = {
             path: value for path, value in files.items() if value[1] != self._drop_origin
         }
+
+
+class RankingInsertionOrderFakeAdapter(MemoryBackendAdapter):
+    """Always returns records in the order they were stored, completely
+    ignoring any ranking-relevant metadata -- models a backend whose
+    ranking primitive has degenerated to plain insertion order, the exact
+    mempalace/mempalace#1733 shape (Kartalops's 0/45,969-drawers finding)
+    regardless of whether the ranking field is constant, absent, or even
+    varied on the stored records."""
+
+    name = "fake-ranking-insertion-order"
+    env_var = "FAKE_API_KEY"
+
+    def __init__(self) -> None:
+        self._store: dict[str, list[MemoryRecord]] = {}
+        self._counter = 0
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        self._counter += 1
+        memory_id = f"m{self._counter}"
+        record = MemoryRecord(memory_id=memory_id, content=content, metadata=metadata or {})
+        self._store.setdefault(session_id, []).append(record)
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        records = self._store.get(session_id, [])[:top_k]
+        return QueryResult(
+            records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+
+class RankingSortedByImportanceFakeAdapter(RankingInsertionOrderFakeAdapter):
+    """Sorts returned records by descending `importance` metadata value --
+    models a backend whose ranking signal genuinely works. This is the
+    negative control the new eval must NOT flag."""
+
+    name = "fake-ranking-sorted"
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        records = sorted(
+            self._store.get(session_id, []),
+            key=lambda r: float(r.metadata.get("importance", "0")),
+            reverse=True,
+        )
+        return QueryResult(
+            records=records[:top_k], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+
+class RankingReversedFakeAdapter(RankingInsertionOrderFakeAdapter):
+    """Returns records in ascending `importance` order -- models a backend
+    that has a genuine, varying per-record signal available and still
+    doesn't order by it (ORDER_INCONSISTENT, distinct from
+    MISSING_ORDERING_KEY)."""
+
+    name = "fake-ranking-reversed"
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        records = sorted(
+            self._store.get(session_id, []),
+            key=lambda r: float(r.metadata.get("importance", "0")),
+        )
+        return QueryResult(
+            records=records[:top_k], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
 
 
 class FailingFakeAdapter(MemoryBackendAdapter):
@@ -792,3 +875,196 @@ def test_load_exclude_question_ids_from_text_file(tmp_path: Path) -> None:
         )
     )
     assert load_locomo_exclude_question_ids(path) == {"mt-locomo-001::2", "mt-locomo-004::0"}
+
+
+# ---------------------------------------------------------------------------
+# Ranking-Quality eval -- distinct from ConflictSignal, closes the
+# mempalace/mempalace#1733 gap (Kartalops): correct content, silently
+# degenerate order.
+# ---------------------------------------------------------------------------
+
+
+def test_ranking_quality_dataset_loads() -> None:
+    cases = load_ranking_quality_dataset()
+    assert len(cases) == 4
+    assert all(isinstance(c, RankingQualityCase) for c in cases)
+
+
+def test_ranking_quality_reproduces_1733_constant_importance() -> None:
+    """The exact bug shape: every record shares the same `importance`
+    value, so a backend that (like MemPalace's real ingest path) never
+    writes a real signal degenerates to insertion order. Must fire."""
+    adapter = RankingInsertionOrderFakeAdapter()
+    result = run_ranking_quality_eval(adapter)
+    case_result = next(c for c in result.case_results if c.case.case_id == "mt-rank-001")
+    assert case_result.error is None
+    assert case_result.signal == RankingSignal.MISSING_ORDERING_KEY
+    assert case_result.matches_insertion_order is True
+
+
+def test_ranking_quality_reproduces_1733_field_never_written() -> None:
+    """Even stronger form of #1733: the field isn't merely constant, it
+    was never written by any ingest path at all -- same observable
+    symptom, same signal."""
+    adapter = RankingInsertionOrderFakeAdapter()
+    result = run_ranking_quality_eval(adapter)
+    case_result = next(c for c in result.case_results if c.case.case_id == "mt-rank-004")
+    assert case_result.error is None
+    assert case_result.signal == RankingSignal.MISSING_ORDERING_KEY
+    assert case_result.field_values == [None, None, None]
+
+
+def test_ranking_quality_does_not_false_positive_on_genuine_signal() -> None:
+    """Negative control this eval must get right: genuinely varied
+    importance values that a correctly-behaving backend orders by
+    descending value must NOT be flagged as MISSING_ORDERING_KEY."""
+    adapter = RankingSortedByImportanceFakeAdapter()
+    result = run_ranking_quality_eval(adapter)
+    case_result = next(c for c in result.case_results if c.case.case_id == "mt-rank-002")
+    assert case_result.error is None
+    assert case_result.signal == RankingSignal.SIGNAL_DRIVEN
+    present = [v for v in case_result.field_values if v is not None]
+    assert present == sorted(present, reverse=True)
+
+
+def test_ranking_quality_flags_order_inconsistent_when_signal_exists_but_unused() -> None:
+    """A backend can carry a genuinely varying signal and still not order
+    by it -- distinct from MISSING_ORDERING_KEY, and this eval must tell
+    the two apart rather than lumping them into one bucket."""
+    adapter = RankingReversedFakeAdapter()
+    result = run_ranking_quality_eval(adapter)
+    case_result = next(c for c in result.case_results if c.case.case_id == "mt-rank-003")
+    assert case_result.error is None
+    assert case_result.signal == RankingSignal.ORDER_INCONSISTENT
+
+
+def test_ranking_quality_handles_backend_failure() -> None:
+    adapter = FailingFakeAdapter()
+    result = run_ranking_quality_eval(adapter)
+    assert len(result.case_results) == 4
+    assert all(c.error is not None for c in result.case_results)
+    assert all(c.signal == RankingSignal.NOT_APPLICABLE for c in result.case_results)
+
+
+def test_ranking_quality_eval_result_rates_ignore_errored_cases() -> None:
+    adapter = RankingInsertionOrderFakeAdapter()
+    result = run_ranking_quality_eval(adapter)
+    assert result.missing_ordering_key_rate is not None
+    assert 0.0 <= result.missing_ordering_key_rate <= 1.0
+    assert len(result.scored_cases) == len(result.case_results)
+
+
+def _ranking_case(ranking_field: str = "importance") -> RankingQualityCase:
+    return RankingQualityCase(
+        case_id="rank-direct-test",
+        session_id="s",
+        query="q",
+        ranking_field=ranking_field,
+        records=[
+            RankingQualitySeedRecord(content="a", metadata={ranking_field: "0.9"}),
+            RankingQualitySeedRecord(content="b", metadata={ranking_field: "0.5"}),
+            RankingQualitySeedRecord(content="c", metadata={ranking_field: "0.1"}),
+        ],
+    )
+
+
+def test_classify_ranking_case_all_identical_is_missing_ordering_key() -> None:
+    case = _ranking_case()
+    records = [
+        MemoryRecord(memory_id="m1", content="a", metadata={"importance": "0.5"}),
+        MemoryRecord(memory_id="m2", content="b", metadata={"importance": "0.5"}),
+        MemoryRecord(memory_id="m3", content="c", metadata={"importance": "0.5"}),
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, values, matches = classify_ranking_case(case, query_result, ["m1", "m2", "m3"])
+    assert signal == RankingSignal.MISSING_ORDERING_KEY
+    assert values == [0.5, 0.5, 0.5]
+    assert matches is True
+
+
+def test_classify_ranking_case_field_missing_entirely_is_missing_ordering_key() -> None:
+    case = _ranking_case()
+    records = [
+        MemoryRecord(memory_id="m1", content="a"),
+        MemoryRecord(memory_id="m2", content="b"),
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, values, matches = classify_ranking_case(case, query_result, ["m1", "m2"])
+    assert signal == RankingSignal.MISSING_ORDERING_KEY
+    assert values == [None, None]
+
+
+def test_classify_ranking_case_partial_field_coverage_is_missing_ordering_key() -> None:
+    """A field present on some but not all returned records is just as
+    unreliable a signal as a constant/absent one -- no complete real
+    per-record signal exists either way."""
+    case = _ranking_case()
+    records = [
+        MemoryRecord(memory_id="m1", content="a", metadata={"importance": "0.9"}),
+        MemoryRecord(memory_id="m2", content="b"),
+        MemoryRecord(memory_id="m3", content="c", metadata={"importance": "0.1"}),
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, values, matches = classify_ranking_case(case, query_result, ["m1", "m2", "m3"])
+    assert signal == RankingSignal.MISSING_ORDERING_KEY
+
+
+def test_classify_ranking_case_varied_and_sorted_is_signal_driven() -> None:
+    case = _ranking_case()
+    records = [
+        MemoryRecord(memory_id="m1", content="a", metadata={"importance": "0.9"}),
+        MemoryRecord(memory_id="m2", content="b", metadata={"importance": "0.5"}),
+        MemoryRecord(memory_id="m3", content="c", metadata={"importance": "0.1"}),
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, values, matches = classify_ranking_case(case, query_result, ["m3", "m2", "m1"])
+    assert signal == RankingSignal.SIGNAL_DRIVEN
+    assert matches is False
+
+
+def test_classify_ranking_case_varied_but_unsorted_is_order_inconsistent() -> None:
+    case = _ranking_case()
+    records = [
+        MemoryRecord(memory_id="m1", content="a", metadata={"importance": "0.1"}),
+        MemoryRecord(memory_id="m2", content="b", metadata={"importance": "0.9"}),
+        MemoryRecord(memory_id="m3", content="c", metadata={"importance": "0.5"}),
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, values, matches = classify_ranking_case(case, query_result, ["m1", "m2", "m3"])
+    assert signal == RankingSignal.ORDER_INCONSISTENT
+
+
+def test_classify_ranking_case_fewer_than_two_records_is_not_applicable() -> None:
+    case = _ranking_case()
+    records = [MemoryRecord(memory_id="m1", content="a", metadata={"importance": "0.9"})]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, values, matches = classify_ranking_case(case, query_result, ["m1"])
+    assert signal == RankingSignal.NOT_APPLICABLE
+
+
+def test_classify_ranking_case_zero_records_is_not_applicable() -> None:
+    case = _ranking_case()
+    query_result = QueryResult(
+        records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, values, matches = classify_ranking_case(case, query_result, [])
+    assert signal == RankingSignal.NOT_APPLICABLE
+    assert values == []
+
+
+def test_ranking_quality_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "ranking_quality" in ALL_EVALS

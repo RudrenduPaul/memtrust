@@ -93,6 +93,67 @@ class ConflictSignal(StrEnum):
     self-report."""
 
 
+class RankingSignal(StrEnum):
+    """Whether a backend's claimed result ordering is actually driven by a
+    real per-record ranking signal, or silently degenerates to something
+    else (typically insertion order) while still returning fully correct
+    *content*.
+
+    This is a distinct taxonomy from ConflictSignal above, not a variant of
+    it. ConflictSignal classifies whether returned content is correct after
+    a contradiction; RankingSignal classifies whether correct content came
+    back in the right order. A backend can score perfectly on every
+    ConflictSignal case and still be silently broken here -- the returned
+    records are the right records, just wrongly ordered, which
+    ConflictSignal structurally cannot see because there was never a
+    content conflict to classify.
+
+    Motivating case: mempalace/mempalace#1733 (GitHub user Kartalops).
+    `mempalace/layers.py`'s `Layer1.generate()` sorts drawers by
+    `importance`/`emotional_weight`/`weight`, but no ingest path in the
+    real package ever writes those keys -- confirmed 0/45,969 drawers on a
+    real palace. `importance` silently defaults to a constant, so the
+    "ranked by importance" sort degenerates to plain insertion order, and
+    `wake-up` returns the oldest moments instead of the documented "high
+    importance, recent" ones. This is the classification the
+    ranking-quality eval reads off every query() response -- see
+    evals/ranking_quality.py.
+    """
+
+    SIGNAL_DRIVEN = "signal_driven"
+    """A ranking-relevant metadata field (importance/emotional_weight/
+    weight or whatever the adapter checks) carries genuinely varied values
+    across the returned records -- a real per-record signal exists that
+    could plausibly be driving the order. This is a claim about the
+    presence of a signal, not proof the backend actually sorted by it; see
+    evals/ranking_quality.py's classify_case-equivalent, which cross-checks
+    this claim against the actual returned order before crediting it."""
+
+    MISSING_ORDERING_KEY = "missing_ordering_key"
+    """Every returned record shares the same value for a ranking-relevant
+    metadata field -- including the case where the field is absent from
+    every record entirely, which is indistinguishable from "silently
+    defaults to a constant" from the caller's side. No real per-record
+    signal is driving order, whatever the backend's documentation claims.
+    This is the exact mempalace/mempalace#1733 shape: `importance` present
+    (or absent) and identical across every record because no ingest path
+    ever wrote a real value."""
+
+    ORDER_INCONSISTENT = "order_inconsistent"
+    """A ranking-relevant metadata field carries genuinely varied values
+    across the returned records, but the actual returned order does not
+    correlate with those values (not sorted descending by the field). A
+    real signal exists and the backend still isn't using it to order
+    results -- an adjacent but distinct bug from MISSING_ORDERING_KEY."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """No ranking-relevant metadata field was present on any returned
+    record and the result set gave no other basis (e.g. too few records)
+    to evaluate ordering at all. Recorded explicitly, never silently
+    dropped from the results table -- same convention as
+    ConflictSignal.NOT_APPLICABLE."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
@@ -120,6 +181,13 @@ class QueryResult:
     the eval scores it as a gap, not a pass or fail -- see
     evals/contradiction.py for the classification logic."""
     latency_ms: float
+    ranking_signal: RankingSignal = RankingSignal.NOT_APPLICABLE
+    """Whether a real per-record ranking signal appears to be driving this
+    response's result order, distinct from ConflictSignal above -- see
+    RankingSignal's docstring and evals/ranking_quality.py. Adapters that
+    do not inspect their own response for a ranking-relevant field default
+    to NOT_APPLICABLE, same convention as conflict_signal defaulting to
+    NOT_APPLICABLE for adapters that skip contradiction detection."""
     raw: dict[str, object] = field(default_factory=dict)
 
 
