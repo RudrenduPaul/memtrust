@@ -349,10 +349,8 @@ Apache 2.0. See `LICENSE`.
 Nine real bugs, reported by real contributors against MemPalace, mem0, Zep/Graphiti, and
 OpenViking, that memtrust's own harness either couldn't have caught before this work or can now
 catch directly. Each one below has been re-verified live against the current codebase, not just
-cited from a changelog. Full write-ups, live-validation evidence, and outreach status live in
-`[redacted internal path]`
-for the project's own tracking; the summary here is for anyone deciding whether this harness would
-have caught their own bug.
+cited from a changelog. Full write-ups and live-validation evidence are tracked internally; the
+summary here is for anyone deciding whether this harness would have caught their own bug.
 
 **MemPalace**
 - [#1754](https://github.com/MemPalace/mempalace/pull/1754) (@rodboev): a checkpoint recovery fix
