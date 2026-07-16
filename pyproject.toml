@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memtrust"
-version = "0.1.0"
+version = "0.1.2"
 description = "Independent, reproducible benchmark harness for agent-memory backends"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -44,6 +44,8 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/RudrenduPaul/memtrust"
 Issues = "https://github.com/RudrenduPaul/memtrust/issues"
+"Author - Rudrendu Paul" = "https://github.com/RudrenduPaul"
+"Author - Sourav Nandy" = "https://github.com/Sourav-nandy-ai"
 
 [project.scripts]
 memtrust = "memtrust.cli:main"
