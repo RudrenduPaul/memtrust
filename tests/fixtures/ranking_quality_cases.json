@@ -1,0 +1,51 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case stores several records under one session, each tagged with a `ranking_field` metadata value, then queries the session and checks whether the returned order actually correlates with that field. Case mt-rank-001 and mt-rank-004 reproduce the exact mempalace/mempalace#1733 shape (GitHub user Kartalops): a ranking-relevant field that is either present-but-constant or entirely absent on every record, so any apparent ordering has no real per-record signal behind it. Case mt-rank-002 is the negative control: genuinely varied importance values that a correctly-behaving backend orders by descending value -- this must NOT be flagged. Case mt-rank-003 is a backend that has a real varying signal but doesn't order by it. See docs/methodology.md and evals/ranking_quality.py for the full scoring logic.",
+  "cases": [
+    {
+      "case_id": "mt-rank-001",
+      "session_id": "ranking-session-1",
+      "query": "wake me up with my recent important memories",
+      "ranking_field": "importance",
+      "records": [
+        {"content": "Had coffee with Alex near the office.", "metadata": {"importance": "0.5"}},
+        {"content": "Signed the lease for the new apartment.", "metadata": {"importance": "0.5"}},
+        {"content": "Grandmother's health scare, went to the hospital.", "metadata": {"importance": "0.5"}},
+        {"content": "Renewed the car registration online.", "metadata": {"importance": "0.5"}}
+      ]
+    },
+    {
+      "case_id": "mt-rank-002",
+      "session_id": "ranking-session-2",
+      "query": "wake me up with my recent important memories",
+      "ranking_field": "importance",
+      "records": [
+        {"content": "Renewed the car registration online.", "metadata": {"importance": "0.2"}},
+        {"content": "Grandmother's health scare, went to the hospital.", "metadata": {"importance": "0.9"}},
+        {"content": "Signed the lease for the new apartment.", "metadata": {"importance": "0.6"}}
+      ]
+    },
+    {
+      "case_id": "mt-rank-003",
+      "session_id": "ranking-session-3",
+      "query": "wake me up with my recent important memories",
+      "ranking_field": "importance",
+      "records": [
+        {"content": "Renewed the car registration online.", "metadata": {"importance": "0.9"}},
+        {"content": "Grandmother's health scare, went to the hospital.", "metadata": {"importance": "0.2"}},
+        {"content": "Signed the lease for the new apartment.", "metadata": {"importance": "0.6"}}
+      ]
+    },
+    {
+      "case_id": "mt-rank-004",
+      "session_id": "ranking-session-4",
+      "query": "wake me up with my recent important memories",
+      "ranking_field": "importance",
+      "records": [
+        {"content": "Had coffee with Alex near the office.", "metadata": {}},
+        {"content": "Signed the lease for the new apartment.", "metadata": {}},
+        {"content": "Grandmother's health scare, went to the hospital.", "metadata": {}}
+      ]
+    }
+  ]
+}

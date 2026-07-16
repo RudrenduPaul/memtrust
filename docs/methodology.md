@@ -17,6 +17,7 @@ This matters because it changes what a number *means*.
 | LLM-judge scoring (LongMemEval, LoCoMo) | Yes, `MEMTRUST_JUDGE_API_KEY` | Without it, `judge_answer()` returns `JudgeVerdict.NOT_RUN` for every case. The eval still runs (facts get stored and queried against the real backend) but nothing gets graded, and `accuracy` is reported as `None`, not as 0%. |
 | Contradiction-detection eval | Yes, one vendor API key | No LLM judge involved -- classification is done by direct substring comparison against the known fixture values (see below), which is cheaper and more auditable than an LLM judge for this specific eval. |
 | Compression/round-trip-fidelity eval | Yes, one vendor API key (more if the backend declares more than one `supported_modes` entry) | No LLM judge involved -- fidelity is scored by a direct, deterministic text-similarity ratio against the literal stored content (see below). **Has not been run against any live backend as of this writing.** |
+| Ranking-Quality eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct comparison of returned record order against per-record metadata values and known insertion order (see below). **Has not been run against any live backend as of this writing.** |
 | Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
@@ -106,6 +107,44 @@ vendor's real API, or is explicitly labeled as not yet measured.
   adapter's `supported_modes` tuple and threading `mode` through to the real vendor call -- no
   change to `evals/compression.py` itself is required either way. See CONTRIBUTING.md.
 
+### MemTrust Ranking-Quality Eval (original)
+
+- **Not derived from any published dataset.** Built specifically to close a gap that
+  `ConflictSignal` (see below) structurally cannot see: whether returned *content* is correct is a
+  different question from whether it came back in the *right order*, and a backend can be
+  perfectly correct on the first axis while silently broken on the second. Neither LongMemEval,
+  LoCoMo, the contradiction eval, nor the compression eval measures ordering at all.
+- **Origin: mempalace/mempalace#1733** (GitHub user Kartalops, found while validating memtrust
+  against real MemPalace usage, not a synthetic scenario invented for this repo).
+  `mempalace/layers.py`'s `Layer1.generate()` sorts drawers by `importance`/`emotional_weight`/
+  `weight`, but no ingest path in the real package ever writes those keys -- confirmed 0/45,969
+  drawers on a real palace. `importance` silently defaults to a constant, so the documented "high
+  importance, recent" `wake-up` ordering degenerates to plain insertion order (oldest moments
+  first) with zero errors raised anywhere in the pipeline. Every individual returned drawer is
+  itself a real, uncorrupted memory -- there is no contradiction anywhere in this bug, which is
+  exactly why it was invisible to `ConflictSignal`.
+- **Fixture:** `tests/fixtures/ranking_quality_cases.json` -- 4 hand-written cases, each a
+  `session_id`, `query`, `ranking_field` (which metadata key this case tests, e.g. `"importance"`),
+  and a list of `records` to store in order (`content` + `metadata`). Case `mt-rank-001` and
+  `mt-rank-004` reproduce the #1733 shape directly (constant value, and field never written at
+  all, respectively); `mt-rank-002` is the negative control (genuinely varied values); `mt-rank-003`
+  models a backend with a real varying signal that still isn't used to order results.
+- **RankingSignal is a distinct taxonomy from ConflictSignal, not a variant of it.** Defined in
+  `src/memtrust/adapters/base.py` alongside `ConflictSignal`. `QueryResult.ranking_signal` follows
+  the exact same "adapter self-reports, eval never blindly trusts it" convention `conflict_signal`
+  established: `MemPalaceAdapter.query()` (the one adapter with a documented, sort-relevant
+  metadata field) computes a coarse self-report via `_classify_ranking_signal()`, and
+  `evals/ranking_quality.py`'s `classify_ranking_case()` derives the actual scored signal from
+  ground truth (the case's known insertion order and per-record field values) rather than trusting
+  that self-report outright.
+- **Extending this eval:** adding more cases means adding entries to the fixture file with the
+  same fields described above. Wiring a new adapter into detection means implementing its own
+  `_classify_ranking_signal`-equivalent and setting `ranking_signal` on the `QueryResult` it
+  returns -- adapters that don't implement this simply keep the field's default,
+  `RankingSignal.NOT_APPLICABLE`, and are scored the same way `ConflictSignal.NOT_APPLICABLE`
+  scores an adapter with `supports_update = False`: recorded explicitly, never silently dropped.
+  See CONTRIBUTING.md.
+
 ## Contradiction-detection scoring logic (the eval this project exists for)
 
 Implemented in `src/memtrust/evals/contradiction.py`, function `classify_case()`. For every case:
@@ -163,6 +202,52 @@ comparison. **No such run has been performed against any live backend as of this
 number this eval could report is currently unmeasured, the same as every other eval's Benchmarks
 section in the README until live credentials are configured.
 
+## Ranking-quality scoring logic
+
+Implemented in `src/memtrust/evals/ranking_quality.py`, function `classify_ranking_case()`. For
+every case:
+
+1. Store each of the case's `records` in order via `adapter.store()`, keeping the returned
+   `memory_id`s in the exact order stored -- this is the eval's ground truth for "insertion order."
+2. Query once via `adapter.query(session_id, query, top_k=len(records))`.
+3. Read the case's `ranking_field` (e.g. `"importance"`) off each returned record's metadata,
+   parsed as a float where present.
+
+Classification:
+
+| Observed evidence | Verdict |
+|---|---|
+| `ranking_field` missing from at least one returned record, or present on all but carrying the identical value everywhere | **MISSING_ORDERING_KEY** -- no real per-record signal exists to have driven the order, whatever the backend's documentation claims |
+| `ranking_field` present and genuinely varied, and the returned order is sorted by descending value | **SIGNAL_DRIVEN** -- a real signal exists and the backend appears to actually use it |
+| `ranking_field` present and genuinely varied, but the returned order does NOT correlate with it | **ORDER_INCONSISTENT** -- a real signal exists and the backend isn't ordering by it, a distinct bug from MISSING_ORDERING_KEY |
+| Fewer than 2 returned records | **NOT_APPLICABLE** -- nothing to compare an ordering claim against |
+
+**Why this doesn't just trust the adapter's self-reported signal.** `QueryResult.ranking_signal`
+is a coarse, adapter-derived claim (see `MemPalaceAdapter._classify_ranking_signal()` -- it can say
+"this field is present and varies" but cannot itself confirm the returned order actually
+correlates with it, because it has no access to any case's ground-truth insertion order).
+`classify_ranking_case()` recomputes the real verdict from the case's own known insertion order and
+field values, and stores the adapter's self-report separately (`adapter_reported_signal`) purely
+for comparison -- exactly the same non-negotiable rule `evals/contradiction.py`'s `classify_case`
+applies to `conflict_signal`.
+
+**Honest limitation -- read this before trusting a MISSING_ORDERING_KEY number.** This eval, run
+purely against a live backend's query responses, can only ever prove one thing: *no real
+per-record signal was observed driving this response's order.* It cannot always distinguish two
+different underlying causes that produce the identical observable symptom:
+
+  * the backend genuinely has nothing meaningful to rank by for this particular query (every
+    candidate really is equally important), versus
+  * the backend forgot to populate the ranking field at all (mempalace/mempalace#1733's actual
+    root cause -- 0/45,969 drawers on a real palace ever got a real `importance` value).
+
+`MISSING_ORDERING_KEY` is named for what is actually detected (absence of a driving signal), not
+for a claim about why. Kartalops's #1733 finding is the strong form of this -- direct inspection of
+a live palace's write path, not a black-box query-response inference -- and this eval's
+query-response-only view would, on its own, only ever justify the weaker claim above. A
+`MISSING_ORDERING_KEY` result is a strong prompt to go verify the stronger claim by inspecting the
+backend's actual ingest/write path (as #1733 did), not proof of it by itself.
+
 ## LLM-judge prompt template
 
 Used by `src/memtrust/scoring/llm_judge.py` for LongMemEval and LoCoMo (the contradiction eval
@@ -206,7 +291,7 @@ relying on its output.
 | `mem0_adapter.py` (`Mem0Adapter`, hosted Platform API) | **High** | `MemoryClient(api_key=...)` reading `MEM0_API_KEY`, `.add()`/`.search()`/`.update()` method names and behavior, confirmed via docs.mem0.ai and the June 2026 SDK v2.0.8 release notes. Mem0's internal ADD/UPDATE/DELETE memory-pipeline decision is documented vendor behavior. | Exact REST path strings (`/v1/memories/`, `/v1/memories/search/`) are a best-effort reconstruction of what the documented SDK wraps, not copied from an OpenAPI spec. |
 | `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
-| `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** |
+| `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** The `importance`/`emotional_weight`/`weight` metadata keys `_classify_ranking_signal()` checks (see the Ranking-Quality eval above) are the same LOW-confidence category: they come from mempalace/mempalace#1733's own root-cause report on `layers.py`, not a confirmed field-name reference for what `recall()`'s response `metadata` actually contains on a live instance. |
 | `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). **This is the adapter most likely to need correction against a live instance.** |
 
 ## Read-after-write verification (opt-in, off by default)

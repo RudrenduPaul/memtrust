@@ -19,6 +19,7 @@ from memtrust.adapters.base import (
     DeleteResult,
     MemoryBackendAdapter,
     QueryResult,
+    RankingSignal,
     StoreResult,
     UpdateResult,
 )
@@ -784,6 +785,62 @@ def test_mempalace_delete_raises_clear_not_implemented_backend_api_error() -> No
     adapter = MemPalaceAdapter(palace=FakePalace())
     with pytest.raises(BackendAPIError, match="not implemented"):
         adapter.delete("palace-1")
+
+
+# ---------------------------------------------------------------------------
+# MemPalaceAdapter.query() -- RankingSignal detection
+#
+# Reproduces the exact mempalace/mempalace#1733 shape (GitHub user
+# Kartalops): `Layer1.generate()` sorts drawers by `importance`/
+# `emotional_weight`/`weight`, but no ingest path ever writes those keys
+# (confirmed 0/45,969 drawers on a real palace), so the field silently
+# defaults to a constant and the sort degenerates to insertion order.
+# ---------------------------------------------------------------------------
+
+
+def test_mempalace_query_flags_missing_ordering_key_when_importance_is_constant() -> None:
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    for content in ["Had coffee with Alex.", "Signed the lease.", "Grandmother's health scare."]:
+        adapter.store("room-1", content, metadata={"importance": "0.5"})
+
+    query_result = adapter.query("room-1", "wake me up with important memories")
+    assert query_result.ranking_signal == RankingSignal.MISSING_ORDERING_KEY
+
+
+def test_mempalace_query_flags_missing_ordering_key_when_importance_never_written() -> None:
+    # The exact #1733 shape: no ingest path ever wrote the field at all,
+    # not even a default -- indistinguishable from a constant default from
+    # this adapter's black-box view, and flagged the same way.
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    for content in ["Had coffee with Alex.", "Signed the lease.", "Grandmother's health scare."]:
+        adapter.store("room-1", content)
+
+    query_result = adapter.query("room-1", "wake me up with important memories")
+    assert query_result.ranking_signal == RankingSignal.MISSING_ORDERING_KEY
+
+
+def test_mempalace_query_reports_signal_driven_when_importance_genuinely_varies() -> None:
+    # Negative control: this must NOT be flagged -- a real per-record
+    # signal exists here.
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    adapter.store("room-1", "Renewed car registration.", metadata={"importance": "0.2"})
+    adapter.store("room-1", "Grandmother's health scare.", metadata={"importance": "0.9"})
+    adapter.store("room-1", "Signed the lease.", metadata={"importance": "0.6"})
+
+    query_result = adapter.query("room-1", "wake me up with important memories")
+    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
+
+
+def test_mempalace_query_ranking_signal_not_applicable_with_fewer_than_two_records() -> None:
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    adapter.store("room-1", "Had coffee with Alex.", metadata={"importance": "0.5"})
+
+    query_result = adapter.query("room-1", "wake me up with important memories")
+    assert query_result.ranking_signal == RankingSignal.NOT_APPLICABLE
 
 
 # ---------------------------------------------------------------------------

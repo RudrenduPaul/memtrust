@@ -33,6 +33,7 @@ from memtrust.evals.compression import CompressionEvalResult, run_compression_ev
 from memtrust.evals.contradiction import ContradictionEvalResult, run_contradiction_eval
 from memtrust.evals.locomo import LoCoMoResult, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
+from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
 from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_resource_sync_eval
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
@@ -50,7 +51,14 @@ console = Console(width=200)
 #: ADAPTER_REGISTRY; "all" expands to this list, not to every registry key,
 #: so a backend is never silently evaluated twice under two names.
 ALL_BACKENDS = ["mempalace", "mem0", "zep", "openviking"]
-ALL_EVALS = ["longmemeval", "locomo", "contradiction", "resource_sync_safety", "compression"]
+ALL_EVALS = [
+    "longmemeval",
+    "locomo",
+    "contradiction",
+    "resource_sync_safety",
+    "compression",
+    "ranking_quality",
+]
 
 
 def _resolve_backend_names(backends_arg: str) -> list[str]:
@@ -148,6 +156,29 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for f in result.file_results
             ],
         }
+    if isinstance(result, RankingQualityEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "signal_driven_rate": result.signal_driven_rate,
+            "missing_ordering_key_rate": result.missing_ordering_key_rate,
+            "order_inconsistent_rate": result.order_inconsistent_rate,
+            "not_applicable_rate": result.not_applicable_rate,
+            "n_cases": len(result.case_results),
+            "cases": [
+                {
+                    "case_id": c.case.case_id,
+                    "ranking_field": c.case.ranking_field,
+                    "signal": str(c.signal),
+                    "adapter_reported_signal": (
+                        str(c.adapter_reported_signal) if c.adapter_reported_signal else None
+                    ),
+                    "matches_insertion_order": c.matches_insertion_order,
+                    "error": c.error,
+                }
+                for c in result.case_results
+            ],
+        }
     if isinstance(result, CompressionEvalResult):
         return {
             "backend": result.backend_name,
@@ -184,8 +215,8 @@ def main() -> None:
     default="all",
     show_default=True,
     help=(
-        "Comma-separated eval list "
-        "(longmemeval,locomo,contradiction,resource_sync_safety,compression), or 'all'."
+        "Comma-separated eval list (longmemeval,locomo,contradiction,"
+        "resource_sync_safety,compression,ranking_quality), or 'all'."
     ),
 )
 @click.option(
@@ -311,6 +342,21 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
             else:
                 console.print("    N/A (no scoreable cases)")
 
+        if "ranking_quality" in eval_names:
+            console.print(f"  Running Ranking-Quality against {backend_name}...")
+            ranking_result = run_ranking_quality_eval(adapter)
+            backend_report["evals"]["ranking_quality"] = _serialize_eval_result(ranking_result)
+            mok = ranking_result.missing_ordering_key_rate
+            sdr = ranking_result.signal_driven_rate
+            oir = ranking_result.order_inconsistent_rate
+            if mok is not None:
+                console.print(
+                    f"    missing-ordering-key: {mok:.1%}  signal-driven: {sdr:.1%}"
+                    f"  order-inconsistent: {oir:.1%}"
+                )
+            else:
+                console.print("    N/A (no scoreable cases)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -353,10 +399,11 @@ def report(report_path: Path) -> None:
     table.add_column("Contradiction (flagged/overwrite/stale/empty-or-lost)")
     table.add_column("Resource-Sync (user-file deletion rate)")
     table.add_column("Compression fidelity by mode")
+    table.add_column("Ranking Quality (missing-ordering-key rate)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
-            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-")
+            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-", "-")
             continue
 
         evals = backend_data.get("evals", {})
@@ -365,6 +412,7 @@ def report(report_path: Path) -> None:
         contra = evals.get("contradiction", {})
         rss = evals.get("resource_sync_safety", {})
         compression = evals.get("compression", {})
+        ranking = evals.get("ranking_quality", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -391,6 +439,7 @@ def report(report_path: Path) -> None:
             if compression
             else "-"
         )
+        ranking_str = _fmt_pct(ranking.get("missing_ordering_key_rate")) if ranking else "-"
         table.add_row(
             backend_name,
             "configured",
@@ -399,6 +448,7 @@ def report(report_path: Path) -> None:
             contra_str,
             rss_str,
             compression_str or "-",
+            ranking_str,
         )
 
     console.print(table)
