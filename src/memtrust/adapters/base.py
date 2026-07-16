@@ -93,6 +93,67 @@ class ConflictSignal(StrEnum):
     self-report."""
 
 
+class CorruptionSignal(StrEnum):
+    """How a backend's *write path* (construction-time config, or a store()/
+    update() call) handled a failure mode that ConflictSignal cannot express.
+
+    ConflictSignal above classifies how a *query response* handled a
+    contradiction between two stored facts -- it is inherently a read-side,
+    post-store observation. The bug classes this enum exists for are
+    different in kind, not just in vendor: they either (a) happen at
+    construction time, before any store()/query() call is ever made, when a
+    backend rejects an invalid configuration (e.g. mem0's Kuzu graph store
+    historically raised ValueError from MemoryGraph.__init__ when
+    embedding_dims was None/<=0 -- mem0ai/mem0#3558), or (b) happen silently
+    *during* a write, corrupting data with no exception and no query-side
+    signal that anything went wrong until a much later, unrelated read fails
+    to find a match (e.g. mem0's Valkey/Redis vector stores historically
+    called `np.array(None, dtype=np.float32)` on a metadata-only update,
+    silently writing a 4-byte garbage vector over a real embedding --
+    mem0ai/mem0#4362). Both are init/write-path phenomena a query-response
+    enum has no vocabulary for, which is why this is a separate enum rather
+    than new ConflictSignal members.
+
+    Adapters that have no surface to observe either failure mode (i.e. every
+    adapter except ones like Mem0DirectAdapter that hold a direct, in-process
+    handle to the vendor library rather than talking to it over HTTP) should
+    report NOT_APPLICABLE rather than guessing.
+    """
+
+    CONFIG_REJECTED = "config_rejected"
+    """Backend construction (or a construction-time-equivalent call inside
+    store()/query()) raised ValueError/pydantic.ValidationError for an
+    invalid configuration, and the adapter caught it and classified it
+    instead of letting it propagate as an unhandled crash. This is the
+    signal a caller should see for the mem0ai/mem0#3558 bug *class*: "bad
+    embedding_dims config is rejected before it can silently corrupt a
+    graph DB," not a literal re-run of that exact removed code path -- see
+    Mem0DirectAdapter's module docstring for why the original Kuzu code
+    this bug lived in no longer exists in the installed mem0ai package."""
+
+    VECTOR_ZEROED = "vector_zeroed"
+    """A write call completed without raising, but the adapter's own
+    inspection of what was actually persisted (not the vendor's normal
+    read API, which -- per mem0ai/mem0#4336 -- does not surface this) shows
+    the embedding was replaced with a zero-length or wrong-dimensionality
+    vector instead of being left untouched. This is what
+    mem0ai/mem0#4362 fixed for Valkey/Redis; a backend still exhibiting it
+    would report this signal, a fixed one reports CLEAN for the same
+    operation."""
+
+    CLEAN = "clean"
+    """The write/config-validation path completed with no corruption or
+    config-rejection detected for this operation."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """This adapter has no surface to observe either failure mode (most
+    REST-based adapters: a vendor's HTTP API gives no way to inspect
+    construction-time config validation separately from a network error, or
+    to inspect raw stored vector bytes independently of its own search/get
+    responses). Recorded explicitly rather than silently omitting the
+    field."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
@@ -130,6 +191,12 @@ class StoreResult:
     memory_id: str
     latency_ms: float
     raw: dict[str, object] = field(default_factory=dict)
+    corruption_signal: CorruptionSignal = CorruptionSignal.NOT_APPLICABLE
+    """See CorruptionSignal above. Defaults to NOT_APPLICABLE so every
+    existing adapter's StoreResult construction keeps working unchanged --
+    only an adapter with a genuine construction-time-config or raw-write
+    inspection surface (see Mem0DirectAdapter) should ever set this to
+    something else."""
     verified: bool | None = None
     """Whether a post-write read-back confirmed the content is actually
     retrievable. `None` means the adapter did not attempt verification
@@ -160,6 +227,12 @@ class UpdateResult:
     acknowledged: bool
     latency_ms: float
     raw: dict[str, object] = field(default_factory=dict)
+    corruption_signal: CorruptionSignal = CorruptionSignal.NOT_APPLICABLE
+    """See CorruptionSignal above and StoreResult.corruption_signal -- same
+    default-NOT_APPLICABLE backward-compatibility reasoning. This is the
+    field a metadata-only update() variant sets to VECTOR_ZEROED/CLEAN when
+    an adapter can actually inspect what a vector-store update wrote (see
+    Mem0DirectAdapter.update_metadata_only)."""
 
 
 @dataclass

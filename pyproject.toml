@@ -40,6 +40,26 @@ dev = [
     "mypy>=1.10.0,<2.0",
     "pip-audit>=2.7.3,<3.0",
 ]
+# Only mem0_direct_adapter.py needs the real mem0ai library in-process
+# (see its module docstring) -- every other adapter talks HTTP and is
+# tested fully offline against pytest-httpx or a hand-written Protocol
+# fake, with no vendor package installed at all. This group is kept
+# separate from `dev` so a contributor working on any other adapter never
+# needs boto3/fastembed/redis/valkey/google-genai just to run `pytest`;
+# tests/test_mem0_direct_adapter.py itself uses `pytest.importorskip` so
+# it degrades to a clean, explained skip rather than a collection error
+# when this group isn't installed. CI installs both (see .github/workflows
+# /ci.yml) so these tests do run for real, against the real installed
+# mem0ai version, on every push -- not just in this build's local venv.
+mem0-direct = [
+    "mem0ai>=2.0.12,<3.0",
+    "boto3>=1.34.0,<2.0",
+    "google-genai>=1.0.0,<2.0",
+    "fastembed>=0.3.1,<1.0",
+    "redis>=5.0.0,<6.0",
+    "redisvl>=0.3.0,<1.0",
+    "valkey>=6.0.0,<7.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/RudrenduPaul/memtrust"

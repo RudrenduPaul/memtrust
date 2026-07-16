@@ -12,7 +12,7 @@ This matters because it changes what a number *means*.
 
 | Component | Requires live credentials? | Notes |
 |---|---|---|
-| `pytest` test suite | No | Every HTTP call is mocked (pytest-httpx). No test ever reaches a real network endpoint. |
+| `pytest` test suite | No | Every HTTP call is mocked (pytest-httpx). No test ever reaches a real network endpoint. `tests/test_mem0_direct_adapter.py` additionally requires the optional `mem0-direct` dependency group (`pip install -e ".[dev,mem0-direct]"`) to exercise the real, installed `mem0ai` package's embedder/vector-store classes -- still fully offline (only the vendor SDK/wire-client boundary is mocked), but the test *file* skips cleanly with an explained reason if that group isn't installed, rather than failing collection. CI installs it. |
 | Eval runners against the bundled synthetic fixtures | Yes, one vendor API key per backend under test | `store()`/`query()`/`update()` call the real vendor API. Without a key, the adapter raises `BackendNotConfiguredError` and the CLI reports SKIPPED. |
 | LLM-judge scoring (LongMemEval, LoCoMo) | Yes, `MEMTRUST_JUDGE_API_KEY` | Without it, `judge_answer()` returns `JudgeVerdict.NOT_RUN` for every case. The eval still runs (facts get stored and queried against the real backend) but nothing gets graded, and `accuracy` is reported as `None`, not as 0%. |
 | Contradiction-detection eval | Yes, one vendor API key | No LLM judge involved -- classification is done by direct substring comparison against the known fixture values (see below), which is cheaper and more auditable than an LLM judge for this specific eval. |
@@ -205,6 +205,7 @@ relying on its output.
 |---|---|---|---|
 | `mem0_adapter.py` (`Mem0Adapter`, hosted Platform API) | **High** | `MemoryClient(api_key=...)` reading `MEM0_API_KEY`, `.add()`/`.search()`/`.update()` method names and behavior, confirmed via docs.mem0.ai and the June 2026 SDK v2.0.8 release notes. Mem0's internal ADD/UPDATE/DELETE memory-pipeline decision is documented vendor behavior. | Exact REST path strings (`/v1/memories/`, `/v1/memories/search/`) are a best-effort reconstruction of what the documented SDK wraps, not copied from an OpenAPI spec. |
 | `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
+| `mem0_direct_adapter.py` (`Mem0DirectAdapter`, direct in-process library, embedder/vector-store selection) | **High on what the installed `mem0ai==2.0.12` package's code actually does (confirmed by reading its real, installed source, not documentation or the GitHub issues), Low on live end-to-end behavior** | Every embedder-dims-forwarding and vector-store vector=None-guard claim below was confirmed by reading the *installed* `mem0.embeddings.{aws_bedrock,fastembed,gemini,openai}.py` and `mem0.vector_stores.{redis,valkey}.py` source directly, and `tests/test_mem0_direct_adapter.py` exercises those real classes with only the vendor SDK/wire-client boundary mocked (`boto3`, `openai`, `google.genai`, `fastembed.TextEmbedding`, `redis`/`valkey`) -- see "Mem0DirectAdapter and the retired Kuzu bug" below for the full finding, including the one surprising negative result (`graph_store`/Kuzu support does not exist in this package version at all). | Never run against a live Redis/Valkey server, a live Bedrock/Gemini/OpenAI embedding endpoint, or a live FastEmbed model download in this environment -- every test mocks the vendor boundary, same convention this document already states for `mem0_adapter.py`. `_read_raw_embedding_bytes()`'s raw-client inspection (used by `update_metadata_only()` to derive `CorruptionSignal.CLEAN`/`VECTOR_ZEROED`) reaches into each vector store's private-ish `schema`/`prefix`/`client` attributes rather than a documented public API, since `VectorStoreBase.get()` does not expose raw vector bytes at all -- confirmed by reading the base class, but still an internals-reaching workaround that could break on a future `mem0ai` release's internal refactor (it would fail closed, into `NOT_APPLICABLE`, not silently misreport). |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
 | `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** |
 | `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). **This is the adapter most likely to need correction against a live instance.** |
@@ -288,6 +289,61 @@ configuration this adapter has no parameter surface to trigger directly, and #59
 scopes to, and is called out here as unfinished rather than silently left out. See the confidence
 table above and `mem0_adapter.py`'s module docstring for exactly what was and was not confirmed
 against live source.
+
+**Why `Mem0DirectAdapter` exists, and the retired Kuzu bug it could not reproduce.** Neither
+`Mem0Adapter` nor `Mem0SelfHostedAdapter` can select a `graph_store`, `embedder`, or
+`vector_store` *provider* -- those are construction-time Python config
+(`MemoryConfig(embedder=..., vector_store=..., graph_store=...)`), not REST parameters either
+adapter's HTTP surface exposes. Five real, cited mem0 bug reports trace to exactly that
+unreachable configuration surface: mem0ai/mem0#3558 (Kuzu graph store raising `ValueError` on a
+bad `embedding_dims`), #5671 (AWS Bedrock not forwarding `embedding_dims`), #4362 (Redis/Valkey
+silently zeroing a vector on a metadata-only update), #4711 (FastEmbed defaulting to a hardcoded
+1536 instead of the loaded model's real dimension), and #2304 (Gemini/OpenAI silently dropping
+`embedding_dims`). `Mem0DirectAdapter` (`mem0_direct_adapter.py`) holds a direct, in-process
+`mem0.Memory` handle via `Memory.from_config()` specifically to make that configuration surface
+reachable, gated on `MEM0_DIRECT_EMBEDDER_PROVIDER` and not included in `cli.ALL_BACKENDS` --
+same opt-in-only precedent as `Mem0SelfHostedAdapter` above, since this adapter targets a
+self-assembled in-process stack rather than a single hosted vendor API.
+
+Of the five, **four are confirmed fixed in the installed `mem0ai==2.0.12` package** (the newest
+version on PyPI as of this build, 2026-07-16) by reading that package's actual source, not by
+trusting the GitHub issues' "merged" status: `aws_bedrock.py` forwards `embedding_dims` into the
+Bedrock Titan V2 request body (#5671); `fastembed.py`'s `FastEmbedEmbedding` reads
+`self.dense_model.embedding_size` at init instead of defaulting to 1536 (#4711); `gemini.py` and
+`openai.py` both forward `embedding_dims` into their respective embed calls (#2304); and
+`redis.py`/`valkey.py` both guard `if vector is not None:` before overwriting the stored
+`"embedding"` field (#4362). `tests/test_mem0_direct_adapter.py` exercises the real, installed
+classes for all four directly (mocking only each vendor's network/model-load boundary), so a
+regression that reintroduced any of them in a future `mem0ai` release would fail those tests
+against the *installed* package -- this is what justifies re-validating all four as PASS against
+the currently pinned `mem0ai` version, not just restating the issue tracker.
+
+**#3558 (Kuzu) could not be reproduced, and this was the one genuinely surprising finding of this
+build.** The installed `mem0ai==2.0.12`'s `MemoryConfig` (`mem0/configs/base.py`) has no
+`graph_store` field at all; no `kuzu` dependency appears in any of the package's declared
+extras; and no graph/kuzu module exists anywhere in the installed `mem0/` package tree (the only
+"kuzu" string in the entire installed package is an illustrative example inside
+`mem0/exceptions.py`'s `DependencyError` docstring, not a real code path). `kuzu_memory.py`, the
+file mem0ai/mem0#3558 and its fix concern, is not present in this release. Worse, passing
+`graph_store` to `MemoryConfig(**config_dict)` anyway does not raise -- it is silently ignored
+(confirmed empirically during this build: `MemoryConfig(graph_store={"provider": "kuzu", ...})`
+produces a config object with no trace the key was ever given, pydantic's default
+`extra="ignore"` behavior on this model). Rather than reproduce that silent no-op,
+`Mem0DirectAdapter.__init__` refuses any `graph_store_provider` request outright, at
+construction, with a `BackendAPIError` naming this finding. In its place, the adapter reproduces
+the *bug class* #3558 established -- a backend rejecting a missing/invalid embedding-dimension
+config at construction time, before any write can silently corrupt state -- against a component
+that still has exactly that validation shape: `ValkeyConfig.embedding_model_dims` is a required
+(no-default) `int` field, so constructing this adapter with `vector_store_provider="valkey"` and
+an explicit `embedding_dims=None` raises a real `pydantic.ValidationError` (a `ValueError`
+subclass) from the installed package, caught and reported as `StoreResult.corruption_signal =
+CorruptionSignal.CONFIG_REJECTED` rather than an unhandled crash. This is an honest substitution
+for a retired code path, not a re-creation of it -- a `memtrust` user reading "CONFIG_REJECTED"
+against `mem0_direct` should not conclude mem0ai/mem0#3558 itself was reproduced, only that the
+*shape* of bug it represents (construction-time config rejection, not a silent graph-store
+no-op) is what this adapter can demonstrate against the currently installed package. See
+`mem0_direct_adapter.py`'s module docstring and `CorruptionSignal.CONFIG_REJECTED`'s docstring
+in `base.py` for the same caveat stated where the code itself lives.
 
 **Why MemPalace's "configuration" is a storage path, not an API key.** MemPalace is genuinely
 local-first and documented as requiring no API key at all. Forcing it to read a fake API key
