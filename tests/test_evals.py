@@ -194,8 +194,29 @@ class FailingFakeAdapter(MemoryBackendAdapter):
 
 def test_contradiction_dataset_loads() -> None:
     cases = load_contradiction_dataset()
-    assert len(cases) == 5
+    assert len(cases) == 7
     assert all(isinstance(c, ContradictionCase) for c in cases)
+
+
+def test_contradiction_dataset_includes_lucene_trigger_and_metadata_cases() -> None:
+    """The two cases added for the self-hosted graphiti-core adapter build:
+    one whose query contains every uppercase letter (O/R/N/T/A/D)
+    getzep/graphiti#1302's lucene_sanitize() mis-escapes, and one carrying
+    non-fact structured metadata for the MemoryRecord.attributes boundary.
+    """
+    cases = {c.case_id: c for c in load_contradiction_dataset()}
+    lucene_case = cases["mt-contra-006"]
+    for letter in "ORNTAD":
+        assert letter in lucene_case.query
+    metadata_case = cases["mt-contra-007"]
+    assert metadata_case.metadata == {
+        "ticket_id": "OPS-4471",
+        "team": "platform-infra",
+        "category": "structured-non-fact",
+    }
+    # Every pre-existing case's metadata must still default to empty --
+    # this is a purely additive field.
+    assert cases["mt-contra-001"].metadata == {}
 
 
 def test_recall_all_adapter_classified_flagged() -> None:
@@ -235,7 +256,7 @@ def test_no_update_adapter_all_not_applicable_and_never_called() -> None:
 def test_failing_adapter_records_error_without_crashing() -> None:
     adapter = FailingFakeAdapter()
     result = run_contradiction_eval(adapter)
-    assert len(result.case_results) == 5
+    assert len(result.case_results) == 7
     assert all(c.error is not None for c in result.case_results)
     assert result.scored_cases == []
     assert result.flagged_rate is None
@@ -463,6 +484,159 @@ def test_classify_case_no_metadata_adapters_unaffected_by_fix(
     assert signal == expected
     assert got_initial == has_initial
     assert got_updated == has_updated
+
+
+# ---------------------------------------------------------------------------
+# EDGE_INTEGRITY_VIOLATION -- the structural check added for
+# ZepGraphitiSelfHostedAdapter, catching the shape of getzep/graphiti#1013
+# (Neo4j bulk edge-save omitting attributes/reference_time -- fixed
+# upstream) and #1001 (FalkorDB's old add_triplet() never setting edge
+# endpoint UUIDs at all -- closed via #1013).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_case_edge_integrity_violation_when_source_uuid_missing() -> None:
+    """(b) classify_case() flags EDGE_INTEGRITY_VIOLATION when an
+    edge-shaped record (raw carries both endpoint-uuid keys) has a
+    missing/falsy source_node_uuid."""
+    case = _contradiction_case()
+    records = [
+        MemoryRecord(
+            memory_id="e1",
+            content="the meeting is at 3pm",
+            raw={"source_node_uuid": None, "target_node_uuid": "node-2"},
+        )
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, _, _ = classify_case(case, query_result)
+    assert signal == ConflictSignal.EDGE_INTEGRITY_VIOLATION
+
+
+def test_classify_case_edge_integrity_violation_when_target_uuid_missing() -> None:
+    case = _contradiction_case()
+    records = [
+        MemoryRecord(
+            memory_id="e1",
+            content="the meeting is at 3pm",
+            raw={"source_node_uuid": "node-1", "target_node_uuid": ""},
+        )
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, _, _ = classify_case(case, query_result)
+    assert signal == ConflictSignal.EDGE_INTEGRITY_VIOLATION
+
+
+def test_classify_case_edge_integrity_violation_takes_priority_over_flagged() -> None:
+    """Even when the retrieved text would otherwise satisfy both
+    initial_value and updated_value (an ordinary FLAGGED case), a
+    structurally broken edge endpoint overrides it -- a broken edge is a
+    more fundamental failure than which values the text happens to
+    contain."""
+    case = _contradiction_case()
+    records = [
+        MemoryRecord(
+            memory_id="e1",
+            content="the meeting is at 2pm and now 3pm",
+            raw={"source_node_uuid": "node-1", "target_node_uuid": None},
+        )
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, _, _ = classify_case(case, query_result)
+    assert signal == ConflictSignal.EDGE_INTEGRITY_VIOLATION
+
+
+def test_classify_case_edge_shaped_record_with_both_endpoints_present_unaffected() -> None:
+    """Records that carry both endpoint-uuid keys with real values must
+    classify exactly as before this change -- this is a strict addition,
+    never a change to any pre-existing classification outcome."""
+    case = _contradiction_case()
+    records = [
+        MemoryRecord(
+            memory_id="e1",
+            content="the meeting is at 3pm",
+            raw={"source_node_uuid": "node-1", "target_node_uuid": "node-2"},
+        )
+    ]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, has_initial, has_updated = classify_case(case, query_result)
+    assert signal == ConflictSignal.SILENT_OVERWRITE
+    assert has_initial is False
+    assert has_updated is True
+
+
+def test_classify_case_non_edge_record_unaffected_by_integrity_check() -> None:
+    """A record whose raw fragment has neither endpoint-uuid key at all
+    (e.g. Mem0/MemPalace/OpenViking's raw shapes) never triggers
+    EDGE_INTEGRITY_VIOLATION -- this is a structural check on edge-shaped
+    records only, not a generic "does this record have an id" check."""
+    case = _contradiction_case()
+    records = [MemoryRecord(memory_id="m1", content="the meeting is at 3pm", raw={"id": "m1"})]
+    query_result = QueryResult(
+        records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, _, _ = classify_case(case, query_result)
+    assert signal == ConflictSignal.SILENT_OVERWRITE
+
+
+def test_run_contradiction_eval_processes_new_fixture_cases_without_error() -> None:
+    """(c) the two fixture cases added for this build (mt-contra-006's
+    lucene-sanitize-trigger-character query, mt-contra-007's structured
+    metadata) load and run through the full eval pipeline without error
+    against a capable fake adapter."""
+    adapter = RecallAllFakeAdapter()
+    result = run_contradiction_eval(adapter)
+    case_ids = {c.case.case_id for c in result.case_results}
+    assert {"mt-contra-006", "mt-contra-007"} <= case_ids
+    assert all(c.error is None for c in result.case_results)
+    assert len(result.case_results) == 7
+
+
+class MetadataCapturingFakeAdapter(RecallAllFakeAdapter):
+    """Records every `metadata` value passed to store() -- used to prove
+    ContradictionCase.metadata actually threads through
+    run_contradiction_eval into the adapter call, not just that the
+    dataclass field parses from JSON."""
+
+    name = "fake-metadata-capture"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.store_metadata_calls: list[dict[str, str] | None] = []
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        self.store_metadata_calls.append(metadata)
+        return super().store(session_id, content, metadata)
+
+
+def test_run_contradiction_eval_threads_case_metadata_into_store() -> None:
+    adapter = MetadataCapturingFakeAdapter()
+    run_contradiction_eval(adapter)
+    # Only mt-contra-007 carries non-empty metadata, and only on the
+    # explicit `adapter.store(case.session_id, case.initial_fact,
+    # metadata=...)` call this fix adds -- RecallAllFakeAdapter.update()
+    # (like ZepGraphitiAdapter/ZepGraphitiSelfHostedAdapter's own
+    # update(), which alias to store()) calls store() a second time per
+    # case without threading case.metadata, so every case, including
+    # mt-contra-007, contributes one additional None-metadata call. Every
+    # other case's metadata is empty and must be threaded through as None
+    # (via `metadata or None`), preserving every pre-existing case's exact
+    # call shape rather than passing an empty dict.
+    non_empty = [m for m in adapter.store_metadata_calls if m]
+    assert non_empty == [
+        {"ticket_id": "OPS-4471", "team": "platform-infra", "category": "structured-non-fact"}
+    ]
+    assert len(adapter.store_metadata_calls) == 14
+    assert adapter.store_metadata_calls.count(None) == 13
 
 
 # ---------------------------------------------------------------------------

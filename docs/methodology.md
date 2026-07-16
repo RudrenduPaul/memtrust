@@ -65,9 +65,22 @@ vendor's real API, or is explicitly labeled as not yet measured.
 - **Not derived from any published dataset.** This is memtrust's own eval, built specifically
   because neither LongMemEval nor LoCoMo tests what happens when a stored fact is contradicted by
   a later one.
-- **Fixture:** `tests/fixtures/contradiction_cases.json` -- 5 hand-written cases, each with an
+- **Fixture:** `tests/fixtures/contradiction_cases.json` -- 7 hand-written cases, each with an
   `initial_fact`, a `contradicting_fact`, a `query`, and the specific `initial_value`/
-  `updated_value` substrings the classifier checks for (see Scoring logic below).
+  `updated_value` substrings the classifier checks for (see Scoring logic below). Cases 6 and 7
+  were added alongside `ZepGraphitiSelfHostedAdapter` (2026-07-16): case 6's query
+  (`"What is the status of order ORTAND-88?"`) deliberately contains every uppercase letter
+  (O, R, N, T, A, D) that getzep/graphiti#1302's `lucene_sanitize()` mis-escapes
+  character-by-character instead of only escaping the `AND`/`OR`/`NOT` boolean operators it's
+  meant to target -- this cannot demonstrate the bug against any adapter in this repo today (it
+  lives entirely inside self-hosted graphiti-core's internal search pipeline, which no adapter's
+  own code can intercept), but gives a contributor running the self-hosted adapter against a live
+  instance a ready-made query to compare BM25 ranking on. Case 7 carries an optional `metadata`
+  field (`ContradictionCase.metadata`, threaded into `adapter.store()`) with non-fact structured
+  key/value pairs, exercising `MemoryRecord.attributes` end-to-end -- see
+  `zep_graphiti_selfhosted_adapter.py`'s module docstring for why that specific adapter accepts
+  and ignores this metadata rather than surfacing it back out (graphiti-core's real
+  `add_episode()` has no generic metadata parameter to receive it).
 - **Design constraint learned the hard way:** the `contradicting_fact` text must not restate the
   old value inside its own correction narrative (e.g. "Priya moved teams, Sam is now the lead"
   restates "Priya"). If it does, a backend that only ever returns the single latest stored string
@@ -120,6 +133,7 @@ Classification:
 
 | Retrieved content contains | Verdict |
 |---|---|
+| Any retrieved record is edge-shaped (`raw` carries both a `source_node_uuid` and `target_node_uuid` key) but at least one is missing/falsy | **EDGE_INTEGRITY_VIOLATION** -- checked before the value-level rules below; see `ConflictSignal.EDGE_INTEGRITY_VIOLATION` in `adapters/base.py` for the two real graphiti-core bugs (getzep/graphiti#1013, #1001) this is built to catch if reproduced against an affected version |
 | Both `initial_value` and `updated_value` | **FLAGGED** -- the contradiction is visible in the response, whatever the adapter itself reports |
 | Only `updated_value` | **SILENT_OVERWRITE** -- the backend resolved the conflict with no trace of the prior value |
 | Only `initial_value` | **SERVED_STALE** -- the backend never surfaced the update at all |
@@ -206,6 +220,7 @@ relying on its output.
 | `mem0_adapter.py` (`Mem0Adapter`, hosted Platform API) | **High** | `MemoryClient(api_key=...)` reading `MEM0_API_KEY`, `.add()`/`.search()`/`.update()` method names and behavior, confirmed via docs.mem0.ai and the June 2026 SDK v2.0.8 release notes. Mem0's internal ADD/UPDATE/DELETE memory-pipeline decision is documented vendor behavior. | Exact REST path strings (`/v1/memories/`, `/v1/memories/search/`) are a best-effort reconstruction of what the documented SDK wraps, not copied from an OpenAPI spec. |
 | `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
+| `zep_graphiti_selfhosted_adapter.py` (`ZepGraphitiSelfHostedAdapter`, self-hosted `graphiti-core`) | **Medium on wire-level shape, Low on live end-to-end behavior** | Every `graphiti_core` constructor/method signature this adapter calls (`Graphiti(uri=, user=, password=)`, `Graphiti(graph_driver=)`, `FalkorDriver(host=, port=, username=, password=)`, `add_episode(name=, episode_body=, source_description=, reference_time=, group_id=, update_communities=)` returning an `AddEpisodeResults` with an `.episode.uuid`, `search(query, group_ids=, num_results=)` returning `list[EntityEdge]` directly, `remove_episode(episode_uuid)`) was confirmed by fetching the real source files from `getzep/graphiti`'s `main` branch on GitHub (`raw.githubusercontent.com/getzep/graphiti/main/...`) on 2026-07-16 and reading them directly -- not reconstructed from documentation. The four bug citations this adapter's module docstring makes (getzep/graphiti#1302, #836, #1013, #1001) were confirmed the same way: #1302's per-character `O`/`R`/`N`/`T`/`A`/`D` escape-map entries and #836's `communities, community_edges = await semaphore_gather(...)` unpack-of-a-list-of-2-tuples were read verbatim out of `helpers.py`/`graphiti.py`/`community_operations.py` on `main`; #1013's fix (`SET e = edge` replacing an enumerated field list in the Neo4j bulk edge-save query -- Neo4j is the default case in `get_entity_edge_save_bulk_query()`; FalkorDB's own branch of the same function uses the equivalent `SET r = edge`) and #1001's closure (FalkorDB's old `add_triplet()` no longer exists anywhere in the rewritten `falkordb_driver.py`) were confirmed the same way. | The real `graphiti-core` package is not installed in this build environment, and no Neo4j or FalkorDB instance was started or reached during this build -- every signature above was confirmed by reading source, never by importing and calling the real package or a live database. This adapter's own unit tests (`tests/test_adapters.py`) mock a `graphiti_core`-shaped Protocol double, the same convention `mempalace_adapter.py`'s `_PalaceProtocol` already establishes. The `update_communities` toggle is confirmed to thread through to `add_episode()` (and is unit-tested doing so), but nothing in this build can demonstrate it actually triggers #836's `ValueError` without a live instance and real LLM credentials driving entity extraction. `lucene_sanitize()` (#1302) is internal to graphiti-core's search pipeline and is not called anywhere in this adapter's own code -- fixture case `mt-contra-006` (see below) only sets up a query a contributor with a live instance could use to observe the ranking degradation directly, it does not reproduce the bug in this repo's own test suite. `EDGE_INTEGRITY_VIOLATION` (#1013/#1001) is checked at the harness level in `evals/contradiction.py`, but both underlying bugs are confirmed fixed/closed on the `graphiti-core` version this adapter was built against, so a live run today should not actually trigger it. |
 | `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** |
 | `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). **This is the adapter most likely to need correction against a live instance.** |
 
@@ -252,9 +267,29 @@ instance is explicitly listed as a first contribution path in CONTRIBUTING.md.
 requires a running graph database (Neo4j or FalkorDB) plus its own LLM credentials for entity
 extraction -- there is no single environment variable that gates "is this configured," which
 breaks the harness's "one env var, or SKIPPED" contract used by every other adapter. Zep Cloud's
-hosted API (`ZEP_API_KEY`) wraps Graphiti and fits that contract. If self-hosted Graphiti support
-is wanted later, it should be a second adapter (e.g. `zep_graphiti_selfhosted_adapter.py`) with its
-own configuration story, not a silent branch inside this one.
+hosted API (`ZEP_API_KEY`) wraps Graphiti and fits that contract.
+
+**Self-hosted Graphiti support (`ZepGraphitiSelfHostedAdapter`, added 2026-07-16).** Following the
+precedent stated above, this is a second adapter, `zep_graphiti_selfhosted_adapter.py`, with its own
+configuration story (`GRAPHITI_NEO4J_URI` or `GRAPHITI_FALKORDB_URL`, not `ZEP_API_KEY`) rather than
+a branch inside `ZepGraphitiAdapter`. It exists specifically because four real, independently-verified
+graphiti-core bug reports -- getzep/graphiti#1302 (`lucene_sanitize()` mis-escaping BM25 queries),
+#836 (`add_episode(update_communities=True)` raising `ValueError` on non-2-node episodes), #1013
+(Neo4j bulk edge-save silently omitting `attributes`/`reference_time`, now fixed upstream), and
+#1001 (FalkorDB's old `add_triplet()` silently no-oping and never setting edge endpoint UUIDs, now
+closed via #1013) -- all live entirely inside the self-hosted `graphiti-core` library layer that
+`ZepGraphitiAdapter`'s hosted REST calls can never reach. See that new adapter's module docstring for
+the full citation trail (each bug was confirmed by fetching and reading the real source from
+`getzep/graphiti`'s `main` branch on GitHub during this build, not by running it against a live
+database) and, plainly, what this build could NOT verify: no Neo4j or FalkorDB instance was ever
+started or reached in this environment, so nothing here demonstrates any of the four bugs actually
+reproducing end-to-end. `ConflictSignal.EDGE_INTEGRITY_VIOLATION` (`adapters/base.py`) and
+`MemoryRecord.attributes` (also `adapters/base.py`) are the two shared-interface additions this
+adapter needed: the former lets `evals/contradiction.py`'s `classify_case()` flag a structurally
+broken edge (missing `source_node_uuid`/`target_node_uuid`) as its own distinct signal instead of
+folding it into an ordinary text-classification miss; the latter lets a backend's structured
+per-record properties (graphiti-core's `EntityEdge.attributes`) survive the adapter boundary at all.
+Both are purely additive to the shared interface -- no existing adapter's behavior changes.
 
 **Why Mem0 has two adapters, `Mem0Adapter` and `Mem0SelfHostedAdapter`, not one with a deployment
 flag.** Mem0 ships two materially different deployment shapes: the hosted Platform API
@@ -328,3 +363,21 @@ and in the delete case, not reachable at all without an interface change this ba
 make. Anyone relying on this adapter to reproduce a specific self-hosted bug report should verify
 against a live instance first, not take the source-code read as equivalent to a live-tested
 integration.
+
+`ZepGraphitiSelfHostedAdapter` deserves the strongest version of this objection of any adapter in
+this repo: it was built and unit-tested entirely against a Protocol double, because the real
+`graphiti-core` package is not installed in this build environment and no Neo4j or FalkorDB
+instance was ever started or reached. Of the four bugs motivating this adapter's addition, two
+(getzep/graphiti#1013, #1001) are confirmed already fixed/closed upstream on the version of
+graphiti-core this adapter was built against -- so a live run today should not reproduce them at
+all, and `ConflictSignal.EDGE_INTEGRITY_VIOLATION` exists to catch them only if this adapter is
+ever run against an older, affected version. Of the remaining two, `update_communities=True` is
+confirmed to thread through to `add_episode()` correctly (unit-tested), but nothing in this build
+demonstrates it actually triggers #836's `ValueError` -- that requires a live instance with real
+LLM credentials driving entity extraction, which is outside this build's scope. `lucene_sanitize()`
+(#1302) is never called by this adapter's own code at all; it is internal to graphiti-core's search
+pipeline, and this adapter can only supply a fixture query (`mt-contra-006`) a contributor with a
+live instance could use to observe the effect, not reproduce it here. If a reader wants confidence
+that this adapter reproduces any of these four issues, the honest answer today is: it does not,
+demonstrably, in this build -- verifying against a live Neo4j/FalkorDB deployment is the necessary
+next step, not an optional nice-to-have.

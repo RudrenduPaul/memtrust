@@ -26,6 +26,10 @@ from memtrust.adapters.mem0_adapter import Mem0Adapter, Mem0SelfHostedAdapter
 from memtrust.adapters.mempalace_adapter import MemPalaceAdapter
 from memtrust.adapters.openviking_adapter import OpenVikingAdapter
 from memtrust.adapters.zep_graphiti_adapter import ZepGraphitiAdapter
+from memtrust.adapters.zep_graphiti_selfhosted_adapter import (
+    ZepGraphitiSelfHostedAdapter,
+    _parse_falkordb_url,
+)
 
 # ---------------------------------------------------------------------------
 # BackendNotConfiguredError -- every adapter, no env var set
@@ -59,6 +63,15 @@ def test_mempalace_raises_when_not_configured(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(BackendNotConfiguredError) as excinfo:
         MemPalaceAdapter()
     assert excinfo.value.missing_env_var == "MEMPALACE_STORAGE_PATH"
+
+
+def test_graphiti_selfhosted_raises_when_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("GRAPHITI_NEO4J_URI", raising=False)
+    monkeypatch.delenv("GRAPHITI_FALKORDB_URL", raising=False)
+    with pytest.raises(BackendNotConfiguredError) as excinfo:
+        ZepGraphitiSelfHostedAdapter()
+    assert excinfo.value.missing_env_var == "GRAPHITI_NEO4J_URI"
+    assert excinfo.value.backend_name == "graphiti_selfhosted"
 
 
 def test_backend_not_configured_error_message_mentions_methodology() -> None:
@@ -864,3 +877,346 @@ def test_delete_many_aggregates_mixed_success_and_failure_without_truncation() -
 def test_delete_many_empty_list_returns_empty_list() -> None:
     adapter = _FakeDeleteAdapter()
     assert adapter.delete_many([]) == []
+
+
+# ---------------------------------------------------------------------------
+# ZepGraphitiSelfHostedAdapter -- self-hosted graphiti-core
+#
+# The real `graphiti-core` package is not installed in this environment
+# (confirmed: `ModuleNotFoundError: No module named 'graphiti_core'`), and no
+# Neo4j/FalkorDB instance is reachable here either. Every test below exercises
+# this adapter's own logic against a fake client injected through the
+# `graphiti_client=` constructor kwarg -- the same convention
+# MemPalaceAdapter's `palace=` param uses -- conforming to the
+# `_GraphitiProtocol` shape defined in zep_graphiti_selfhosted_adapter.py.
+# These tests prove the adapter's internal logic is correct given a response
+# shape; they do not prove that shape matches a live graphiti-core instance.
+# See that module's docstring and docs/methodology.md for the full caveat.
+# ---------------------------------------------------------------------------
+
+
+class _FakeEntityEdge:
+    """Stands in for a real `graphiti_core.edges.EntityEdge` -- exposes
+    `.model_dump()` the same way the real Pydantic model does, so
+    `zep_graphiti_selfhosted_adapter._to_plain_dict()` handles it exactly
+    as it would the real class."""
+
+    def __init__(
+        self,
+        uuid: str,
+        fact: str,
+        source_node_uuid: str | None = "node-source",
+        target_node_uuid: str | None = "node-target",
+        invalid_at: str | None = None,
+        valid_at: str | None = None,
+        attributes: dict[str, Any] | None = None,
+    ) -> None:
+        self.uuid = uuid
+        self.fact = fact
+        self.source_node_uuid = source_node_uuid
+        self.target_node_uuid = target_node_uuid
+        self.invalid_at = invalid_at
+        self.valid_at = valid_at
+        self.attributes = attributes or {}
+
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "uuid": self.uuid,
+            "fact": self.fact,
+            "source_node_uuid": self.source_node_uuid,
+            "target_node_uuid": self.target_node_uuid,
+            "invalid_at": self.invalid_at,
+            "valid_at": self.valid_at,
+            "attributes": self.attributes,
+        }
+
+
+class _FakeEpisodicNode:
+    def __init__(self, uuid: str) -> None:
+        self.uuid = uuid
+
+
+class _FakeAddEpisodeResults:
+    """Stands in for a real `graphiti_core.graphiti.AddEpisodeResults`."""
+
+    def __init__(self, episode_uuid: str) -> None:
+        self.episode = _FakeEpisodicNode(episode_uuid)
+
+    def model_dump(self) -> dict[str, Any]:
+        return {"episode": {"uuid": self.episode.uuid}}
+
+
+class FakeGraphitiClient:
+    """Fake conforming to `_GraphitiProtocol` -- records every call it
+    receives so tests can assert on exactly what this adapter sent."""
+
+    def __init__(self) -> None:
+        self.add_episode_calls: list[dict[str, Any]] = []
+        self.search_calls: list[dict[str, Any]] = []
+        self.remove_episode_calls: list[str] = []
+        self.closed = False
+        self._next_search_result: list[_FakeEntityEdge] = []
+        self._episode_counter = 0
+
+    def set_search_result(self, edges: list[_FakeEntityEdge]) -> None:
+        self._next_search_result = edges
+
+    async def add_episode(
+        self,
+        name: str,
+        episode_body: str,
+        source_description: str,
+        reference_time: Any,
+        group_id: str | None = None,
+        update_communities: bool = False,
+    ) -> _FakeAddEpisodeResults:
+        self._episode_counter += 1
+        self.add_episode_calls.append(
+            {
+                "name": name,
+                "episode_body": episode_body,
+                "source_description": source_description,
+                "reference_time": reference_time,
+                "group_id": group_id,
+                "update_communities": update_communities,
+            }
+        )
+        return _FakeAddEpisodeResults(f"episode-{self._episode_counter}")
+
+    async def search(
+        self, query: str, group_ids: list[str] | None = None, num_results: int = 10
+    ) -> list[_FakeEntityEdge]:
+        self.search_calls.append(
+            {"query": query, "group_ids": group_ids, "num_results": num_results}
+        )
+        return self._next_search_result
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        self.remove_episode_calls.append(episode_uuid)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _BrokenGraphitiClient:
+    """Every call raises, same convention as MemPalaceAdapter's
+    `BrokenPalace` test double above -- exercises the adapter's
+    vendor-exception-wrapping path."""
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("vendor exploded")
+
+    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise RuntimeError("vendor exploded")
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        raise RuntimeError("vendor exploded")
+
+    async def close(self) -> None:
+        pass
+
+
+def test_graphiti_selfhosted_configured_via_falkordb_url_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GRAPHITI_NEO4J_URI", raising=False)
+    monkeypatch.setenv("GRAPHITI_FALKORDB_URL", "redis://localhost:6379")
+    # Must not raise BackendNotConfiguredError -- GRAPHITI_FALKORDB_URL
+    # alone satisfies configuration, the same "one env var, or SKIPPED"
+    # contract GRAPHITI_NEO4J_URI satisfies on its own.
+    ZepGraphitiSelfHostedAdapter()
+
+
+def test_graphiti_selfhosted_store_query_update_with_fake_client() -> None:
+    client = FakeGraphitiClient()
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+
+    store_result = adapter.store("session-1", "Priya is the lead on payments.")
+    assert store_result.memory_id == "episode-1"
+    call = client.add_episode_calls[0]
+    assert call["group_id"] == "session-1"
+    assert call["episode_body"] == "Priya is the lead on payments."
+    assert call["update_communities"] is False
+
+    client.set_search_result(
+        [
+            _FakeEntityEdge(
+                uuid="edge-1",
+                fact="Sam is the lead on payments.",
+                attributes={"confidence": 0.9, "source": "correction"},
+            )
+        ]
+    )
+    query_result = adapter.query("session-1", "Who leads payments?")
+    assert len(query_result.records) == 1
+    record = query_result.records[0]
+    assert record.memory_id == "edge-1"
+    assert record.content == "Sam is the lead on payments."
+    assert query_result.conflict_signal == ConflictSignal.SERVED_STALE
+
+    adapter.update("session-1", store_result.memory_id, "Sam is now the lead.")
+    assert len(client.add_episode_calls) == 2
+    assert client.add_episode_calls[1]["episode_body"] == "Sam is now the lead."
+
+
+def test_graphiti_selfhosted_query_populates_attributes_from_mock_response() -> None:
+    """query() populates MemoryRecord.attributes from the backend's
+    structured per-edge attributes dict -- the field this build added to
+    base.py specifically so graphiti_core's EntityEdge.attributes survives
+    the adapter boundary instead of being dropped or flattened into
+    `raw` only."""
+    client = FakeGraphitiClient()
+    client.set_search_result(
+        [
+            _FakeEntityEdge(
+                uuid="edge-9",
+                fact="The migration ticket is priority P0.",
+                attributes={"ticket_id": "OPS-4471", "team": "platform-infra"},
+            )
+        ]
+    )
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    result = adapter.query("session-x", "priority?")
+    assert result.records[0].attributes == {"ticket_id": "OPS-4471", "team": "platform-infra"}
+
+
+def test_graphiti_selfhosted_query_attributes_default_empty_when_absent() -> None:
+    client = FakeGraphitiClient()
+    client.set_search_result([_FakeEntityEdge(uuid="edge-2", fact="a fact with no attributes")])
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    result = adapter.query("session-1", "q")
+    assert result.records[0].attributes == {}
+
+
+def test_graphiti_selfhosted_query_flags_invalidated_edge() -> None:
+    client = FakeGraphitiClient()
+    client.set_search_result(
+        [_FakeEntityEdge(uuid="e1", fact="old fact", invalid_at="2026-06-01T00:00:00Z")]
+    )
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    result = adapter.query("session-1", "q")
+    assert result.conflict_signal == ConflictSignal.FLAGGED
+    assert result.records[0].metadata == {"invalid_at": "2026-06-01T00:00:00Z"}
+
+
+def test_graphiti_selfhosted_query_served_stale_when_no_invalidation() -> None:
+    client = FakeGraphitiClient()
+    client.set_search_result([_FakeEntityEdge(uuid="e1", fact="a fact")])
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    result = adapter.query("session-1", "q")
+    assert result.conflict_signal == ConflictSignal.SERVED_STALE
+
+
+def test_graphiti_selfhosted_query_raw_carries_edge_endpoint_uuids() -> None:
+    """The exact structural shape evals/contradiction.py's
+    EDGE_INTEGRITY_VIOLATION check reads: MemoryRecord.raw must carry the
+    edge's source_node_uuid/target_node_uuid so that check can inspect
+    them without this adapter needing its own bespoke field for it."""
+    client = FakeGraphitiClient()
+    client.set_search_result(
+        [_FakeEntityEdge(uuid="e1", fact="a fact", source_node_uuid="n1", target_node_uuid="n2")]
+    )
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    result = adapter.query("session-1", "q")
+    assert result.records[0].raw["source_node_uuid"] == "n1"
+    assert result.records[0].raw["target_node_uuid"] == "n2"
+
+
+def test_graphiti_selfhosted_store_threads_update_communities_true() -> None:
+    """The update_communities=True toggle this build added, demonstrated
+    reaching add_episode() -- see this adapter module's docstring for the
+    honest limitation this does NOT prove: that it actually triggers
+    getzep/graphiti#836's ValueError, which needs a live instance and real
+    entity extraction to observe."""
+    client = FakeGraphitiClient()
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client, update_communities=True)
+    adapter.store("session-1", "content")
+    assert client.add_episode_calls[0]["update_communities"] is True
+
+
+def test_graphiti_selfhosted_update_communities_defaults_false() -> None:
+    client = FakeGraphitiClient()
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    adapter.store("session-1", "content")
+    assert client.add_episode_calls[0]["update_communities"] is False
+
+
+def test_graphiti_selfhosted_update_communities_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GRAPHITI_UPDATE_COMMUNITIES", "true")
+    client = FakeGraphitiClient()
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    adapter.store("session-1", "content")
+    assert client.add_episode_calls[0]["update_communities"] is True
+
+
+def test_graphiti_selfhosted_explicit_update_communities_kwarg_overrides_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GRAPHITI_UPDATE_COMMUNITIES", "true")
+    client = FakeGraphitiClient()
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client, update_communities=False)
+    adapter.store("session-1", "content")
+    assert client.add_episode_calls[0]["update_communities"] is False
+
+
+def test_graphiti_selfhosted_delete_calls_remove_episode() -> None:
+    client = FakeGraphitiClient()
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    result = adapter.delete("episode-7")
+    assert result.success is True
+    assert result.memory_id == "episode-7"
+    assert client.remove_episode_calls == ["episode-7"]
+
+
+def test_graphiti_selfhosted_wraps_vendor_exceptions_in_backend_api_error() -> None:
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=_BrokenGraphitiClient())
+    with pytest.raises(BackendAPIError):
+        adapter.store("session-1", "content")
+    with pytest.raises(BackendAPIError):
+        adapter.query("session-1", "q")
+    with pytest.raises(BackendAPIError):
+        adapter.delete("id-1")
+
+
+def test_graphiti_selfhosted_close_calls_client_close() -> None:
+    client = FakeGraphitiClient()
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=client)
+    adapter.close()
+    assert client.closed is True
+
+
+def test_graphiti_selfhosted_close_is_a_noop_when_client_never_constructed() -> None:
+    adapter = ZepGraphitiSelfHostedAdapter(neo4j_uri="bolt://localhost:7687")
+    adapter.close()  # must not raise -- _get_client() was never called
+
+
+def test_graphiti_selfhosted_get_client_raises_clear_error_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # graphiti-core is not a memtrust dependency and is genuinely not
+    # installed in this test environment -- this exercises the real
+    # ImportError path, not a simulated one, same convention as
+    # MemPalaceAdapter's equivalent test above.
+    monkeypatch.setenv("GRAPHITI_NEO4J_URI", "bolt://localhost:7687")
+    adapter = ZepGraphitiSelfHostedAdapter()
+    with pytest.raises(BackendAPIError, match="not installed"):
+        adapter.store("session-1", "content")
+
+
+def test_parse_falkordb_url_bare_host_port() -> None:
+    assert _parse_falkordb_url("localhost:6379") == ("localhost", 6379, None, None)
+
+
+def test_parse_falkordb_url_full_redis_uri() -> None:
+    assert _parse_falkordb_url("redis://admin:secret@falkor-host:6380") == (
+        "falkor-host",
+        6380,
+        "admin",
+        "secret",
+    )
+
+
+def test_parse_falkordb_url_defaults_port_when_omitted() -> None:
+    host, port, _user, _password = _parse_falkordb_url("falkor-host")
+    assert host == "falkor-host"
+    assert port == 6379
