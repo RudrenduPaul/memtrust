@@ -14,6 +14,7 @@ from memtrust.adapters.base import (
     UpdateResult,
 )
 from memtrust.adapters.mem0_adapter import Mem0Adapter, Mem0SelfHostedAdapter
+from memtrust.adapters.mem0_direct_adapter import Mem0DirectAdapter
 from memtrust.adapters.mempalace_adapter import MemPalaceAdapter
 from memtrust.adapters.openviking_adapter import OpenVikingAdapter
 from memtrust.adapters.zep_graphiti_adapter import ZepGraphitiAdapter
@@ -22,15 +23,18 @@ from memtrust.adapters.zep_graphiti_selfhosted_adapter import ZepGraphitiSelfHos
 #: Registry the CLI resolves --backends names against. Keys are the
 #: user-facing backend names used on the command line.
 #:
-#: "mem0_selfhosted" and "graphiti_selfhosted" are intentionally not part
-#: of cli.ALL_BACKENDS (the set "all" expands to) -- both target a
-#: self-run local deployment rather than a hosted vendor API, so both are
-#: opt-in only, never auto-included. See docs/methodology.md for their
-#: confidence levels.
+#: "mem0_selfhosted", "mem0_direct", and "graphiti_selfhosted" are
+#: intentionally not part of cli.ALL_BACKENDS (the set "all" expands to) --
+#: none targets a single hosted vendor API the way the other four do
+#: ("mem0_selfhosted"/"graphiti_selfhosted" are self-run local
+#: deployments, "mem0_direct" is a self-assembled in-process
+#: embedder/vector-store stack), so all three are opt-in only, never
+#: auto-included. See docs/methodology.md for their confidence levels.
 ADAPTER_REGISTRY: dict[str, type[MemoryBackendAdapter]] = {
     "mempalace": MemPalaceAdapter,
     "mem0": Mem0Adapter,
     "mem0_selfhosted": Mem0SelfHostedAdapter,
+    "mem0_direct": Mem0DirectAdapter,
     "zep": ZepGraphitiAdapter,
     "graphiti": ZepGraphitiAdapter,
     "graphiti_selfhosted": ZepGraphitiSelfHostedAdapter,
@@ -50,6 +54,7 @@ __all__ = [
     "UpdateResult",
     "Mem0Adapter",
     "Mem0SelfHostedAdapter",
+    "Mem0DirectAdapter",
     "MemPalaceAdapter",
     "OpenVikingAdapter",
     "ZepGraphitiAdapter",
