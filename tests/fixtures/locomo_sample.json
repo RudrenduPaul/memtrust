@@ -36,6 +36,12 @@
           "answer": "A bowl and a small vase",
           "category": "multi-hop",
           "evidence": ["D2:2"]
+        },
+        {
+          "question": "What color did Mia paint her kitchen last spring?",
+          "answer": "The conversation never mentions Mia painting a kitchen.",
+          "category": "adversarial",
+          "evidence": []
         }
       ]
     }
