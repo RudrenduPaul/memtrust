@@ -28,6 +28,26 @@ prefix, triggers a resync, and re-lists the prefix to see what survived:
                               content no longer matches what was seeded,
                               i.e. the resync silently overwrote it
                               rather than deleting it outright.
+  * NESTED_CONTENT_UNINDEXED -- the path itself still exists after the
+                              resync (list_resource_paths() reports it
+                              present) and a query() was actually issued,
+                              but the search index never returned a
+                              record for that path at all -- distinct
+                              from OVERWRITTEN_UNCHANGED, which means a
+                              record for the path *was* found but its
+                              content had changed. This is the
+                              volcengine/OpenViking#1703 failure mode:
+                              index_resource() skipped every subdirectory
+                              during reindex, so nested-directory content
+                              was never vectorized in the first place --
+                              "never indexed," not "deleted" or
+                              "overwritten." A file at a top-level path
+                              (no "/" in its resource path) failing this
+                              way would just look like a generic search
+                              miss; this signal is specifically for paths
+                              that are nested, where "never indexed" has
+                              a concrete, reproducible mechanism to point
+                              to.
 
 Optional/flagged capability: this eval only runs against adapters that
 set MemoryBackendAdapter.supports_resource_sync = True. Adapters without
@@ -74,6 +94,15 @@ class ResourceSyncSignal(StrEnum):
     """Still present after the resync, but its content no longer matches
     what was seeded -- silently overwritten rather than deleted."""
 
+    NESTED_CONTENT_UNINDEXED = "nested_content_unindexed"
+    """Still present after the resync (the path itself was not deleted or
+    overwritten), but no query() call ever returned a record for that
+    path at all -- the content exists on disk/in the filesystem mirror
+    but was never indexed for search. This is "never indexed," not
+    "deleted": the exact volcengine/OpenViking#1703 failure mode, where
+    a reindex's directory walk skipped every subdirectory and left
+    nested content permanently unsearchable with no error raised."""
+
     NOT_APPLICABLE = "not_applicable"
     """Either the backend has no resource-sync primitive this eval can
     exercise (MemoryBackendAdapter.supports_resource_sync is False), or a
@@ -104,6 +133,7 @@ class ResourceSyncFileResult:
     present_before_resync: bool
     present_after_resync: bool
     content_matches_after_resync: bool | None
+    indexed_after_resync: bool | None
     signal: ResourceSyncSignal
     error: str | None = None
 
@@ -143,6 +173,13 @@ class ResourceSyncEvalResult:
     def overwritten_unchanged_rate(self) -> float | None:
         return self._fraction(ResourceSyncSignal.OVERWRITTEN_UNCHANGED)
 
+    @property
+    def nested_content_unindexed_rate(self) -> float | None:
+        """Fraction of seed files that survived the resync on disk but
+        were never returned by any query() call -- the volcengine/
+        OpenViking#1703 signal, distinct from deletion or overwrite."""
+        return self._fraction(ResourceSyncSignal.NESTED_CONTENT_UNINDEXED)
+
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[ResourceSyncCase]:
     data = json.loads(Path(path).read_text())
@@ -168,9 +205,10 @@ def classify_resource_sync_file(
     present_before: bool,
     present_after: bool,
     content_matches_after_resync: bool | None,
+    indexed_after_resync: bool | None = None,
 ) -> ResourceSyncSignal:
     """Classify a single seeded file's outcome from its before/after
-    presence and (if re-verifiable) content match.
+    presence and (if re-verifiable) content/index match.
 
     Returns DELETED_USER_FILE whenever a file that was confirmed present
     before the resync is gone afterward -- deliberately independent of
@@ -180,12 +218,24 @@ def classify_resource_sync_file(
     disappearing unexpectedly is just as real a signal, it is simply not
     the metric #3029 was about.
 
+    Returns NESTED_CONTENT_UNINDEXED whenever a file is still present
+    after the resync but `indexed_after_resync` is explicitly False --
+    meaning a query() call was actually made and returned no record at
+    all for this path, as opposed to returning a record with stale
+    content (OVERWRITTEN_UNCHANGED). `indexed_after_resync=None` (the
+    default) means the caller never attempted to distinguish "no record
+    found" from "record found with wrong content" -- existing callers
+    that only pass the first three arguments keep the prior behavior
+    unchanged (OVERWRITTEN_UNCHANGED wins on a content mismatch).
+
     A file never observed present before the resync has nothing
     meaningful to classify (its "before" state is unknown), so it is
     recorded as NOT_APPLICABLE rather than guessed at either way.
     """
     if present_before and not present_after:
         return ResourceSyncSignal.DELETED_USER_FILE
+    if present_after and indexed_after_resync is False:
+        return ResourceSyncSignal.NESTED_CONTENT_UNINDEXED
     if present_after and content_matches_after_resync is False:
         return ResourceSyncSignal.OVERWRITTEN_UNCHANGED
     if present_after:
@@ -233,6 +283,7 @@ def run_resource_sync_eval(
                         present_before_resync=False,
                         present_after_resync=False,
                         content_matches_after_resync=None,
+                        indexed_after_resync=None,
                         signal=ResourceSyncSignal.NOT_APPLICABLE,
                         error=str(exc),
                     )
@@ -245,16 +296,29 @@ def run_resource_sync_eval(
             present_after = stored_path in paths_after
 
             content_matches: bool | None = None
+            indexed_after: bool | None = None
             if present_after:
                 try:
                     query_result = adapter.query(case.prefix, seed.content, top_k=5)
+                    # Two distinct questions, not one: did the search index
+                    # return *any* record for this exact path at all
+                    # (indexed_after -- the #1703 signal), and separately,
+                    # among whatever records did come back, does any one's
+                    # content match what was seeded (content_matches -- the
+                    # #3029-era overwrite signal). Collapsing these into one
+                    # boolean would make "never indexed" indistinguishable
+                    # from "indexed with stale content."
+                    indexed_after = any(r.memory_id == stored_path for r in query_result.records)
                     content_matches = any(
                         seed.content.lower() in r.content.lower() for r in query_result.records
                     )
                 except BackendAPIError:
                     content_matches = None
+                    indexed_after = None
 
-            signal = classify_resource_sync_file(present_before, present_after, content_matches)
+            signal = classify_resource_sync_file(
+                present_before, present_after, content_matches, indexed_after
+            )
             result.file_results.append(
                 ResourceSyncFileResult(
                     case_id=case.case_id,
@@ -264,6 +328,7 @@ def run_resource_sync_eval(
                     present_before_resync=present_before,
                     present_after_resync=present_after,
                     content_matches_after_resync=content_matches,
+                    indexed_after_resync=indexed_after,
                     signal=signal,
                 )
             )

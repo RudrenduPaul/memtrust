@@ -59,6 +59,27 @@
           "content": "A user's vacation plan notes, also stored under the wiki resource path and also independent of the watcher's source."
         }
       ]
+    },
+    {
+      "case_id": "mt-resync-004",
+      "prefix": "resync-session-4/agent-memory",
+      "seed_files": [
+        {
+          "path_suffix": "generated/entities/people/jordan-lee.md",
+          "origin": "generated",
+          "content": "Auto-ingested by the watcher: Jordan Lee's role and team, extracted from the source conversation."
+        },
+        {
+          "path_suffix": "user-notes/preferences/user-482/notification-settings.md",
+          "origin": "user",
+          "content": "User-authored notification preferences, nested two directory levels deep, added directly and never produced by any ingestion watcher."
+        },
+        {
+          "path_suffix": "user-notes/preferences/user-482/timezone.md",
+          "origin": "user",
+          "content": "User-authored timezone preference, also nested under the same two-level user-482 preferences directory."
+        }
+      ]
     }
   ]
 }
