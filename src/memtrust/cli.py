@@ -146,6 +146,7 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
             "user_file_deletion_rate": result.user_file_deletion_rate,
             "preserved_rate": result.preserved_rate,
             "overwritten_unchanged_rate": result.overwritten_unchanged_rate,
+            "nested_content_unindexed_rate": result.nested_content_unindexed_rate,
             "n_files": len(result.file_results),
             "files": [
                 {
@@ -153,6 +154,7 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                     "path_suffix": f.path_suffix,
                     "origin": f.origin,
                     "signal": str(f.signal),
+                    "indexed_after_resync": f.indexed_after_resync,
                     "error": f.error,
                 }
                 for f in result.file_results
@@ -361,8 +363,13 @@ def run(
                 console.print(f"    SKIPPED: {rss_result.skip_reason}")
             else:
                 dr = rss_result.user_file_deletion_rate
+                ndr = rss_result.nested_content_unindexed_rate
                 if dr is not None:
-                    console.print(f"    user-file deletion rate: {dr:.1%}")
+                    ndr_str = f"{ndr:.1%}" if ndr is not None else "N/A"
+                    console.print(
+                        f"    user-file deletion rate: {dr:.1%}"
+                        f"  nested-content-unindexed rate: {ndr_str}"
+                    )
                 else:
                     console.print("    N/A (no scoreable files)")
 
@@ -435,7 +442,7 @@ def report(report_path: Path) -> None:
     table.add_column("LongMemEval")
     table.add_column("LoCoMo (all cats / non-adversarial)")
     table.add_column("Contradiction (flagged/overwrite/stale/empty-or-lost)")
-    table.add_column("Resource-Sync (user-file deletion rate)")
+    table.add_column("Resource-Sync (user-file deletion / nested-content-unindexed)")
     table.add_column("Compression fidelity by mode")
     table.add_column("Ranking Quality (missing-ordering-key rate)")
 
@@ -466,7 +473,10 @@ def report(report_path: Path) -> None:
         if rss.get("skipped"):
             rss_str = "SKIPPED (unsupported)"
         elif rss:
-            rss_str = _fmt_pct(rss.get("user_file_deletion_rate"))
+            rss_str = (
+                f"{_fmt_pct(rss.get('user_file_deletion_rate'))} / "
+                f"{_fmt_pct(rss.get('nested_content_unindexed_rate'))}"
+            )
         else:
             rss_str = "-"
         compression_str = (

@@ -530,6 +530,213 @@ def test_openviking_delete_raises_backend_api_error_on_http_failure(
 
 
 # ---------------------------------------------------------------------------
+# OpenVikingAdapter.store() resource_path -- volcengine/OpenViking#1703 gap
+#
+# #1703 (real bug, reported by SonicBotMan): OpenViking's own
+# index_resource() skipped every subdirectory during reindex, so nested-
+# directory content was never vectorized and searches over it silently
+# returned nothing. That bug is only reachable by this harness at all if
+# memtrust's own store() actually constructs a real nested directory tree
+# against OpenViking in the first place -- these tests prove store() now
+# does that when a caller supplies `resource_path` metadata, and that it
+# still falls back to the pre-existing flat content-hash path when no
+# caller does (no regression for evals/contradiction.py, evals/
+# compression.py, longmemeval.py, locomo.py -- none of which pass
+# resource_path).
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_store_with_resource_path_writes_real_nested_path(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        match_json={
+            "path": "viking://memory/session-1/entities/people/jordan-lee.md",
+            "content": "Jordan Lee prefers async standups.",
+            "metadata": {"resource_path": "entities/people/jordan-lee.md", "origin": "user"},
+        },
+        json={"path": "viking://memory/session-1/entities/people/jordan-lee.md"},
+    )
+
+    result = adapter.store(
+        "session-1",
+        "Jordan Lee prefers async standups.",
+        metadata={"resource_path": "entities/people/jordan-lee.md", "origin": "user"},
+    )
+
+    assert result.memory_id == "viking://memory/session-1/entities/people/jordan-lee.md"
+    adapter.close()
+
+
+def test_openviking_store_without_resource_path_falls_back_to_flat_hash(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """No regression: a caller that never sets `resource_path` in metadata
+    (every eval except resource_sync_safety.py) must keep writing to the
+    same flat memory/{session_id}/{sha256(content)[:16]} path as before."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        body = _json.loads(request.content)
+        assert body["path"].startswith("viking://memory/session-1/")
+        suffix = body["path"].removeprefix("viking://memory/session-1/")
+        assert "/" not in suffix  # flat, single-level -- no nested directory
+        assert len(suffix) == 16  # sha256(content)[:16]
+        return httpx.Response(status_code=200, json={"path": body["path"]})
+
+    httpx_mock.add_callback(
+        capture, method="POST", url="http://localhost:1933/v1/fs/write", is_reusable=True
+    )
+
+    adapter.store("session-1", "I prefer dark mode.")
+    adapter.store("session-1", "I prefer dark mode.", metadata={"origin": "user"})
+    adapter.close()
+
+
+def test_openviking_store_resource_path_with_leading_slash_is_normalized(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        match_json={
+            "path": "viking://memory/session-1/preferences/user-482/notifications.md",
+            "content": "Notifications muted after 9pm.",
+            "metadata": {"resource_path": "/preferences/user-482/notifications.md"},
+        },
+        json={"path": "viking://memory/session-1/preferences/user-482/notifications.md"},
+    )
+
+    result = adapter.store(
+        "session-1",
+        "Notifications muted after 9pm.",
+        metadata={"resource_path": "/preferences/user-482/notifications.md"},
+    )
+
+    assert result.memory_id == "viking://memory/session-1/preferences/user-482/notifications.md"
+    adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# OpenVikingAdapter.list_resource_paths() -- real recursive tree walk
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_list_resource_paths_walks_nested_directories(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """A single flat response is not assumed to already contain every
+    nested file: a directory entry in the first response must be
+    descended into with a follow-up call, and the final list must contain
+    the real leaf paths from every level, not just the top level."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        match_json={"path_prefix": "viking://memory/session-1/entities"},
+        json={
+            "entries": [
+                {"path": "viking://memory/session-1/entities/skills.md", "type": "file"},
+                {"path": "viking://memory/session-1/entities/people", "type": "directory"},
+            ]
+        },
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        match_json={"path_prefix": "viking://memory/session-1/entities/people"},
+        json={
+            "entries": [
+                {
+                    "path": "viking://memory/session-1/entities/people/jordan-lee.md",
+                    "type": "file",
+                },
+                {
+                    "path": "viking://memory/session-1/entities/people/alex-kim.md",
+                    "type": "file",
+                },
+            ]
+        },
+    )
+
+    paths = adapter.list_resource_paths("memory/session-1/entities")
+
+    assert sorted(paths) == sorted(
+        [
+            "viking://memory/session-1/entities/skills.md",
+            "viking://memory/session-1/entities/people/jordan-lee.md",
+            "viking://memory/session-1/entities/people/alex-kim.md",
+        ]
+    )
+    adapter.close()
+
+
+def test_openviking_list_resource_paths_treats_trailing_slash_as_directory(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Bare path-string entries (not dicts) that end in "/" must also be
+    recursed into -- the directory marker is not assumed to always arrive
+    as a {"type": "directory"} dict."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        match_json={"path_prefix": "viking://memory/session-1/preferences"},
+        json={"paths": ["viking://memory/session-1/preferences/user-482/"]},
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        match_json={"path_prefix": "viking://memory/session-1/preferences/user-482"},
+        json={"paths": ["viking://memory/session-1/preferences/user-482/notifications.md"]},
+    )
+
+    paths = adapter.list_resource_paths("memory/session-1/preferences")
+
+    assert paths == ["viking://memory/session-1/preferences/user-482/notifications.md"]
+    adapter.close()
+
+
+def test_openviking_list_resource_paths_respects_max_depth(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """max_depth=0 must not recurse at all -- a directory entry at the
+    top level is dropped rather than descended into."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        match_json={"path_prefix": "viking://memory/session-1/entities"},
+        json={
+            "entries": [
+                {"path": "viking://memory/session-1/entities/skills.md", "type": "file"},
+                {"path": "viking://memory/session-1/entities/people", "type": "directory"},
+            ]
+        },
+    )
+
+    paths = adapter.list_resource_paths("memory/session-1/entities", max_depth=0)
+
+    assert paths == ["viking://memory/session-1/entities/skills.md"]
+    adapter.close()
+
+
+# ---------------------------------------------------------------------------
 # MemPalaceAdapter (fake in-memory Palace, no chromadb dependency required)
 # ---------------------------------------------------------------------------
 
