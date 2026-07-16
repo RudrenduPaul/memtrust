@@ -53,12 +53,77 @@ vendor's real API, or is explicitly labeled as not yet measured.
   `speaker_a`/`speaker_b`, `session_<n>`/`session_<n>_date_time` pairs (each session a list of
   `{speaker, text, dia_id}` turns), and a `qa` list of `{question, answer, category, evidence}`
   entries spanning five categories (single-hop, multi-hop, temporal, open-domain, adversarial).
+  The published dataset totals 1,986 questions: 1,540 "regular" questions across the first four
+  categories, plus a 446-question adversarial category 5 -- deliberately unanswerable questions
+  that test whether a backend admits it doesn't know rather than fabricating a confident answer.
 - **What ships in this repo:** `tests/fixtures/locomo_sample.json` -- 1 hand-written conversation,
-  2 sessions, 3 QA pairs across 3 of the 5 real categories (single-hop, temporal, multi-hop). Again,
-  invented content matching the real schema, not copied data.
+  2 sessions, 4 QA pairs across all 4 non-adversarial categories represented by 3 cases
+  (single-hop, temporal, multi-hop) plus 1 adversarial case. Again, invented content matching the
+  real schema, not copied data.
 - **To run against the real dataset:** download `locomo10.json` from the LoCoMo repository and
   point `run_locomo(adapter, judge, dataset_path=...)` at it -- the loader expects the same
   top-level `{"conversations": [...]}` shape already.
+
+#### Headline accuracy vs. non-adversarial accuracy (category-5 exclusion)
+
+This gap was raised by an independent audit (`dial481/locomo-audit`, referenced from
+mempalace/mempalace#29 and #875): a benchmark's headline accuracy number, if it silently folds
+the 446-question adversarial category 5 in with the 1,540 regular questions, is not the same
+measurement the LoCoMo paper itself reports, and a reader comparing numbers across vendors has no
+way to tell whether adversarial questions were included unless the harness makes the distinction
+explicit.
+
+`LoCoMoResult` reports two accuracy numbers, both always computed, neither hidden behind extra
+API surface a caller has to know to ask for:
+
+- **`accuracy`** -- every graded case, all categories included (adversarial included). This is
+  the property's original meaning; nothing that already reads `.accuracy` changes behavior.
+- **`non_adversarial_accuracy`** -- the same computation restricted to categories other than
+  `"adversarial"`, mirroring the real benchmark's own 1,540/446 split. This is the number that is
+  directly comparable to a vendor's claim that excludes category 5.
+
+Both numbers are surfaced everywhere `accuracy` already was: `memtrust run`'s console output
+prints both lines (`accuracy (all categories, incl. adversarial)` and `non_adversarial_accuracy
+(excludes category 5)`), the JSON report's `locomo` block carries both keys, and `memtrust
+report`'s table renders both as `all / non-adversarial` in the LoCoMo column. `accuracy_by_category()`
+already existed and still gives the full per-category breakdown, including `"adversarial"` on its
+own -- `non_adversarial_accuracy` is the additive, headline-visible version of "exclude that one
+category," not a replacement for the finer-grained breakdown.
+
+**What this does not claim to fix.** memtrust cannot make a vendor disclose which number they
+reported; it can only make sure memtrust's own numbers, and any report generated from a memtrust
+run, never blend the two without saying so.
+
+#### Known-bad ground-truth exclusion
+
+The same audit separately catalogued 99 ground-truth labeling errors in the released dataset --
+a different problem from the category-5 blending above: even the 1,540 "regular" questions
+include some where the published expected answer is itself wrong, which would unfairly penalize
+a backend that answered correctly against the *actual* conversation content.
+
+`run_locomo(adapter, judge, dataset_path=..., exclude_question_ids=...)` accepts an optional set
+of question IDs to exclude from scoring entirely -- the case is still recorded (so `n_cases` stays
+honest and a reader can see it was excluded, not silently dropped) via
+`LoCoMoCaseResult.excluded_ground_truth`, but it is never queried, never judged, and never counted
+toward `accuracy`, `non_adversarial_accuracy`, or `accuracy_by_category()`.
+
+**This repo does not ship dial481's specific 99 question IDs.** They were not independently
+verified against his published audit data during this change, and hardcoding an unverified list
+into memtrust's default scoring would be exactly the kind of unstated, unauditable adjustment this
+document exists to prevent. The mechanism is real and pluggable; the specific list is left for
+whoever runs memtrust against the real dataset to supply, once they have a verified corrected list.
+
+To use it:
+
+1. Build (or obtain) a verified list of known-bad question IDs. The published LoCoMo schema has
+   no `question_id` field, so `run_locomo()` derives one per case as
+   `f"{conversation_id}::{index_in_conversation}"` (or uses `qa["question_id"]` directly if the
+   dataset provides it) -- a corrected list must use IDs in that same shape.
+2. Load it with `load_exclude_question_ids(path)` (`src/memtrust/evals/locomo.py`), which accepts
+   either a JSON array of ID strings or a plain-text file with one ID per line (`#`-prefixed lines
+   ignored, for inline annotation of why an ID is excluded).
+3. Pass the result as `exclude_question_ids=...` to `run_locomo()`, or point `memtrust run` at the
+   file directly with `--locomo-exclude-question-ids-file <path>`.
 
 ### MemTrust Contradiction-Detection Eval (original)
 

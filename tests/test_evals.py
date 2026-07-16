@@ -7,6 +7,11 @@ credentials are ever configured.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+from typing import Any
+
+import httpx
 import pytest
 from pytest_httpx import HTTPXMock
 
@@ -29,6 +34,7 @@ from memtrust.evals.contradiction import (
     load_dataset as load_contradiction_dataset,
 )
 from memtrust.evals.locomo import load_dataset as load_locomo_dataset
+from memtrust.evals.locomo import load_exclude_question_ids as load_locomo_exclude_question_ids
 from memtrust.evals.locomo import run_locomo
 from memtrust.evals.longmemeval import load_dataset as load_longmemeval_dataset
 from memtrust.evals.longmemeval import run_longmemeval
@@ -40,7 +46,7 @@ from memtrust.evals.resource_sync_safety import (
 from memtrust.evals.resource_sync_safety import (
     load_dataset as load_resource_sync_dataset,
 )
-from memtrust.scoring.llm_judge import LLMJudge
+from memtrust.scoring.llm_judge import JudgeVerdict, LLMJudge
 
 
 class RecallAllFakeAdapter(MemoryBackendAdapter):
@@ -610,7 +616,9 @@ def test_longmemeval_handles_backend_failure() -> None:
 def test_locomo_dataset_loads() -> None:
     conversations = load_locomo_dataset()
     assert len(conversations) == 1
-    assert len(conversations[0]["qa"]) == 3
+    # 3 non-adversarial + 1 adversarial (category 5) case -- see
+    # locomo_sample.json and docs/methodology.md's cat-5 note.
+    assert len(conversations[0]["qa"]) == 4
 
 
 def test_locomo_runs_offline_and_reports_no_accuracy(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -618,8 +626,9 @@ def test_locomo_runs_offline_and_reports_no_accuracy(monkeypatch: pytest.MonkeyP
     adapter = RecallAllFakeAdapter()
     judge = LLMJudge()
     result = run_locomo(adapter, judge)
-    assert len(result.case_results) == 3
+    assert len(result.case_results) == 4
     assert result.accuracy is None
+    assert result.non_adversarial_accuracy is None
 
 
 def test_locomo_sets_records_empty_on_empty_query_result(
@@ -632,9 +641,9 @@ def test_locomo_sets_records_empty_on_empty_query_result(
     adapter = EmptyButCapableFakeAdapter()
     judge = LLMJudge()
     result = run_locomo(adapter, judge)
-    assert len(result.case_results) == 3
+    assert len(result.case_results) == 4
     assert all(c.records_empty for c in result.case_results)
-    assert result.n_records_empty == 3
+    assert result.n_records_empty == 4
 
 
 def test_locomo_records_empty_false_when_records_returned() -> None:
@@ -662,8 +671,97 @@ def test_locomo_accuracy_by_category(
     )
     result = run_locomo(adapter, judge)
     by_cat = result.accuracy_by_category()
-    assert set(by_cat.keys()) == {"single-hop", "temporal", "multi-hop"}
+    assert set(by_cat.keys()) == {"single-hop", "temporal", "multi-hop", "adversarial"}
     assert all(v == 1.0 for v in by_cat.values())
+    judge.close()
+
+
+def test_locomo_non_adversarial_accuracy_excludes_adversarial_cases(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Proves the cat-5 exclusion is real, not a no-op: the adversarial
+    case is graded INCORRECT (the backend confidently answers an
+    unanswerable question, exactly the failure mode category 5 is
+    designed to catch) while the 3 non-adversarial cases are graded
+    CORRECT. `.accuracy` must fold the adversarial miss into its
+    denominator (3/4 = 75%); `.non_adversarial_accuracy` must exclude it
+    entirely (3/3 = 100%) -- if the two numbers were equal here, the
+    exclusion would not be doing anything."""
+    monkeypatch.setenv("MEMTRUST_JUDGE_API_KEY", "test-key")
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+
+    def _judge_callback(request: Any) -> httpx.Response:
+        body = json.loads(request.content)
+        prompt = body["messages"][0]["content"]
+        if "kitchen" in prompt:
+            content = "INCORRECT\nThe backend fabricated an answer to an unanswerable question."
+        else:
+            content = "CORRECT\nmatches"
+        return httpx.Response(
+            status_code=200,
+            json={
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    httpx_mock.add_callback(
+        _judge_callback,
+        method="POST",
+        url="https://api.deepseek.com/chat/completions",
+        is_reusable=True,
+    )
+    result = run_locomo(adapter, judge)
+
+    assert len(result.graded_cases) == 4
+    assert result.accuracy == pytest.approx(0.75)
+    assert result.non_adversarial_accuracy == pytest.approx(1.0)
+    assert result.accuracy != result.non_adversarial_accuracy
+    assert result.accuracy_by_category()["adversarial"] == 0.0
+    judge.close()
+
+
+def test_locomo_exclude_question_ids_removes_flagged_cases(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Proves exclude_question_ids genuinely removes a case from scoring
+    (never queries or judges it, and it never counts toward accuracy),
+    the mechanism a caller would use to score against a corrected
+    ground truth once they have a verified list of known-bad question
+    IDs (e.g. from an audit like dial481/locomo-audit)."""
+    monkeypatch.setenv("MEMTRUST_JUDGE_API_KEY", "test-key")
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.deepseek.com/chat/completions",
+        json={
+            "choices": [{"message": {"content": "CORRECT\nmatches"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        },
+        is_reusable=True,
+    )
+
+    conversations = load_locomo_dataset()
+    conv_id = conversations[0]["conversation_id"]
+    # The multi-hop case is the 3rd qa entry (index 2) in the fixture --
+    # exclude it as if an audit had flagged its ground truth as wrong.
+    flagged_question_id = f"{conv_id}::2"
+
+    result = run_locomo(adapter, judge, exclude_question_ids={flagged_question_id})
+
+    excluded = [c for c in result.case_results if c.question_id == flagged_question_id]
+    assert len(excluded) == 1
+    assert excluded[0].excluded_ground_truth is True
+    assert excluded[0].verdict == JudgeVerdict.NOT_RUN
+
+    # 4 total cases recorded, but only 3 actually scored -- the excluded
+    # one is neither queried nor judged nor counted.
+    assert len(result.case_results) == 4
+    assert len(result.graded_cases) == 3
+    assert result.n_excluded_ground_truth == 1
+    assert all(c.question_id != flagged_question_id for c in result.graded_cases)
     judge.close()
 
 
@@ -671,5 +769,26 @@ def test_locomo_handles_backend_failure() -> None:
     adapter = FailingFakeAdapter()
     judge = LLMJudge()
     result = run_locomo(adapter, judge)
-    assert len(result.case_results) == 3
+    assert len(result.case_results) == 4
     assert all(c.error is not None for c in result.case_results)
+
+
+def test_load_exclude_question_ids_from_json_file(tmp_path: Path) -> None:
+    path = tmp_path / "exclude.json"
+    path.write_text('["mt-locomo-001::2", "mt-locomo-004::0"]')
+    assert load_locomo_exclude_question_ids(path) == {"mt-locomo-001::2", "mt-locomo-004::0"}
+
+
+def test_load_exclude_question_ids_from_text_file(tmp_path: Path) -> None:
+    path = tmp_path / "exclude.txt"
+    path.write_text(
+        "\n".join(
+            [
+                "# known ground-truth errors from dial481/locomo-audit-style review",
+                "mt-locomo-001::2",
+                "",
+                "mt-locomo-004::0",
+            ]
+        )
+    )
+    assert load_locomo_exclude_question_ids(path) == {"mt-locomo-001::2", "mt-locomo-004::0"}
