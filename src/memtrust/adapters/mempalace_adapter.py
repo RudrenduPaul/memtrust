@@ -58,9 +58,69 @@ from memtrust.adapters.base import (
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
+    RankingSignal,
     StoreResult,
     UpdateResult,
 )
+
+#: Metadata keys that mempalace/mempalace#1733 (see RankingSignal's
+#: docstring in adapters/base.py) identified as the fields
+#: `mempalace/layers.py`'s `Layer1.generate()` sorts drawers by. Checked in
+#: this priority order because `importance` is the field the issue's root
+#: cause names directly (0/45,969 drawers on a real palace ever had it
+#: written); `emotional_weight`/`weight` are the sort's other documented
+#: keys, checked as fallbacks so this adapter still reports something
+#: meaningful if a future MemPalace version populates one of those instead.
+_RANKING_METADATA_KEYS = ("importance", "emotional_weight", "weight")
+
+
+def _classify_ranking_signal(records: list[MemoryRecord]) -> RankingSignal:
+    """Inspect a query response's records for a ranking-relevant metadata
+    field and report whether a real per-record signal appears to exist.
+
+    This is a coarse, adapter-level claim, not the full picture: it can
+    say "this field is present and varies" (SIGNAL_DRIVEN) or "this field
+    is absent or constant across every record" (MISSING_ORDERING_KEY), but
+    it cannot by itself confirm the backend's returned order actually
+    correlates with a varying field -- that requires ground truth about
+    intended order that only a specific eval case has. See
+    evals/ranking_quality.py's classify_ranking_case, which cross-checks
+    this claim against the actual returned order before crediting a
+    SIGNAL_DRIVEN report, exactly the way evals/contradiction.py's
+    classify_case never trusts an adapter's bare conflict_signal claim
+    outright either.
+
+    Fewer than 2 records is treated as NOT_APPLICABLE -- there is nothing
+    to compare an "identical across records" claim against with 0 or 1
+    record.
+    """
+    if len(records) < 2:
+        return RankingSignal.NOT_APPLICABLE
+
+    for key in _RANKING_METADATA_KEYS:
+        values = [r.metadata[key] for r in records if key in r.metadata]
+        if not values:
+            continue
+        if len(values) < len(records):
+            # The field is present on some records but not all -- exactly
+            # as ambiguous as "every record shares the same value": there
+            # is no complete, real per-record signal to point to.
+            return RankingSignal.MISSING_ORDERING_KEY
+        if len(set(values)) == 1:
+            # Present everywhere but identical -- the exact
+            # mempalace/mempalace#1733 shape: a field that silently
+            # defaulted to one constant value for every drawer.
+            return RankingSignal.MISSING_ORDERING_KEY
+        return RankingSignal.SIGNAL_DRIVEN
+
+    # None of the known ranking-relevant keys appeared on any record at
+    # all. That is itself indistinguishable, from the caller's side, from
+    # "this field silently defaults to a constant" -- a backend that never
+    # writes the key produces the same observable symptom (no real
+    # per-record signal) as one that writes a constant default. Flagging
+    # both the same way is deliberate, not an oversight -- see
+    # docs/methodology.md's honesty note on this eval's limits.
+    return RankingSignal.MISSING_ORDERING_KEY
 
 
 class _PalaceProtocol(Protocol):
@@ -184,8 +244,12 @@ class MemPalaceAdapter(MemoryBackendAdapter):
         # a query result carrying an "invalidated" marker means the
         # backend itself flagged that fact as superseded.
         conflict_signal = ConflictSignal.FLAGGED if invalidated else ConflictSignal.NOT_APPLICABLE
+        ranking_signal = _classify_ranking_signal(records)
         return QueryResult(
-            records=records, conflict_signal=conflict_signal, latency_ms=timer.elapsed_ms()
+            records=records,
+            conflict_signal=conflict_signal,
+            latency_ms=timer.elapsed_ms(),
+            ranking_signal=ranking_signal,
         )
 
     def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
