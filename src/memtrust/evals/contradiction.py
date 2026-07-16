@@ -26,8 +26,8 @@ does the backend:
                          NOT_APPLICABLE, and never folded into an ordinary
                          miss
 
-Design principle (see [redacted] [redacted]): classification is
-never a blind pass-through of what an adapter *claims* happened. Each
+Design principle: classification is never a blind pass-through of what an
+adapter *claims* happened. Each
 case's final verdict cross-checks the adapter-reported ConflictSignal
 against the actual retrieved content (does it contain the old value, the
 new value, or both) -- so a vendor's own optimistic self-report cannot
