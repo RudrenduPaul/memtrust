@@ -35,10 +35,9 @@ a directory/resource-mirror concept (the store/query/update-only model)
 are skipped cleanly -- reported as skipped, never silently dropped from
 the results table and never crashed by calling an unimplemented method.
 
-Design principle (see [redacted] [redacted], and
-evals/contradiction.py's classify_case for the same pattern applied to
-contradiction detection): classification never blindly trusts that a
-seeded file is "fine" just because the adapter didn't error. Each file's
+Design principle (see evals/contradiction.py's classify_case for the same
+pattern applied to contradiction detection): classification never blindly
+trusts that a seeded file is "fine" just because the adapter didn't error. Each file's
 final signal is derived from the actual before/after path listings (and,
 where possible, a re-query of the file's own content) -- not from any
 self-report the adapter makes about the resync succeeding.
