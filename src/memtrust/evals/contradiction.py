@@ -65,6 +65,25 @@ class ContradictionCase:
     query: str
     initial_value: str
     updated_value: str
+    metadata: dict[str, str] = field(default_factory=dict)
+    """Optional non-fact structured key/value pairs stored alongside
+    `initial_fact` (see `run_contradiction_eval` below, which threads this
+    into `adapter.store()`'s own `metadata` parameter). Empty for every
+    pre-existing case -- this is a purely additive field. Its purpose is
+    to exercise the harness's `MemoryRecord.attributes` boundary
+    end-to-end: a backend whose query() response echoes structured
+    per-record properties (e.g. self-hosted graphiti-core's
+    `EntityEdge.attributes`) has somewhere for this eval to observe them,
+    instead of every case only ever carrying plain fact text. See
+    tests/fixtures/contradiction_cases.json for the case that uses this,
+    and docs/methodology.md for the honesty caveat: graphiti-core's real
+    `add_episode()` has no generic metadata parameter to receive this
+    (confirmed against source, see
+    zep_graphiti_selfhosted_adapter.py's module docstring), so that
+    specific adapter accepts-and-ignores it, same as every no-op `mode`
+    parameter elsewhere in this codebase -- this field threading through
+    the harness is not itself proof any adapter surfaces it back out.
+    """
 
 
 @dataclass
@@ -115,6 +134,10 @@ class ContradictionEvalResult:
     def empty_or_lost_rate(self) -> float | None:
         return self._fraction(ConflictSignal.EMPTY_OR_LOST)
 
+    @property
+    def edge_integrity_violation_rate(self) -> float | None:
+        return self._fraction(ConflictSignal.EDGE_INTEGRITY_VIOLATION)
+
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[ContradictionCase]:
     data = json.loads(Path(path).read_text())
@@ -129,6 +152,7 @@ def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[ContradictionC
             query=c["query"],
             initial_value=c["initial_value"],
             updated_value=c["updated_value"],
+            metadata=c.get("metadata", {}),
         )
         for c in cases
     ]
@@ -189,11 +213,27 @@ def classify_case(
         unconditionally regardless of metadata (dead code -- see git
         history); it now genuinely differentiates on concrete, per-record
         adapter metadata.
+      * Structural check, evaluated before all of the above: if ANY
+        retrieved record is edge-shaped (its `raw` fragment carries both
+        a `source_node_uuid` and a `target_node_uuid` key -- the property
+        names graphiti_core's `EntityEdge` writes) but at least one of
+        those two values is missing/falsy, the case is classified
+        EDGE_INTEGRITY_VIOLATION regardless of what the value-level text
+        match would otherwise say. A structurally broken edge (no
+        endpoints) is a more fundamental failure than "which value did
+        the text contain" -- see ConflictSignal.EDGE_INTEGRITY_VIOLATION
+        for the two real graphiti-core bugs (getzep/graphiti#1013,
+        #1001) this exists to catch if reproduced against an affected
+        version. Records from backends that don't model edges at all
+        (no such keys present in `raw`) never trigger this.
     """
     content = " ".join(r.content for r in query_result.records).lower()
     has_initial = case.initial_value.lower() in content
     has_updated = case.updated_value.lower() in content
     has_invalidation_metadata = any(r.metadata.get("invalid_at") for r in query_result.records)
+
+    if any(_edge_endpoints_missing(r) for r in query_result.records):
+        return ConflictSignal.EDGE_INTEGRITY_VIOLATION, has_initial, has_updated
 
     if has_initial and has_updated:
         return ConflictSignal.FLAGGED, has_initial, has_updated
@@ -222,6 +262,25 @@ def classify_case(
     return ConflictSignal.NOT_APPLICABLE, has_initial, has_updated
 
 
+def _edge_endpoints_missing(record: object) -> bool:
+    """True if `record.raw` is edge-shaped (carries both a
+    `source_node_uuid` and a `target_node_uuid` key -- the property names
+    graphiti_core's `EntityEdge` writes on every relationship, see
+    `zep_graphiti_selfhosted_adapter.py`) but at least one of those two
+    values is missing or falsy. Records whose `raw` fragment has neither
+    key at all (i.e. this backend doesn't model edges, or this record
+    isn't edge-shaped) never trigger this -- it is a structural check on
+    edge-shaped records only, not a generic "does this record have an id"
+    heuristic.
+    """
+    raw = getattr(record, "raw", None)
+    if not isinstance(raw, dict):
+        return False
+    if "source_node_uuid" not in raw and "target_node_uuid" not in raw:
+        return False
+    return not raw.get("source_node_uuid") or not raw.get("target_node_uuid")
+
+
 def run_contradiction_eval(
     adapter: MemoryBackendAdapter,
     dataset_path: Path | str = DEFAULT_FIXTURE_PATH,
@@ -246,7 +305,14 @@ def run_contradiction_eval(
 
     for case in cases:
         try:
-            store_result = adapter.store(case.session_id, case.initial_fact)
+            # `metadata` carries the case's optional non-fact structured
+            # properties (see ContradictionCase.metadata) through to the
+            # adapter's own store() -- empty dict for every pre-existing
+            # case, so `metadata or None` preserves every adapter's
+            # existing no-metadata call shape exactly.
+            store_result = adapter.store(
+                case.session_id, case.initial_fact, metadata=case.metadata or None
+            )
             adapter.update(case.session_id, store_result.memory_id, case.contradicting_fact)
             query_result = adapter.query(case.session_id, case.query, top_k=5)
         except BackendAPIError as exc:

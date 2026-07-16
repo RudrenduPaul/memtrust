@@ -51,6 +51,33 @@
       "query": "Who leads the payments team?",
       "initial_value": "Priya",
       "updated_value": "Sam"
+    },
+    {
+      "_note": "Added for the self-hosted graphiti-core adapter build (see zep_graphiti_selfhosted_adapter.py). The query string's order code deliberately contains every uppercase letter (O, R, N, T, A, D) that getzep/graphiti#1302's lucene_sanitize() backslash-escapes character-by-character instead of only escaping the AND/OR/NOT boolean operators it targets -- 'ORTAND-88' alone hits all six. This case cannot demonstrate the bug against any adapter in this repo today (it lives entirely inside self-hosted graphiti-core's internal search pipeline, unreachable from any adapter's own code -- see that module's docstring); it exists so a contributor running ZepGraphitiSelfHostedAdapter against a live self-hosted instance has a ready-made query to compare BM25 ranking on, with and without the trigger letters.",
+      "case_id": "mt-contra-006",
+      "session_id": "contra-session-6",
+      "subject": "order tracking status",
+      "initial_fact": "Order ORTAND-88 is currently pending.",
+      "contradicting_fact": "Update: order ORTAND-88 has shipped.",
+      "query": "What is the status of order ORTAND-88?",
+      "initial_value": "pending",
+      "updated_value": "shipped"
+    },
+    {
+      "_note": "Added for the self-hosted graphiti-core adapter build. Carries non-fact structured metadata (ticket_id/team/category) so the harness exercises MemoryRecord.attributes end-to-end (see ContradictionCase.metadata and run_contradiction_eval in evals/contradiction.py). ZepGraphitiSelfHostedAdapter.store() accepts and ignores this metadata today (graphiti-core's real add_episode() has no generic metadata parameter to receive it -- see that adapter's module docstring); this case documents that limitation rather than implying a live self-hosted run would echo it back.",
+      "case_id": "mt-contra-007",
+      "session_id": "contra-session-7",
+      "subject": "escalation priority",
+      "initial_fact": "The database migration ticket is priority P2.",
+      "contradicting_fact": "The database migration ticket was escalated to priority P0.",
+      "query": "What priority is the database migration ticket?",
+      "initial_value": "P2",
+      "updated_value": "P0",
+      "metadata": {
+        "ticket_id": "OPS-4471",
+        "team": "platform-infra",
+        "category": "structured-non-fact"
+      }
     }
   ]
 }
