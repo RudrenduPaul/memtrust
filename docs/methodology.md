@@ -308,8 +308,7 @@ rather than silently reporting $0.00.
 ## Vendor-pushback self-check
 
 Before publishing any run's numbers, the honest question is asked and answered here, not skipped:
-*if MemPalace's, Mem0's, or Zep's own team read this
-methodology, could they point to a specific,
+*if MemPalace's, Mem0's, or Zep's own team read this methodology, could they point to a specific,
 defensible flaw?*
 
 As of this writing, the most defensible objection would be: two of the five adapters
