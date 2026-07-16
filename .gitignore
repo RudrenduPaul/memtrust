@@ -23,3 +23,4 @@ results/*/
 node_modules/
 .idea/
 .vscode/
+.claude/

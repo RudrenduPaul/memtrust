@@ -1,0 +1,3 @@
+# CI/CD workflows are the highest-leverage place for a supply-chain compromise to
+# hide, so changes here always require review.
+/.github/workflows/ @RudrenduPaul
