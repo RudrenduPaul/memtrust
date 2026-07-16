@@ -31,7 +31,7 @@ from memtrust.adapters import ADAPTER_REGISTRY
 from memtrust.adapters.base import BackendNotConfiguredError, MemoryBackendAdapter
 from memtrust.evals.compression import CompressionEvalResult, run_compression_eval
 from memtrust.evals.contradiction import ContradictionEvalResult, run_contradiction_eval
-from memtrust.evals.locomo import LoCoMoResult, run_locomo
+from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
 from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_resource_sync_eval
 from memtrust.scoring.cost_tracker import CostTracker
@@ -98,10 +98,12 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
             "backend": result.backend_name,
             "dataset_path": result.dataset_path,
             "accuracy": result.accuracy,
+            "non_adversarial_accuracy": result.non_adversarial_accuracy,
             "accuracy_by_category": result.accuracy_by_category(),
             "n_cases": len(result.case_results),
             "n_graded": len(result.graded_cases),
             "n_records_empty": result.n_records_empty,
+            "n_excluded_ground_truth": result.n_excluded_ground_truth,
             "cases": [asdict(c) for c in result.case_results],
         }
     if isinstance(result, ContradictionEvalResult):
@@ -195,7 +197,25 @@ def main() -> None:
     type=click.Path(dir_okay=False, path_type=Path),
     help="Path to write the JSON report. Defaults to ./memtrust-report-<date>.json",
 )
-def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
+@click.option(
+    "--locomo-exclude-question-ids-file",
+    "locomo_exclude_ids_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        "Path to a file of known-bad-ground-truth LoCoMo question IDs to exclude from "
+        "scoring (JSON array, or one ID per line). See evals/locomo.py's "
+        "load_exclude_question_ids() and docs/methodology.md for the ID shape and how "
+        "a corrected list (e.g. derived from a published ground-truth audit) plugs in. "
+        "No such list ships with memtrust by default."
+    ),
+)
+def run(
+    backends: str,
+    eval_arg: str,
+    output_path: Path | None,
+    locomo_exclude_ids_path: Path | None,
+) -> None:
     """Run the eval suite against the requested backends.
 
     Backends without a configured credential env var print SKIPPED and
@@ -204,6 +224,11 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
     """
     backend_names = _resolve_backend_names(backends)
     eval_names = _resolve_eval_names(eval_arg)
+    locomo_exclude_ids = (
+        load_exclude_question_ids(locomo_exclude_ids_path)
+        if locomo_exclude_ids_path is not None
+        else None
+    )
     cost_tracker = CostTracker()
     judge = LLMJudge(cost_tracker=cost_tracker)
 
@@ -254,18 +279,31 @@ def run(backends: str, eval_arg: str, output_path: Path | None) -> None:
 
         if "locomo" in eval_names:
             console.print(f"  Running LoCoMo against {backend_name}...")
-            locomo_result = run_locomo(adapter, judge)
+            locomo_result = run_locomo(adapter, judge, exclude_question_ids=locomo_exclude_ids)
             backend_report["evals"]["locomo"] = _serialize_eval_result(locomo_result)
             acc = locomo_result.accuracy
+            non_adv_acc = locomo_result.non_adversarial_accuracy
             if acc is not None:
-                console.print(f"    accuracy: {acc:.1%}")
+                console.print(f"    accuracy (all categories, incl. adversarial): {acc:.1%}")
             else:
                 console.print("    accuracy: N/A (judge not configured)")
+            if non_adv_acc is not None:
+                console.print(
+                    f"    non_adversarial_accuracy (excludes category 5): {non_adv_acc:.1%}"
+                )
+            else:
+                console.print("    non_adversarial_accuracy: N/A (judge not configured)")
             if locomo_result.n_records_empty:
                 console.print(
                     f"    [yellow]records_empty: {locomo_result.n_records_empty}/"
                     f"{len(locomo_result.case_results)}[/yellow] "
                     "(backend call succeeded but returned nothing)"
+                )
+            if locomo_result.n_excluded_ground_truth:
+                console.print(
+                    f"    excluded_ground_truth: {locomo_result.n_excluded_ground_truth}/"
+                    f"{len(locomo_result.case_results)} "
+                    "(known-bad ground truth, excluded via --locomo-exclude-question-ids-file)"
                 )
 
         if "contradiction" in eval_names:
@@ -349,7 +387,7 @@ def report(report_path: Path) -> None:
     table.add_column("Backend")
     table.add_column("Status")
     table.add_column("LongMemEval")
-    table.add_column("LoCoMo")
+    table.add_column("LoCoMo (all cats / non-adversarial)")
     table.add_column("Contradiction (flagged/overwrite/stale/empty-or-lost)")
     table.add_column("Resource-Sync (user-file deletion rate)")
     table.add_column("Compression fidelity by mode")
@@ -391,11 +429,14 @@ def report(report_path: Path) -> None:
             if compression
             else "-"
         )
+        locomo_acc_str = _fmt_pct(locomo.get("accuracy"))
+        locomo_non_adv_str = _fmt_pct(locomo.get("non_adversarial_accuracy"))
+        locomo_str = f"{locomo_acc_str} / {locomo_non_adv_str}" if locomo else "-"
         table.add_row(
             backend_name,
             "configured",
             _fmt_pct(lme.get("accuracy")) if lme else "-",
-            _fmt_pct(locomo.get("accuracy")) if locomo else "-",
+            locomo_str,
             contra_str,
             rss_str,
             compression_str or "-",
