@@ -77,7 +77,7 @@ class ConflictSignal(StrEnum):
     """The backend has no update/contradiction-relevant primitive to
     evaluate here (see MemoryBackendAdapter.supports_update). Recorded
     explicitly rather than silently dropping the backend from the eval
-    table -- see [redacted] [redacted]."""
+    table."""
 
     EMPTY_OR_LOST = "empty_or_lost"
     """The backend DOES have an update/contradiction-relevant primitive
