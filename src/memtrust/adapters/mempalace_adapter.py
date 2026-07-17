@@ -55,6 +55,29 @@ table). If the real package's `remember()`/`recall()` do not accept a
 `BackendAPIError` (via the existing generic `except Exception` wrapping
 below), not silently -- it never falls back to pretending the mode was
 honored.
+
+Migration-rollback simulation (NOT implemented here, deliberately):
+MemPalace ships its own `migrate.migrate()` function, which is documented
+to perform an on-disk swap at the end of a storage migration. Community
+report mempalace/mempalace#1028 (GitHub user eldar702) describes an
+earlier, unguarded `shutil.rmtree()`-then-`shutil.move()` version of that
+swap: the old backup was deleted FIRST, so a `move()` failure partway
+through (e.g. a cross-device `EXDEV` error) could permanently lose the
+palace directory. mempalace/mempalace#935 is the real upstream fix -- a
+safer "rename-aside" swap. This adapter, like every other adapter in this
+repo, has zero direct filesystem control over a live `mempalace` package's
+internal `migrate.migrate()` call -- it only wraps `remember()`/
+`recall()`/`invalidate()` through `_get_palace()` below (see the module
+confidence note above). So `MemPalaceAdapter` does not set
+`supports_migration_rollback_simulation = True` and does not override
+`simulate_migration_failure()` -- the same "no real process/filesystem-
+lifecycle control" reasoning that already applies to
+`supports_crash_recovery_simulation` (see adapters/base.py). See
+evals/migration_rollback.py and
+tests/test_evals.py::MigrationRollbackFakeAdapter for the harness-side
+simulation this gap is closed with instead, and docs/methodology.md for
+the honesty caveat that applies here the same way it applies to the rest
+of this adapter.
 """
 
 from __future__ import annotations

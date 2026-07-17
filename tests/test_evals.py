@@ -23,6 +23,7 @@ from memtrust.adapters.base import (
     ExtractionQualitySignal,
     MemoryBackendAdapter,
     MemoryRecord,
+    MigrationFailureResult,
     QueryResult,
     RankingSignal,
     RetrievalWarning,
@@ -67,6 +68,15 @@ from memtrust.evals.locomo import load_exclude_question_ids as load_locomo_exclu
 from memtrust.evals.locomo import run_locomo
 from memtrust.evals.longmemeval import load_dataset as load_longmemeval_dataset
 from memtrust.evals.longmemeval import run_longmemeval
+from memtrust.evals.migration_rollback import (
+    MigrationRollbackCase,
+    MigrationRollbackSignal,
+    classify_migration_rollback_case,
+    run_migration_rollback_eval,
+)
+from memtrust.evals.migration_rollback import (
+    load_dataset as load_migration_rollback_dataset,
+)
 from memtrust.evals.ranking_quality import (
     RankingQualityCase,
     RankingQualitySeedRecord,
@@ -369,6 +379,109 @@ class CrashRecoveryFailingFakeAdapter(CrashRecoveryFakeAdapter):
     distinct from the unsupported-adapter skip path."""
 
     name = "fake-crash-recovery-failing"
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        raise BackendAPIError(self.name, "simulated network failure")
+
+
+class MigrationRollbackFakeAdapter(MemoryBackendAdapter):
+    """Models the exact MemPalace/mempalace#1028 shape (GitHub user
+    eldar702): an unguarded `shutil.rmtree()`-then-`shutil.move()` swap at
+    the end of a migration deletes the old backup FIRST, then attempts to
+    move new data into place -- if that move step fails partway (e.g. a
+    simulated cross-device EXDEV error, represented here simply as "the
+    move never completes"), the old backup is already gone and there is
+    nothing left to recover.
+
+    `simulate_migration_failure()` reproduces this precisely: it deletes
+    `_store[session_id]` (the "old backup") BEFORE the simulated move
+    would land any new data, and never restores it -- the bug itself."""
+
+    name = "fake-migration-rollback-unguarded-swap"
+    env_var = "FAKE_API_KEY"
+    supports_migration_rollback_simulation = True
+
+    def __init__(self) -> None:
+        self._store: dict[str, dict[str, str]] = {}
+        self._counter = 0
+
+    def _contains(self, session_id: str, content: str) -> bool:
+        return any(content.lower() in c.lower() for c in self._store.get(session_id, {}).values())
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        self._counter += 1
+        memory_id = f"m{self._counter}"
+        self._store.setdefault(session_id, {})[memory_id] = content
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        matches = [
+            MemoryRecord(memory_id=mid, content=c)
+            for mid, c in self._store.get(session_id, {}).items()
+            if query.lower() in c.lower()
+        ][:top_k]
+        return QueryResult(
+            records=matches, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+    def simulate_migration_failure(self, session_id: str, content: str) -> MigrationFailureResult:
+        store_result = self.store(session_id, content)
+        # The bug: rmtree() deletes the old backup FIRST, before move()
+        # has landed anything new. Simulate move() failing partway (e.g.
+        # EXDEV) by simply never restoring what rmtree() just deleted.
+        del self._store[session_id]
+        recoverable = self._contains(session_id, content)
+        return MigrationFailureResult(
+            session_id=session_id,
+            memory_id=store_result.memory_id,
+            content=content,
+            original_data_recoverable=recoverable,
+        )
+
+
+class MigrationRollbackRenameAsideFakeAdapter(MigrationRollbackFakeAdapter):
+    """Models MemPalace/mempalace#935's real fix: a "rename-aside" swap
+    that renames the new data into place first, keeps the old backup
+    renamed-aside (never deleted up front), and only deletes the backup
+    after independently confirming the swap succeeded. The negative
+    control this eval must NOT flag as DATA_LOST."""
+
+    name = "fake-migration-rollback-rename-aside"
+
+    def simulate_migration_failure(self, session_id: str, content: str) -> MigrationFailureResult:
+        store_result = self.store(session_id, content)
+        # The fix: keep a renamed-aside copy of the old backup instead of
+        # deleting it up front. The simulated move step fails here (same
+        # EXDEV interruption as the buggy adapter above) BEFORE the
+        # commit step that would delete the backup ever runs, so the
+        # renamed-aside copy is restored back into place.
+        backup = dict(self._store.get(session_id, {}))
+        self._store[session_id] = backup
+        recoverable = self._contains(session_id, content)
+        return MigrationFailureResult(
+            session_id=session_id,
+            memory_id=store_result.memory_id,
+            content=content,
+            original_data_recoverable=recoverable,
+        )
+
+
+class MigrationRollbackFailingFakeAdapter(MigrationRollbackFakeAdapter):
+    """A migration-rollback-capable adapter whose store() call itself
+    fails -- exercises run_migration_rollback_eval()'s BackendAPIError
+    handling path, distinct from the unsupported-adapter skip path."""
+
+    name = "fake-migration-rollback-failing"
 
     def store(
         self, session_id: str, content: str, metadata: dict[str, str] | None = None
@@ -2116,6 +2229,103 @@ def test_crash_recovery_registered_in_eval_list() -> None:
     from memtrust.cli import ALL_EVALS
 
     assert "crash_recovery" in ALL_EVALS
+
+
+def test_migration_rollback_dataset_loads() -> None:
+    cases = load_migration_rollback_dataset()
+    assert len(cases) == 3
+    assert all(isinstance(c, MigrationRollbackCase) for c in cases)
+
+
+def test_migration_rollback_skips_cleanly_for_unsupported_adapter() -> None:
+    adapter = RecallAllFakeAdapter()
+    result = run_migration_rollback_eval(adapter)
+    assert result.skipped is True
+    assert result.skip_reason is not None
+    assert result.case_results == []
+
+
+def test_migration_rollback_detects_data_lost_matching_issue_1028() -> None:
+    """The exact MemPalace/mempalace#1028 bug shape: the unguarded
+    rmtree()-then-move() swap deletes the old backup before the move
+    completes, so an independent post-failure query() finds nothing.
+    Must fire on every case."""
+    adapter = MigrationRollbackFakeAdapter()
+    result = run_migration_rollback_eval(adapter)
+    assert len(result.case_results) == 3
+    assert all(c.error is None for c in result.case_results)
+    assert all(c.original_data_recoverable is False for c in result.case_results)
+    assert all(c.signal == MigrationRollbackSignal.DATA_LOST for c in result.case_results)
+    assert result.data_lost_rate == 1.0
+    assert result.restored_rate == 0.0
+
+
+def test_migration_rollback_does_not_false_positive_on_rename_aside_fix() -> None:
+    """Negative control this eval must get right: a backend that
+    implements MemPalace/mempalace#935's rename-aside swap must NOT be
+    flagged as DATA_LOST -- the original data must be classified
+    RESTORED."""
+    adapter = MigrationRollbackRenameAsideFakeAdapter()
+    result = run_migration_rollback_eval(adapter)
+    assert len(result.case_results) == 3
+    assert all(c.original_data_recoverable is True for c in result.case_results)
+    assert all(c.signal == MigrationRollbackSignal.RESTORED for c in result.case_results)
+    assert result.restored_rate == 1.0
+    assert result.data_lost_rate == 0.0
+
+
+def test_migration_rollback_classification_uses_independent_query_not_adapter_self_report() -> None:
+    """The classification's ground truth must be this eval's own
+    independent post-failure query() observation, not the adapter's
+    self-reported MigrationFailureResult.original_data_recoverable flag
+    threaded through only for diagnostics -- see this module's docstring.
+    For both fake adapters here, the two should agree; this asserts the
+    field the eval actually reports is set and consistent."""
+    lost_adapter = MigrationRollbackFakeAdapter()
+    lost_result = run_migration_rollback_eval(lost_adapter)
+    assert all(
+        c.adapter_reported_recoverable == c.original_data_recoverable
+        for c in lost_result.case_results
+    )
+
+    restored_adapter = MigrationRollbackRenameAsideFakeAdapter()
+    restored_result = run_migration_rollback_eval(restored_adapter)
+    assert all(
+        c.adapter_reported_recoverable == c.original_data_recoverable
+        for c in restored_result.case_results
+    )
+
+
+def test_migration_rollback_handles_backend_failure() -> None:
+    adapter = MigrationRollbackFailingFakeAdapter()
+    result = run_migration_rollback_eval(adapter)
+    assert len(result.case_results) == 3
+    assert all(c.error is not None for c in result.case_results)
+    assert all(c.signal == MigrationRollbackSignal.NOT_APPLICABLE for c in result.case_results)
+    assert all(c.original_data_recoverable is None for c in result.case_results)
+    assert all(c.adapter_reported_recoverable is None for c in result.case_results)
+
+
+def test_migration_rollback_eval_result_rates_ignore_errored_cases() -> None:
+    adapter = MigrationRollbackFakeAdapter()
+    result = run_migration_rollback_eval(adapter)
+    assert result.data_lost_rate is not None
+    assert 0.0 <= result.data_lost_rate <= 1.0
+    assert len(result.scored_cases) == len(result.case_results)
+
+
+def test_classify_migration_rollback_case_restored() -> None:
+    assert classify_migration_rollback_case(True) == MigrationRollbackSignal.RESTORED
+
+
+def test_classify_migration_rollback_case_data_lost() -> None:
+    assert classify_migration_rollback_case(False) == MigrationRollbackSignal.DATA_LOST
+
+
+def test_migration_rollback_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "migration_rollback" in ALL_EVALS
 
 
 # ---------------------------------------------------------------------------

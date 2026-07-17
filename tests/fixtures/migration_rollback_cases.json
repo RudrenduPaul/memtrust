@@ -1,0 +1,21 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case is a single piece of content the eval treats as ORIGINAL pre-migration data: it is handed to adapter.simulate_migration_failure(session_id, content) (a named simulation primitive, never a real filesystem migration -- see MemoryBackendAdapter.supports_migration_rollback_simulation and evals/migration_rollback.py), which stores it, simulates a storage migration whose final rename-aside swap step is interrupted before the commit step completes, and the eval then independently re-queries for the content to see whether it survived. Modeled on MemPalace/mempalace#1028 (GitHub user eldar702): MemPalace's own migrate.migrate() function had an unguarded shutil.rmtree()-then-shutil.move() swap that could permanently lose the palace directory if the move step failed partway (e.g. a cross-device EXDEV error), since the old backup was already deleted first. MemPalace/mempalace#935 is the real upstream fix -- a safer rename-aside swap -- this eval verifies the CONCEPT of, not a specific merged diff. No live MemPalace instance was run against this fixture as of its creation; see docs/methodology.md for the honest scope of what this eval closes.",
+  "cases": [
+    {
+      "case_id": "mt-migration-001",
+      "session_id": "migration-rollback-session-1",
+      "content": "The onboarding checklist requires a signed NDA before repo access is granted."
+    },
+    {
+      "case_id": "mt-migration-002",
+      "session_id": "migration-rollback-session-2",
+      "content": "Maria's timezone is UTC+2 and she is usually online after 9am local time."
+    },
+    {
+      "case_id": "mt-migration-003",
+      "session_id": "migration-rollback-session-3",
+      "content": "The staging environment's database snapshot is taken nightly at 2am UTC."
+    }
+  ]
+}
