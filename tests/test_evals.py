@@ -1746,6 +1746,108 @@ def test_locomo_dataset_loads() -> None:
     assert len(conversations[0]["qa"]) == 4
 
 
+def test_locomo_dataset_loads_from_custom_path(tmp_path: Path) -> None:
+    """A real, downloaded locomo10.json (or any file matching its schema)
+    loads via an explicit path, not just the bundled default fixture."""
+    custom = tmp_path / "locomo10.json"
+    custom.write_text(
+        json.dumps(
+            {
+                "conversations": [
+                    {
+                        "conversation_id": "real-001",
+                        "speaker_a": "A",
+                        "speaker_b": "B",
+                        "session_1_date_time": "2026-01-01 00:00",
+                        "session_1": [{"speaker": "A", "text": "hello", "dia_id": "D1:1"}],
+                        "qa": [
+                            {
+                                "question": "Who said hello?",
+                                "answer": "A",
+                                "category": "single-hop",
+                                "evidence": ["D1:1"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    conversations = load_locomo_dataset(custom)
+    assert len(conversations) == 1
+    assert conversations[0]["conversation_id"] == "real-001"
+
+
+def test_locomo_dataset_missing_file_raises_actionable_error(tmp_path: Path) -> None:
+    missing = tmp_path / "does_not_exist.json"
+    with pytest.raises(ValueError, match="not found"):
+        load_locomo_dataset(missing)
+
+
+def test_locomo_dataset_invalid_json_raises_actionable_error(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not valid json")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        load_locomo_dataset(bad)
+
+
+def test_locomo_dataset_missing_conversations_key_raises_actionable_error(
+    tmp_path: Path,
+) -> None:
+    bad = tmp_path / "wrong_shape.json"
+    bad.write_text(json.dumps({"examples": []}))
+    with pytest.raises(ValueError, match="conversations"):
+        load_locomo_dataset(bad)
+
+
+def test_locomo_dataset_conversations_not_a_list_raises_actionable_error(
+    tmp_path: Path,
+) -> None:
+    bad = tmp_path / "wrong_type.json"
+    bad.write_text(json.dumps({"conversations": {"not": "a list"}}))
+    with pytest.raises(ValueError, match="must be a list"):
+        load_locomo_dataset(bad)
+
+
+def test_run_locomo_accepts_custom_dataset_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_locomo(..., dataset_path=...) -- the mechanism `memtrust run
+    --locomo-dataset-path` drives -- runs against a real, non-default
+    file end to end and records it on the result."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    custom = tmp_path / "locomo10.json"
+    custom.write_text(
+        json.dumps(
+            {
+                "conversations": [
+                    {
+                        "conversation_id": "real-002",
+                        "speaker_a": "A",
+                        "speaker_b": "B",
+                        "session_1_date_time": "2026-01-01 00:00",
+                        "session_1": [{"speaker": "A", "text": "hello", "dia_id": "D1:1"}],
+                        "qa": [
+                            {
+                                "question": "Who said hello?",
+                                "answer": "A",
+                                "category": "single-hop",
+                                "evidence": ["D1:1"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_locomo(adapter, judge, dataset_path=custom)
+    assert result.dataset_path == str(custom)
+    assert len(result.case_results) == 1
+    assert result.case_results[0].conversation_id == "real-002"
+
+
 def test_locomo_runs_offline_and_reports_no_accuracy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
     adapter = RecallAllFakeAdapter()
