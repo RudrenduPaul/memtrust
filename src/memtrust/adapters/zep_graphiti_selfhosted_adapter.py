@@ -13,7 +13,7 @@ a silent branch inside this one."* That is exactly what this file is.
 
 ## Why this adapter exists
 
-Seven real, independently-verified graphiti-core bugs live entirely in the
+Ten real, independently-verified graphiti-core bugs live entirely in the
 self-hosted library layer that `ZepGraphitiAdapter` (hosted REST) cannot
 reach at all, because Zep Cloud's REST surface never exposes graphiti-core's
 internals to a caller:
@@ -111,17 +111,93 @@ internals to a caller:
     `sanitize()`'s map and filters empty tokens before pipe-joining in
     `build_fulltext_query()`.
 
-None of the above seven confirmations came from running graphiti-core
-against a live Neo4j or FalkorDB instance in this environment -- five came
+  * **getzep/graphiti#1467** (open as of this build, contributor
+    elimydlarz): `GeminiEmbedder.create_batch()`
+    (`graphiti_core/embedder/gemini.py`) special-cases `batch_size=1` only
+    for `"gemini-embedding-001"` -- confirmed by fetching that file from
+    `main` on 2026-07-16, the `elif batch_size is None:` branch falls
+    straight to `DEFAULT_BATCH_SIZE = 100` for every other model name,
+    including `"gemini-embedding-2-preview"`/`"gemini-embedding-2"`. Those
+    two models return exactly one embedding per `embed_content()` call
+    regardless of how many strings are in the batch, and `create_batch()`
+    never checks `len(result.embeddings) != len(batch)` before returning,
+    so it silently hands back a too-short list. graphiti-core's own dedup
+    pipeline (`_semantic_candidate_search()` in
+    `graphiti_core/utils/maintenance/node_operations.py`, reached from
+    `add_episode()` once 2+ entities are extracted) then zips the
+    extracted-node list against this too-short embeddings list with
+    `strict=True`, raising `ValueError: zip() argument 2 is shorter than
+    argument 1`. This adapter has no code path to select a Gemini embedder
+    at all before this build -- see "GeminiEmbedder support" below.
+  * **getzep/graphiti#1525** (closed, contributor maui314159, fixed
+    upstream via merged PR#1531): a NUL byte (`\\x00`) embedded in episode
+    content -- common in text extracted from PDFs/PPTX -- survives
+    FalkorDB's client-side query-parameter serialization
+    (`falkordb/helpers.py::quote_string`, which only escapes backslash and
+    double-quote) and makes FalkorDB's parser reject the entire bulk
+    episode-save query with `redis.exceptions.ResponseError: Failed to
+    parse query parameter '<name>' value`, silently dropping every episode
+    in that call. Confirmed via the issue's own filed reproduction and
+    PR#1531's diff (`gh issue view 1525`/`gh pr view 1531 --repo
+    getzep/graphiti`, fetched 2026-07-16); already fixed on `main`, so this
+    signal exists to classify the shape if reproduced against an
+    older/unpinned graphiti-core version, same role every other
+    already-fixed `CrashSignal` member here plays.
+
+  * **getzep/graphiti#1625** (open as of this build, contributor pcy06):
+    FalkorDB's Cypher query for `EpisodeNodeOperations.retrieve_episodes()`
+    intends to filter with `e.valid_at <= $reference_time`, but FalkorDB
+    can return rows for which that same expression evaluates `False` when
+    projected as a column -- a future-dated episode can leak into a
+    point-in-time query. Confirmed via the issue's own filed reproduction
+    (`gh issue view 1625 --repo getzep/graphiti`, fetched 2026-07-16),
+    which demonstrates a `valid_at=2024-03-01` episode returned for a
+    `reference_time=2024-02-01` query. This adapter's `query()` never
+    calls `retrieve_episodes()` at all -- it calls `Graphiti.search()`,
+    which returns edges, never episodes -- so this bug was previously
+    entirely unreachable through this adapter. See `retrieve_episodes()`
+    below and `evals/episode_temporal_leak.py`, the new eval this build
+    added specifically to detect (not fix -- the real bug lives inside
+    graphiti-core's FalkorDB driver's Cypher query construction) this
+    leak shape.
+
+## GeminiEmbedder support
+
+Set `GRAPHITI_EMBEDDER_PROVIDER=gemini` (or pass `embedder_provider="gemini"`
+to the constructor) plus `GRAPHITI_GEMINI_API_KEY` (or `gemini_api_key=`) to
+construct a real `graphiti_core.embedder.gemini.GeminiEmbedder` and pass it
+as `Graphiti(embedder=...)` -- confirmed against the real, current
+`Graphiti.__init__` signature on `main` (2026-07-16), which accepts an
+optional `embedder: EmbedderClient | None` and falls back to its own
+default `OpenAIEmbedder()` when `None`, exactly this adapter's prior,
+unconfigurable behavior. `GRAPHITI_GEMINI_EMBEDDING_MODEL` (or
+`gemini_embedding_model=`) optionally overrides the embedding model name
+(e.g. `"gemini-embedding-2-preview"`, the model getzep/graphiti#1467
+concerns); left unset, `GeminiEmbedderConfig`'s own default
+(`"text-embedding-001"`) applies. Leaving `GRAPHITI_EMBEDDER_PROVIDER`
+unset (the default) is fully backward compatible: `_build_embedder()`
+returns `None`, and `Graphiti(embedder=None)` behaves identically to never
+passing the keyword at all. This is what makes getzep/graphiti#1467's bug
+class reachable through this adapter at all -- see `CrashSignal
+.EMBEDDING_BATCH_COUNT_MISMATCH` in base.py and `_classify_crash()` below
+for the classification this build added alongside it. Requires the
+optional `graphiti-core[google-genai]` extra; a missing `google-genai`
+install raises `BackendAPIError` naming that extra, the same "fail loudly
+and specifically" convention `_get_client()`'s FalkorDB-extra check
+already establishes.
+
+None of the above nine confirmations came from running graphiti-core
+against a live Neo4j or FalkorDB instance in this environment -- seven came
 from fetching the real source files from `getzep/graphiti`'s `main` branch
 on GitHub (`raw.githubusercontent.com/getzep/graphiti/main/...`) during
-this build, 2026-07-16, and reading them directly; #1222 and #1183 came
-from reading each issue/PR's own filed reproduction and diff via `gh issue
-view`/`gh pr view` the same day. That is stronger evidence than
-documentation, but it is still a snapshot of an unpinned, moving branch (or,
-for #1222/#1183, a point-in-time reading of the issue tracker), and it is
-not a substitute for exercising this adapter against a real deployment. See
-"What this adapter does NOT prove" below.
+this build (five on 2026-07-16, two more -- #1467, #1525 -- also on
+2026-07-16), and reading them directly; #1222 and #1183 came from reading
+each issue/PR's own filed reproduction and diff via `gh issue view`/`gh pr
+view` the same day. That is stronger evidence than documentation, but it is
+still a snapshot of an unpinned, moving branch (or, for #1222/#1183/#1525,
+a point-in-time reading of the issue tracker), and it is not a substitute
+for exercising this adapter against a real deployment. See "What this
+adapter does NOT prove" below.
 
 ## Design: why a separate class/file, not a flag on ZepGraphitiAdapter
 
@@ -298,6 +374,19 @@ class _GraphitiProtocol(Protocol):
 
     async def close(self) -> None: ...
 
+    driver: Any
+    """The real `Graphiti` instance's own `.driver` attribute (a
+    `GraphDriver` -- `Neo4jDriver` or `FalkorDriver`), confirmed present on
+    every real `Graphiti` instance by reading `graphiti_core/graphiti.py`'s
+    `__init__` on 2026-07-16 (`self.driver = graph_driver or Neo4jDriver(...)`).
+    Only accessed by `retrieve_episodes()` below, via
+    `driver.episode_node_ops` -- a real, confirmed property on `GraphDriver`
+    (`graphiti_core/driver/driver.py`) exposing an `EpisodeNodeOperations`
+    instance. See `retrieve_episodes()` and
+    `evals/episode_temporal_leak.py` for why this needs the raw driver
+    rather than going through `Graphiti.search()` (which only ever returns
+    edges -- `EntityEdge` -- never episodes)."""
+
 
 def _to_plain_dict(obj: object) -> dict[str, object]:
     """Best-effort conversion of a graphiti_core Pydantic model (or a test
@@ -335,16 +424,20 @@ def _classify_crash(exc: Exception) -> CrashSignal:
     *shape*, it does not prove (or require) that the crash occurred at the
     exact upstream line this adapter's module docstring cites.
 
-    The third check (RediSearch `Syntax error`, getzep/graphiti#1222/
-    #1183) is message-only, with no `isinstance` gate: the real exception
-    FalkorDB's RediSearch fulltext-query path raises is typically a
-    `redis`-client `ResponseError`, and this adapter deliberately does not
-    import the optional `redis`/`falkordb` packages just to `isinstance`-
-    check against them (see `_get_client()` above -- graphiti-core's
-    FalkorDB extra is optional and may not be installed). Requiring both
-    "redisearch" and "syntax error" as substrings (not "syntax error"
-    alone) keeps this from ever matching an unrelated Python `SyntaxError`
-    or a different vendor's syntax-error message.
+    The third and fourth checks (RediSearch `Syntax error`, getzep/graphiti
+    #1222/#1183; "failed to parse query parameter", getzep/graphiti#1525)
+    are message-only, with no `isinstance` gate: the real exceptions both
+    FalkorDB's RediSearch fulltext-query path and its query-parameter
+    serialization raise are typically a `redis`-client `ResponseError`,
+    and this adapter deliberately does not import the optional
+    `redis`/`falkordb` packages just to `isinstance`-check against them
+    (see `_get_client()` above -- graphiti-core's FalkorDB extra is
+    optional and may not be installed). Requiring both "redisearch" and
+    "syntax error" as substrings (not "syntax error" alone) keeps the
+    third check from ever matching an unrelated Python `SyntaxError` or a
+    different vendor's syntax-error message; requiring both "failed to
+    parse query parameter" and "value" in the fourth keeps it from
+    matching an unrelated parse failure that merely mentions "value".
     """
     message = str(exc).lower()
     if isinstance(exc, ValueError) and "values to unpack" in message:
@@ -358,6 +451,14 @@ def _classify_crash(exc: Exception) -> CrashSignal:
         # getzep/graphiti#920: comparing a tz-naive stored timestamp
         # against a tz-aware datetime in edge-contradiction resolution.
         return CrashSignal.TYPE_COMPARISON_ERROR
+    if isinstance(exc, ValueError) and "zip()" in message and "shorter than" in message:
+        # getzep/graphiti#1467: GeminiEmbedder.create_batch() silently
+        # returns fewer vectors than inputs for the gemini-embedding-2*
+        # model family, later tripping a strict-zip ValueError several
+        # frames away in graphiti-core's own dedup pipeline. See
+        # CrashSignal.EMBEDDING_BATCH_COUNT_MISMATCH's docstring in
+        # base.py for the full citation trail.
+        return CrashSignal.EMBEDDING_BATCH_COUNT_MISMATCH
     if "redisearch" in message and "syntax error" in message:
         # getzep/graphiti#1222 (empty sanitized query -> "(@group_id:...)
         # ()") / #1183 (unescaped |, /, \ in episode text -> an empty
@@ -367,6 +468,17 @@ def _classify_crash(exc: Exception) -> CrashSignal:
         # .QUERY_SANITIZATION_ERROR's docstring in base.py for the full
         # citation trail.
         return CrashSignal.QUERY_SANITIZATION_ERROR
+    if "failed to parse query parameter" in message and "value" in message:
+        # getzep/graphiti#1525 (maui314159, fixed upstream via merged
+        # PR#1531): a NUL byte embedded in episode content (commonly from
+        # PDF/PPTX extraction) survives FalkorDB's client-side parameter
+        # serialization and makes FalkorDB's parser reject the entire
+        # bulk episode-save query with "Failed to parse query parameter
+        # '<name>' value" -- silently dropping every episode in that
+        # call, not just the offending one. See CrashSignal
+        # .QUERY_PARAMETER_PARSE_ERROR's docstring in base.py for the
+        # full citation trail.
+        return CrashSignal.QUERY_PARAMETER_PARSE_ERROR
     return CrashSignal.UNKNOWN
 
 
@@ -402,6 +514,9 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
         neo4j_password: str | None = None,
         falkordb_url: str | None = None,
         update_communities: bool | None = None,
+        embedder_provider: str | None = None,
+        gemini_api_key: str | None = None,
+        gemini_embedding_model: str | None = None,
         graphiti_client: _GraphitiProtocol | None = None,
     ) -> None:
         resolved_neo4j_uri = neo4j_uri or os.environ.get(self.env_var)
@@ -422,6 +537,57 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
         self._neo4j_user = neo4j_user or os.environ.get("GRAPHITI_NEO4J_USER", DEFAULT_NEO4J_USER)
         self._neo4j_password = neo4j_password or os.environ.get("GRAPHITI_NEO4J_PASSWORD")
         self._falkordb_url = resolved_falkordb_url
+        # Embedder selection -- see "GeminiEmbedder support" in this
+        # module's docstring for getzep/graphiti#1467's motivation.
+        # `None`/unset (the default) leaves graphiti-core's own default
+        # OpenAIEmbedder() untouched, same backward-compatible-default
+        # convention every other optional field on this adapter follows.
+        self._embedder_provider = embedder_provider or os.environ.get("GRAPHITI_EMBEDDER_PROVIDER")
+        self._gemini_api_key = gemini_api_key or os.environ.get("GRAPHITI_GEMINI_API_KEY")
+        self._gemini_embedding_model = gemini_embedding_model or os.environ.get(
+            "GRAPHITI_GEMINI_EMBEDDING_MODEL"
+        )
+        gemini_requested = self._embedder_provider == "gemini"
+        if gemini_requested and graphiti_client is None and not self._gemini_api_key:
+            raise BackendNotConfiguredError(self.name, "GRAPHITI_GEMINI_API_KEY")
+
+    def _build_embedder(self) -> Any:
+        """Construct the `EmbedderClient` to pass as `Graphiti(embedder=...)`,
+        or `None` to let graphiti-core fall back to its own default
+        `OpenAIEmbedder()` -- see `__init__`'s `embedder_provider` param and
+        this module's docstring, "GeminiEmbedder support" section.
+
+        Only `"gemini"` is wired up today -- the one provider
+        getzep/graphiti#1467 concerns. An unrecognized `embedder_provider`
+        value raises BackendAPIError naming exactly what this adapter
+        supports, rather than silently falling back to the OpenAI default
+        a caller who set it clearly did not intend.
+        """
+        if self._embedder_provider is None:
+            return None
+        if self._embedder_provider != "gemini":
+            raise BackendAPIError(
+                self.name,
+                f"unsupported embedder_provider {self._embedder_provider!r}; this adapter "
+                "only wires up 'gemini' today -- the provider getzep/graphiti#1467 concerns. "
+                "See module docstring.",
+            )
+        try:
+            from graphiti_core.embedder.gemini import (  # type: ignore[import-not-found]
+                GeminiEmbedder,
+                GeminiEmbedderConfig,
+            )
+        except ImportError as exc:
+            raise BackendAPIError(
+                self.name,
+                "graphiti-core is installed without Gemini embedder support. Install "
+                "`pip install graphiti-core[google-genai]`, or unset "
+                "GRAPHITI_EMBEDDER_PROVIDER to use graphiti-core's default OpenAIEmbedder.",
+            ) from exc
+        config_kwargs: dict[str, Any] = {"api_key": self._gemini_api_key}
+        if self._gemini_embedding_model:
+            config_kwargs["embedding_model"] = self._gemini_embedding_model
+        return GeminiEmbedder(GeminiEmbedderConfig(**config_kwargs))
 
     def _get_client(self) -> _GraphitiProtocol:
         if self._client is not None:
@@ -433,10 +599,13 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
                 self.name,
                 "the `graphiti-core` package is not installed. Install it "
                 "with `pip install graphiti-core` (add the `[falkordb]` "
-                "extra for FalkorDB support). See docs/methodology.md for "
-                "this adapter's confidence level and what was confirmed "
-                "against the real graphiti_core source vs. a live instance.",
+                "extra for FalkorDB support, or `[google-genai]` for Gemini "
+                "embedder support). See docs/methodology.md for this "
+                "adapter's confidence level and what was confirmed against "
+                "the real graphiti_core source vs. a live instance.",
             ) from exc
+
+        embedder = self._build_embedder()
 
         if self._falkordb_url:
             try:
@@ -453,10 +622,13 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
                 ) from exc
             host, port, username, password = _parse_falkordb_url(self._falkordb_url)
             driver = FalkorDriver(host=host, port=port, username=username, password=password)
-            self._client = Graphiti(graph_driver=driver)
+            self._client = Graphiti(graph_driver=driver, embedder=embedder)
         else:
             self._client = Graphiti(
-                uri=self._neo4j_uri, user=self._neo4j_user, password=self._neo4j_password
+                uri=self._neo4j_uri,
+                user=self._neo4j_user,
+                password=self._neo4j_password,
+                embedder=embedder,
             )
         return self._client
 
@@ -496,22 +668,26 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
                     update_communities=self._update_communities,
                 )
             )
-        except (ValueError, TypeError) as exc:
-            # Caught ahead of the generic Exception handler below so these
-            # two specific graphiti-core crash shapes -- getzep/graphiti
-            # #836 (ValueError from a tuple/list unpack count mismatch) and
-            # #920 (TypeError from a tz-naive/tz-aware datetime comparison)
-            # -- get classified via _classify_crash() instead of collapsing
-            # into the same opaque "some exception happened" error every
-            # other failure produces. Anything that doesn't match either
-            # known shape (including an unrelated ValueError/TypeError)
-            # still raises BackendAPIError, just with
-            # crash_signal=CrashSignal.UNKNOWN instead of None -- see
-            # CrashSignal.UNKNOWN's docstring for why that distinction
-            # matters.
-            raise BackendAPIError(self.name, str(exc), crash_signal=_classify_crash(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
-            raise BackendAPIError(self.name, str(exc), crash_signal=CrashSignal.UNKNOWN) from exc
+            # A single except-Exception handler, routed through
+            # _classify_crash() for every failure shape -- not just the two
+            # (ValueError, TypeError) shapes this adapter's own module
+            # docstring calls out by name (getzep/graphiti#836/#920).
+            # _classify_crash() itself still narrows #836/#920 by exact
+            # type+message before falling through to message-only checks
+            # (see that function's docstring), so this single handler loses
+            # no classification precision -- it's what lets a non-
+            # ValueError/TypeError crash shape (e.g. getzep/graphiti#1525's
+            # `redis.exceptions.ResponseError` "Failed to parse query
+            # parameter ... value", raised from this same add_episode()
+            # bulk-episode-save call) also get classified instead of
+            # silently collapsing to a hardcoded UNKNOWN default the way an
+            # earlier version of this method did. See CrashSignal.UNKNOWN's
+            # docstring for why "not classified" (None, never used here)
+            # and "classified as UNKNOWN" (this handler's honest fallback
+            # for anything _classify_crash() doesn't recognize) are
+            # different facts.
+            raise BackendAPIError(self.name, str(exc), crash_signal=_classify_crash(exc)) from exc
 
         result_dict = _to_plain_dict(result)
         episode = getattr(result, "episode", None) if not isinstance(result, dict) else None
@@ -632,6 +808,71 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
         return DeleteResult(success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms())
+
+    def retrieve_episodes(
+        self,
+        reference_time: datetime,
+        group_ids: list[str] | None = None,
+        last_n: int = 10,
+    ) -> list[dict[str, object]]:
+        """Call graphiti-core's real, driver-level
+        `EpisodeNodeOperations.retrieve_episodes()` directly, bypassing
+        `Graphiti.search()`/`query()` entirely -- `search()` only ever
+        returns edges (`EntityEdge`), never episodes (`EpisodicNode`), so
+        there is no way to reach point-in-time episode retrieval through
+        this adapter's normal `query()` path at all. This is the primitive
+        `evals/episode_temporal_leak.py` needs to reproduce
+        getzep/graphiti#1625 (contributor pcy06, open as of this build):
+        FalkorDB's Cypher query for `retrieve_episodes()` intends to filter
+        by `e.valid_at <= $reference_time`, but FalkorDB can return rows
+        for which that same expression evaluates `False` when projected --
+        confirmed via the issue's own filed reproduction (`gh issue view
+        1625 --repo getzep/graphiti`, fetched 2026-07-16), which shows a
+        future-dated episode (`valid_at=2024-03-01`) returned for a
+        `reference_time=2024-02-01` query. Real signature confirmed by
+        reading `graphiti_core/driver/operations/episode_node_ops.py` on
+        `main`, 2026-07-16:
+        `EpisodeNodeOperations.retrieve_episodes(self, executor,
+        reference_time, last_n=3, group_ids=None, source=None,
+        saga=None) -> list[EpisodicNode]` -- `executor` is the driver
+        itself (confirmed against the issue's own repro code, which calls
+        `driver.episode_node_ops.retrieve_episodes(driver,
+        reference_time, ...)`).
+
+        This is detection, not resolution -- the bug this classifies lives
+        entirely inside graphiti-core's FalkorDB driver's Cypher query
+        construction (pcy06 already proposed the real upstream fix: project
+        the temporal comparison first, then filter on that boolean), not in
+        this adapter's own code. memtrust's role is surfacing whether a
+        given self-hosted deployment's `retrieve_episodes()` call actually
+        exhibits the leak, not fixing graphiti-core itself.
+
+        Raises:
+            BackendAPIError: if this graphiti_core driver has no
+                `episode_node_ops` surface at all (e.g. an injected test
+                double that doesn't model one), or if the real call itself
+                fails -- classified via `_classify_crash()` the same as
+                every other vendor call this adapter wraps.
+        """
+        client = self._get_client()
+        driver = getattr(client, "driver", None)
+        episode_ops = getattr(driver, "episode_node_ops", None) if driver is not None else None
+        if episode_ops is None:
+            raise BackendAPIError(
+                self.name,
+                "this graphiti_core driver has no episode_node_ops surface -- "
+                "cannot call retrieve_episodes() directly. See "
+                "evals/episode_temporal_leak.py's module docstring.",
+            )
+        try:
+            episodes = asyncio.run(
+                episode_ops.retrieve_episodes(
+                    driver, reference_time, last_n=last_n, group_ids=group_ids
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
+            raise BackendAPIError(self.name, str(exc), crash_signal=_classify_crash(exc)) from exc
+        return [_to_plain_dict(ep) for ep in episodes]
 
     def close(self) -> None:
         if self._client is None:

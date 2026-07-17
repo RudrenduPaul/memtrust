@@ -1,0 +1,62 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Modeled on mem0ai/mem0#4884 (GitHub user wangjiawei-vegetable): mem0 v3's hybrid retrieval pipeline hardcodes spaCy's English model en_core_web_sm for both BM25 lemmatization and entity extraction, so non-Latin-script text can silently degrade to semantic-only retrieval with zero error surfaced. Each case pairs a short, real-language piece of content with a query in the same script, covering five non-Latin scripts the issue names directly (Chinese, Japanese, Arabic, Thai, Hindi). `script` tags which family a case belongs to. See evals/language_degradation.py for the scoring logic -- classification reads mem0.Memory.search(explain=True)'s real score_details breakdown, not a guess from content alone.",
+  "cases": [
+    {
+      "case_id": "mt-lang-001",
+      "session_id": "lang-session-zh-1",
+      "script": "chinese",
+      "content": "用户的部署窗口是每周二早上。",
+      "query": "用户的部署窗口是什么时候？"
+    },
+    {
+      "case_id": "mt-lang-002",
+      "session_id": "lang-session-zh-2",
+      "script": "chinese",
+      "content": "项目经理是张伟，负责支付团队。",
+      "query": "谁是支付团队的项目经理？"
+    },
+    {
+      "case_id": "mt-lang-003",
+      "session_id": "lang-session-ja-1",
+      "script": "japanese",
+      "content": "ユーザーの好きなデプロイ日は水曜日です。",
+      "query": "デプロイは何曜日に行いますか？"
+    },
+    {
+      "case_id": "mt-lang-004",
+      "session_id": "lang-session-ar-1",
+      "script": "arabic",
+      "content": "الموعد النهائي للمشروع هو الخامس عشر من أغسطس.",
+      "query": "متى الموعد النهائي للمشروع؟"
+    },
+    {
+      "case_id": "mt-lang-005",
+      "session_id": "lang-session-ar-2",
+      "script": "arabic",
+      "content": "اسم المهندس المسؤول عن قاعدة البيانات هو ليلى.",
+      "query": "من المسؤول عن قاعدة البيانات؟"
+    },
+    {
+      "case_id": "mt-lang-006",
+      "session_id": "lang-session-th-1",
+      "script": "thai",
+      "content": "วันส่งมอบงานคือวันศุกร์ของทุกสัปดาห์.",
+      "query": "วันส่งมอบงานคือวันอะไร?"
+    },
+    {
+      "case_id": "mt-lang-007",
+      "session_id": "lang-session-hi-1",
+      "script": "hindi",
+      "content": "उपयोगकर्ता का पसंदीदा समय क्षेत्र मंगलवार सुबह है।",
+      "query": "पसंदीदा समय क्षेत्र कौन सा है?"
+    },
+    {
+      "case_id": "mt-lang-008",
+      "session_id": "lang-session-hi-2",
+      "script": "hindi",
+      "content": "प्रोजेक्ट की अंतिम तिथि 15 सितंबर से 1 अक्तूबर कर दी गई।",
+      "query": "प्रोजेक्ट की नई अंतिम तिथि क्या है?"
+    }
+  ]
+}

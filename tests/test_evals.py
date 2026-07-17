@@ -37,6 +37,7 @@ from memtrust.adapters.base import (
 from memtrust.evals.contradiction import (
     ContradictionCase,
     classify_case,
+    run_add_only_contradiction_eval,
     run_contradiction_eval,
 )
 from memtrust.evals.contradiction import (
@@ -1276,6 +1277,100 @@ def test_run_contradiction_eval_threads_case_metadata_into_store() -> None:
     ]
     assert len(adapter.store_metadata_calls) == 14
     assert adapter.store_metadata_calls.count(None) == 13
+
+
+# ---------------------------------------------------------------------------
+# run_add_only_contradiction_eval() -- mem0 v3 ADD-only pipeline shape
+# (NDNM1408, mem0ai/mem0#4956): reuses classify_case()/ConflictSignal
+# unchanged, only the call sequence (store() twice, no update(), no
+# memory_id threaded) differs from run_contradiction_eval() above.
+# ---------------------------------------------------------------------------
+
+
+class AddOnlyStaleFakeAdapter(RecallAllFakeAdapter):
+    """Simulates the exact divergence NDNM1408's mem0ai/mem0#4956 report
+    describes: a real, targeted `update(memory_id, ...)` call genuinely
+    overwrites (drops the old value), but two independent, untargeted
+    `store()` calls for the same fact leave BOTH values sitting in the
+    backend, and this fake's `query()` always surfaces the OLDEST stored
+    value first -- reproducing "a query can surface the stale one" after
+    an add()-only conflict, regardless of top_k. A real vector store's
+    ranking wouldn't be this deterministic, but the point this fake proves
+    is structural: run_add_only_contradiction_eval()'s store()+store()
+    sequence can reach a failure shape run_contradiction_eval()'s
+    store()+update(memory_id) sequence cannot, because the latter always
+    routes through the id-targeted overwrite primitive instead of
+    exercising add()-time conflict behavior at all."""
+
+    name = "fake-add-only-stale"
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        contents = self._store.get(session_id, [])
+        oldest = contents[:1]
+        records = [MemoryRecord(memory_id="m0", content=c) for c in oldest]
+        return QueryResult(
+            records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        # A real, targeted update()-by-id primitive: genuinely replaces
+        # the stored value rather than appending alongside it -- distinct
+        # from store()'s plain-append behavior inherited from
+        # RecallAllFakeAdapter.
+        self._store[session_id] = [content]
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+
+def test_add_only_contradiction_eval_reuses_taxonomy_unchanged() -> None:
+    """A plain recall-everything adapter classifies identically under both
+    eval entry points -- proving run_add_only_contradiction_eval() reuses
+    classify_case()/ConflictSignal completely unchanged, per the backlog's
+    own scoping note that no taxonomy change was needed for this item."""
+    adapter = RecallAllFakeAdapter()
+    result = run_add_only_contradiction_eval(adapter)
+    assert result.flagged_rate == 1.0
+    assert result.silent_overwrite_rate == 0.0
+    assert result.served_stale_rate == 0.0
+
+
+def test_add_only_contradiction_eval_calls_store_twice_never_update() -> None:
+    adapter = RecallAllFakeAdapter()
+    run_add_only_contradiction_eval(adapter)
+    cases = load_contradiction_dataset()
+    # Exactly 2 store() calls per fixture case (initial_fact,
+    # contradicting_fact) -- update() is never invoked, unlike
+    # run_contradiction_eval()'s store()+update() sequence.
+    assert adapter.store_calls == len(cases) * 2
+
+
+def test_add_only_contradiction_eval_reproduces_ndnm1408_stale_shape() -> None:
+    """The exact mem0ai/mem0#4956 divergence: run_contradiction_eval()'s
+    id-targeted update() call resolves the conflict cleanly (no stale
+    value left to serve), while run_add_only_contradiction_eval()'s two
+    independent store() calls leave the old value reachable and the fake's
+    query() surfaces it -- SERVED_STALE, a failure shape the classic
+    eval's own call sequence structurally cannot reach against this same
+    fake adapter."""
+    classic_result = run_contradiction_eval(AddOnlyStaleFakeAdapter())
+    assert classic_result.served_stale_rate == 0.0
+
+    add_only_result = run_add_only_contradiction_eval(AddOnlyStaleFakeAdapter())
+    assert add_only_result.served_stale_rate == 1.0
+
+
+def test_add_only_contradiction_eval_no_update_adapter_not_applicable() -> None:
+    adapter = NoUpdateFakeAdapter()
+    result = run_add_only_contradiction_eval(adapter)
+    assert result.not_applicable_rate == 1.0
+    assert adapter.store_calls == 0
+
+
+def test_add_only_contradiction_eval_failing_adapter_records_error() -> None:
+    adapter = FailingFakeAdapter()
+    result = run_add_only_contradiction_eval(adapter)
+    assert len(result.case_results) == 7
+    assert all(c.error is not None for c in result.case_results)
+    assert result.scored_cases == []
 
 
 # ---------------------------------------------------------------------------

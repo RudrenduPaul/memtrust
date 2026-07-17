@@ -143,14 +143,70 @@ class CrashSignal(StrEnum):
     or prove this specific call hit a legacy-truncated record versus some
     other cause of a malformed response body."""
 
+    EMBEDDING_BATCH_COUNT_MISMATCH = "embedding_batch_count_mismatch"
+    """A `ValueError` raised from Python's `zip(..., strict=True)` count
+    mismatch (message contains both "zip()" and "shorter than"). Matches
+    the shape of getzep/graphiti#1467 (contributor elimydlarz, open as of
+    this build): `GeminiEmbedder.create_batch()` (`graphiti_core/embedder/
+    gemini.py`) only special-cases `batch_size=1` for the
+    `"gemini-embedding-001"` model -- confirmed by reading the real,
+    current `main`-branch source, 2026-07-16 -- so for
+    `"gemini-embedding-2-preview"`/`"gemini-embedding-2"`, a single
+    `embed_content(contents=batch)` call can silently return ONE embedding
+    for an N-item batch (these models do not batch the way `-001` does),
+    with no exception raised inside `create_batch()` itself. The caller
+    that ends up with a too-short embeddings list is graphiti-core's own
+    dedup pipeline -- `_semantic_candidate_search()`
+    (`graphiti_core/utils/maintenance/node_operations.py`) or
+    `create_entity_node_embeddings()` (`graphiti_core/nodes.py`), reached
+    from `add_episode()` once an episode extracts 2+ entities -- which
+    zips the extracted-node list against the returned embeddings list with
+    `strict=True`, raising `ValueError: zip() argument 2 is shorter than
+    argument 1` (or the reverse-argument-order phrasing, depending on
+    which list came up short) once the count mismatch is finally observed,
+    several call frames away from where the embedder actually returned
+    the wrong count. See
+    zep_graphiti_selfhosted_adapter.py's `_build_embedder()` (the Gemini
+    embedder wiring this signal's classification depends on being
+    reachable at all) and `_classify_crash()`."""
+
+    QUERY_PARAMETER_PARSE_ERROR = "query_parameter_parse_error"
+    """A FalkorDB `redis.exceptions.ResponseError` raised with a message
+    matching `"failed to parse query parameter '<name>' value"` (message
+    contains both "failed to parse query parameter" and "value"). Matches
+    the shape of getzep/graphiti#1525 (contributor maui314159, fixed
+    upstream via merged PR#1531): a NUL byte (`\\x00`) embedded in a string
+    value -- commonly present in text extracted from PDFs/PPTX -- makes
+    FalkorDB's client-side query-parameter serialization
+    (`falkordb/helpers.py::quote_string`, which only escapes backslash and
+    double-quote) emit the NUL byte verbatim into the `CYPHER <key>=<value>
+    ...` parameter header FalkorDB's own client builds. FalkorDB's parser
+    then rejects the ENTIRE query -- including a bulk episode save shaped
+    like `UNWIND $episodes AS e MERGE (n:Episodic {uuid:e.uuid})
+    SET n.content=e.content` -- with this exact message, silently dropping
+    every episode in that call, not just the one containing the NUL byte.
+    PR#1531's real fix strips `\\x00` recursively from FalkorDB query
+    parameters in `FalkorDriver.execute_query`/`FalkorDriverSession.run`
+    before they reach the client, closing the bug upstream as of that
+    merge -- this signal exists so the harness can still *classify* the
+    failure shape if it ever reproduces against an older/unpatched
+    graphiti-core version, the same "diagnostic classifier, not a live
+    reproduction" role every other `CrashSignal` member plays. The real
+    exception is a `redis`-client `ResponseError`; see
+    zep_graphiti_selfhosted_adapter.py's `_classify_crash()` for the exact
+    substring match (message-only, not `isinstance`, same reasoning
+    `QUERY_SANITIZATION_ERROR` above documents: this adapter does not
+    import the optional `redis`/`falkordb` packages just to `isinstance`-
+    check against them)."""
+
     UNKNOWN = "unknown"
     """The caught exception's type/message did not match any known crash
     shape this enum classifies. This is the honest, expected outcome for
     the overwhelming majority of failures -- network errors, auth
     failures, database unavailability, and any vendor bug other than the
-    two specific shapes above all land here. `UNKNOWN` is not a gap in
-    this classification; it is what "not one of the specific bug classes
-    we know how to recognize" looks like."""
+    specific shapes above all land here. `UNKNOWN` is not a gap in this
+    classification; it is what "not one of the specific bug classes we
+    know how to recognize" looks like."""
 
 
 class BackendAPIError(Exception):
@@ -751,6 +807,68 @@ class ConsistencySignal(StrEnum):
     convention as every other NOT_APPLICABLE member in this module."""
 
 
+class LanguageDegradationSignal(StrEnum):
+    """Whether a backend's hybrid retrieval pipeline's non-semantic
+    signals (BM25 keyword matching, entity-based boosting) genuinely fired
+    for a given query, or silently degraded to semantic-only retrieval
+    with no error surfaced -- a language-conditioned failure mode none of
+    `ExtractionQualitySignal`/`RankingSignal`/`EmbeddingDriftSignal` above
+    classify (all three concern content/order/drift, never whether a
+    *language-dependent* pipeline stage ran at all).
+
+    Motivating case: wangjiawei-vegetable (rank 147, mem0ai/mem0#4884,
+    open, merge-ready companion PR #4943 as of this build). mem0 v3's
+    hybrid retrieval pipeline hardcodes spaCy's English model
+    `en_core_web_sm` for BOTH BM25 lemmatization
+    (`mem0/utils/lemmatization.py::lemmatize_for_bm25`) and entity
+    extraction (`mem0/utils/spacy_models.py::get_nlp_full`) -- confirmed
+    by reading the installed `mem0ai==2.0.12` package's own
+    `mem0/utils/spacy_models.py` directly: `get_nlp_full()`/
+    `get_nlp_lemma()` both call `spacy.load("en_core_web_sm", ...)`
+    unconditionally, with no language parameter or per-language model
+    selection anywhere in the module. For non-Latin-script text (CJK,
+    Arabic, Thai, Hindi, etc.), the English pipeline's tokenization/
+    lemmatization does not produce keyword/entity signals that
+    meaningfully overlap between query time and store time, so mem0's own
+    `mem0/memory/main.py::_search_vector_store()` can end up with an
+    empty `bm25_scores` dict and/or an empty `entity_boosts` dict for a
+    query where either would fire for equivalent English text -- and
+    `mem0/utils/scoring.py::score_and_rank()`'s own `has_bm25 =
+    bool(bm25_scores)`/`has_entity = bool(entity_boosts)` gates mean the
+    combined score silently falls back to semantic-only weighting, with
+    no exception and no field in the normal (non-`explain`) response
+    indicating this happened.
+
+    This signal is derived from `Memory.search(explain=True)`'s real,
+    installed `score_details` per-result breakdown (`bm25_score`,
+    `entity_boost` -- confirmed by reading `mem0/utils/scoring.py::
+    score_and_rank()` directly), not guessed or inferred from content
+    alone -- see `mem0_direct_adapter.py`'s `query()` for exactly how.
+    """
+
+    HYBRID_SIGNALS_ACTIVE = "hybrid_signals_active"
+    """At least one returned record's `score_details` showed a nonzero
+    `bm25_score` or `entity_boost` -- the hybrid pipeline's keyword/
+    entity-matching signals genuinely contributed to at least one result,
+    not just semantic similarity."""
+
+    SEMANTIC_ONLY_DEGRADED = "semantic_only_degraded"
+    """`explain=True` was requested and every returned record's
+    `score_details` showed `bm25_score == 0.0` AND `entity_boost == 0.0`
+    -- the exact mem0ai/mem0#4884 shape: hybrid retrieval silently
+    degraded to semantic-only, with no error or warning anywhere in the
+    normal response. Only assigned when records were actually returned to
+    inspect -- see NOT_APPLICABLE below for the zero-records case, which
+    is a different failure mode (EMPTY_OR_LOST-shaped, not this one)."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """`explain` was not requested, no records were returned to inspect,
+    or this adapter has no `score_details`-equivalent surface to observe
+    at all. Recorded explicitly rather than silently defaulting to either
+    signal above, same convention every other signal enum's
+    NOT_APPLICABLE member in this package follows."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
@@ -870,6 +988,17 @@ class QueryResult:
     under-delivered," including when it still returned some records --
     see RetrievalWarning's docstring for exactly why that distinction
     matters."""
+    language_degradation_signal: LanguageDegradationSignal = (
+        LanguageDegradationSignal.NOT_APPLICABLE
+    )
+    """Whether this query's hybrid retrieval signals (BM25/entity-boost)
+    genuinely fired, or silently degraded to semantic-only -- see
+    LanguageDegradationSignal's docstring for the mem0ai/mem0#4884
+    provenance and evals/language_degradation.py. Defaults to
+    NOT_APPLICABLE, same backward-compatible-default convention every
+    other signal field on this dataclass follows -- only
+    `Mem0DirectAdapter.query(explain=True)` currently sets this to
+    something else."""
     raw: dict[str, object] = field(default_factory=dict)
 
 
