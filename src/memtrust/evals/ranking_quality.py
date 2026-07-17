@@ -67,6 +67,7 @@ from typing import Any
 from memtrust.adapters.base import (
     BackendAPIError,
     MemoryBackendAdapter,
+    MemoryRecord,
     QueryResult,
     RankingSignal,
 )
@@ -183,6 +184,35 @@ def _parse_float(value: str | None) -> float | None:
         return None
 
 
+def _field_value(case: RankingQualityCase, record: MemoryRecord) -> float | None:
+    """Read a case's declared `ranking_field` off one returned record.
+
+    `MemoryRecord.score` (adapters/base.py) is a dedicated, already-typed
+    dataclass field every mem0-backed adapter populates from its own
+    search response -- it is NOT part of `metadata` (a vendor-agnostic,
+    string-only dict this eval otherwise reads from). Before this change,
+    a fixture case declaring `ranking_field: "score"` would always read
+    `metadata.get("score")`, which is never populated by any adapter, so
+    every such case landed on MISSING_ORDERING_KEY unconditionally --
+    never actually testing real score-based ranking at all.
+
+    Motivating case: mem0ai/mem0#3144 (GitHub user Duguce, closed as
+    duplicate of #4453) -- mem0's local vector-store search `score` field
+    doesn't semantically make sense: most vector stores return raw
+    distance as "score" and mem0 does not invert it into similarity, so a
+    LESS-relevant memory can carry a HIGHER score. Reading `.score`
+    directly (case.ranking_field == "score") is what lets this eval
+    actually classify that shape -- SIGNAL_DRIVEN only when the returned
+    order is genuinely sorted by descending score, ORDER_INCONSISTENT when
+    a real (if semantically inverted) score value exists but the returned
+    order doesn't track it -- instead of silently treating every
+    score-labeled case as "no signal present" via the metadata-only read.
+    """
+    if case.ranking_field == "score":
+        return record.score
+    return _parse_float(record.metadata.get(case.ranking_field))
+
+
 def classify_ranking_case(
     case: RankingQualityCase,
     query_result: QueryResult,
@@ -198,7 +228,7 @@ def classify_ranking_case(
     result record.
     """
     records = query_result.records
-    field_values = [_parse_float(r.metadata.get(case.ranking_field)) for r in records]
+    field_values = [_field_value(case, r) for r in records]
 
     matches_insertion_order: bool | None = None
     if records and stored_ids_in_order:

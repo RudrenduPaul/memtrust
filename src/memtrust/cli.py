@@ -45,8 +45,10 @@ from memtrust.evals.migration_rollback import (
     MigrationRollbackEvalResult,
     run_migration_rollback_eval,
 )
+from memtrust.evals.orphan_cleanup import OrphanCleanupEvalResult, run_orphan_cleanup_eval
 from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
 from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_resource_sync_eval
+from memtrust.evals.result_consistency import ConsistencyEvalResult, run_result_consistency_eval
 from memtrust.evals.scale_stress import (
     DEFAULT_N_RECORDS,
     ScaleTestResult,
@@ -64,8 +66,8 @@ from memtrust.receipt import (
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 14
-#: evals now registered, the `report` table has 16 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 16
+#: evals now registered, the `report` table has 18 columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
@@ -92,6 +94,8 @@ ALL_EVALS = [
     "filter_injection",
     "lock_contention",
     "stats_accuracy",
+    "orphan_cleanup",
+    "result_consistency",
 ]
 
 
@@ -414,6 +418,45 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
             "undercount_gap": result.undercount_gap,
             "error": result.error,
         }
+    if isinstance(result, OrphanCleanupEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "orphaned_vector_entry_rate": result.orphaned_vector_entry_rate,
+            "clean_rate": result.clean_rate,
+            "n_files": len(result.file_results),
+            "files": [
+                {
+                    "case_id": f.case_id,
+                    "path_suffix": f.path_suffix,
+                    "signal": str(f.signal),
+                    "present_after_delete": f.present_after_delete,
+                    "queryable_after_delete": f.queryable_after_delete,
+                    "error": f.error,
+                }
+                for f in result.file_results
+            ],
+        }
+    if isinstance(result, ConsistencyEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "consistent_rate": result.consistent_rate,
+            "inconsistent_rate": result.inconsistent_rate,
+            "n_cases": len(result.case_results),
+            "cases": [
+                {
+                    "case_id": c.case.case_id,
+                    "signal": str(c.signal),
+                    "average_jaccard": c.average_jaccard,
+                    "n_successful_runs": c.n_successful_runs,
+                    "error": c.error,
+                }
+                for c in result.case_results
+            ],
+        }
     raise TypeError(f"no serializer for {type(result)!r}")
 
 
@@ -436,7 +479,8 @@ def main() -> None:
         "Comma-separated eval list (longmemeval,locomo,contradiction,"
         "resource_sync_safety,compression,ranking_quality,scale_stress,"
         "embedding_drift,crash_recovery,extraction_quality,"
-        "migration_rollback,filter_injection,lock_contention,stats_accuracy), or 'all'."
+        "migration_rollback,filter_injection,lock_contention,stats_accuracy,"
+        "orphan_cleanup,result_consistency), or 'all'."
     ),
 )
 @click.option(
@@ -779,6 +823,34 @@ def run(
             else:
                 console.print("    N/A (no scoreable records)")
 
+        if "orphan_cleanup" in eval_names:
+            console.print(f"  Running Orphan-Cleanup against {backend_name}...")
+            orphan_result = run_orphan_cleanup_eval(adapter)
+            backend_report["evals"]["orphan_cleanup"] = _serialize_eval_result(orphan_result)
+            if orphan_result.skipped:
+                console.print(f"    SKIPPED: {orphan_result.skip_reason}")
+            else:
+                ovr = orphan_result.orphaned_vector_entry_rate
+                if ovr is not None:
+                    console.print(f"    orphaned-vector-entry rate: {ovr:.1%}")
+                else:
+                    console.print("    N/A (no scoreable files)")
+
+        if "result_consistency" in eval_names:
+            console.print(f"  Running Result-Consistency against {backend_name}...")
+            consistency_result = run_result_consistency_eval(adapter)
+            backend_report["evals"]["result_consistency"] = _serialize_eval_result(
+                consistency_result
+            )
+            ir = consistency_result.inconsistent_rate
+            if ir is not None:
+                console.print(
+                    f"    inconsistent rate: {ir:.1%}"
+                    f"  consistent rate: {consistency_result.consistent_rate:.1%}"
+                )
+            else:
+                console.print("    N/A (no scoreable cases)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -840,12 +912,16 @@ def report(report_path: Path) -> None:
     table.add_column("Filter Injection (injection-succeeded / benign-false-positive)")
     table.add_column("Lock Contention (signal, stalled/n)")
     table.add_column("Stats Accuracy (signal, verified/reported)")
+    table.add_column("Orphan-Cleanup (orphaned-vector-entry rate)")
+    table.add_column("Result-Consistency (inconsistent rate)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
             table.add_row(
                 backend_name,
                 "SKIPPED",
+                "-",
+                "-",
                 "-",
                 "-",
                 "-",
@@ -878,6 +954,8 @@ def report(report_path: Path) -> None:
         filter_injection = evals.get("filter_injection", {})
         lock_contention = evals.get("lock_contention", {})
         stats_accuracy = evals.get("stats_accuracy", {})
+        orphan_cleanup = evals.get("orphan_cleanup", {})
+        result_consistency = evals.get("result_consistency", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -971,6 +1049,15 @@ def report(report_path: Path) -> None:
             stats_accuracy_str = "N/A"
         else:
             stats_accuracy_str = "-"
+        if orphan_cleanup.get("skipped"):
+            orphan_cleanup_str = "SKIPPED (unsupported)"
+        elif orphan_cleanup:
+            orphan_cleanup_str = _fmt_pct(orphan_cleanup.get("orphaned_vector_entry_rate"))
+        else:
+            orphan_cleanup_str = "-"
+        result_consistency_str = (
+            _fmt_pct(result_consistency.get("inconsistent_rate")) if result_consistency else "-"
+        )
         table.add_row(
             backend_name,
             "configured",
@@ -988,6 +1075,8 @@ def report(report_path: Path) -> None:
             filter_injection_str,
             lock_contention_str,
             stats_accuracy_str,
+            orphan_cleanup_str,
+            result_consistency_str,
         )
 
     console.print(table)
