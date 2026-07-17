@@ -54,6 +54,7 @@ from memtrust.adapters.base import (  # noqa: E402
     BackendNotConfiguredError,
     ConflictSignal,
     CorruptionSignal,
+    ExtractionSignal,
 )
 from memtrust.adapters.mem0_direct_adapter import (  # noqa: E402
     SUPPORTED_EMBEDDER_PROVIDERS,
@@ -110,6 +111,13 @@ class _FakeMemory:
         self.delete_calls: list[str] = []
         self.raise_on_add: Exception | None = None
         self.raise_on_search: Exception | None = None
+        self.add_returns_empty_results: bool = False
+        """When True, add() returns a well-formed response with zero
+        extracted memories -- the exact mem0ai/mem0#5178 shape: no
+        exception, a normal-looking dict, but nothing usable for
+        `_extract_memory_id()` to find. Lets tests exercise
+        ExtractionSignal.EMPTY_EXTRACTION without needing a real vendor
+        call that legitimately extracted nothing."""
 
     def add(
         self, messages: object, *, user_id=None, metadata=None, infer=True
@@ -117,6 +125,8 @@ class _FakeMemory:
         if self.raise_on_add:
             raise self.raise_on_add
         self.add_calls.append({"messages": messages, "user_id": user_id, "metadata": metadata})
+        if self.add_returns_empty_results:
+            return {"results": []}
         return {"results": [{"id": "mem-1", "memory": str(messages), "event": "ADD"}]}
 
     def search(self, query: str, *, filters=None, top_k=5) -> dict[str, object]:
@@ -148,6 +158,7 @@ def test_store_returns_clean_corruption_signal_on_success() -> None:
     result = adapter.store("session-1", "My dog is named Baxter.", metadata={"topic": "pets"})
     assert result.memory_id == "mem-1"
     assert result.corruption_signal == CorruptionSignal.CLEAN
+    assert result.extraction_signal == ExtractionSignal.FACTS_EXTRACTED
     assert fake.add_calls == [
         {
             "messages": "My dog is named Baxter.",
@@ -163,6 +174,25 @@ def test_store_wraps_vendor_exception_in_backend_api_error() -> None:
     adapter = Mem0DirectAdapter(memory=fake)
     with pytest.raises(BackendAPIError):
         adapter.store("session-1", "content")
+
+
+def test_store_reports_empty_extraction_signal_when_add_returns_no_results() -> None:
+    """mem0ai/mem0#5178: Memory.add() can complete without raising and
+    return a normal-shaped `{"results": []}` response -- no exception, no
+    other signal that anything unusual happened -- when its extraction
+    pipeline found nothing worth persisting. Before this fix,
+    `_extract_memory_id()` silently returned "" here and the resulting
+    StoreResult was indistinguishable from a genuine successful store with
+    an unusual id shape. This proves the adapter now flags that gap
+    instead of masking it.
+    """
+    fake = _FakeMemory()
+    fake.add_returns_empty_results = True
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.store("session-1", "just saying hi, nothing to remember")
+    assert result.memory_id == ""
+    assert result.corruption_signal == CorruptionSignal.CLEAN
+    assert result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
 
 
 def test_query_parses_records_and_reports_not_applicable_conflict_signal() -> None:
@@ -395,6 +425,10 @@ def test_store_reports_config_rejected_for_missing_embedding_dims_on_valkey(
     result = adapter.store("session-1", "content")
     assert result.memory_id == ""
     assert result.corruption_signal == CorruptionSignal.CONFIG_REJECTED
+    # NOT_APPLICABLE, not EMPTY_EXTRACTION -- memory_id="" here means
+    # construction was rejected before any extraction could run, a
+    # different failure class than "extraction ran and found nothing."
+    assert result.extraction_signal == ExtractionSignal.NOT_APPLICABLE
     assert "embedding_model_dims" in result.raw["error"]
 
 
