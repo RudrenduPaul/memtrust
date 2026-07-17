@@ -78,6 +78,64 @@ tests/test_evals.py::MigrationRollbackFakeAdapter for the harness-side
 simulation this gap is closed with instead, and docs/methodology.md for
 the honesty caveat that applies here the same way it applies to the rest
 of this adapter.
+
+MCP metadata-tool coverage (mempalace_status/list_wings/list_rooms):
+MemPalace/mempalace#1871 (contributor alionar) found that the MCP
+server's metadata/histogram-listing tools -- `mempalace_status`,
+`mempalace_list_wings`, `mempalace_list_rooms` -- did a full-collection
+scan on every call against a Qdrant-backed palace, which is O(N^2)
+against repeated calls and hung the server at 158K+ drawers (fixed by
+server-side Qdrant faceting). Before this change, memtrust had zero
+coverage of this code path at all: every method above this note is
+written against the guessed `remember()`/`recall()`/`invalidate()`
+library concepts, never the MCP-server tool surface.
+
+Investigating this confirmed two things against the real, installed
+`mempalace` package (PyPI, not the guessed API this module's other
+methods are written against):
+
+  1. There is no `Palace` class anywhere in the real package -- `store()`/
+     `query()`/`update()` above are written against an unconfirmed guess
+     (see this module's opening confidence note) that does not match the
+     real package's actual surface, and will raise BackendAPIError
+     against it today. That mismatch is a separate, pre-existing gap this
+     change does not attempt to fix.
+  2. `mempalace.mcp_server` DOES ship real, plain module-level functions
+     -- `tool_status()`, `tool_list_wings()`, `tool_list_rooms(wing=None)`
+     -- that are the actual implementation MCP tool calls dispatch to.
+     They are callable directly, in-process, with no MCP stdio/HTTP
+     transport involved: confirmed by importing the real package, seeding
+     a local chromadb-backed palace directly via
+     `mempalace.palace.get_backend_for_palace(...).get_collection(...)`,
+     and calling these functions, which correctly report ground-truth
+     wing/room counts. This is exactly the "library-level function that
+     does the same underlying work" this build's investigation was asked
+     to look for, and it is a genuinely confirmed finding, not a repeat of
+     the LOW-confidence guessing this module's other methods carry.
+
+`metadata_overview()`/`list_metadata_categories()`/
+`list_metadata_subcategories()` below wrap those three real functions.
+One more confirmed-real detail those methods depend on: `mempalace.
+mcp_server`'s module-level `_config.palace_path` property reads the
+`MEMPALACE_PALACE_PATH` environment variable (`MEMPAL_PALACE_PATH` as a
+legacy alias) -- a *different* env var name than this adapter's own
+`MEMPALACE_STORAGE_PATH`. `_sync_mcp_palace_path()` below bridges that gap
+explicitly (mirrors `self._storage_path` into `MEMPALACE_PALACE_PATH`
+before every call) rather than silently assuming the two names line up.
+
+Scale coverage: evals/mempalace_metadata_scale.py exercises these three
+methods against a real, locally seeded chromadb-backed palace at
+increasing checkpoint sizes and checks both correctness (reported counts
+match ground truth) and that per-call latency does not blow up
+super-linearly as the corpus grows -- the same "recall/latency as a
+function of scale" pattern evals/scale_stress.py already established, but
+for this repo's first coverage of the metadata-listing code path instead
+of store()/query(). See that module's docstring for the one part of
+alionar's exact repro this could NOT be reproduced live in this
+environment: MemPalace's Qdrant backend is REST-only against a live
+external Qdrant server (no embedded/local mode), and this build's
+environment has neither docker nor a local Qdrant binary available --
+stated honestly there rather than fabricated.
 """
 
 from __future__ import annotations
@@ -92,12 +150,21 @@ from memtrust.adapters.base import (
     DeleteResult,
     MemoryBackendAdapter,
     MemoryRecord,
+    MetadataCategoryCountsResult,
+    MetadataOverviewResult,
     QueryResult,
     RankingSignal,
     RetrievalWarning,
     StoreResult,
     UpdateResult,
 )
+
+#: Env var the real installed `mempalace` package's `mempalace.mcp_server`
+#: module reads its palace location from (confirmed via
+#: `mempalace.config.MempalaceConfig.palace_path`), distinct from this
+#: adapter's own MEMPALACE_STORAGE_PATH -- see the module docstring's "MCP
+#: metadata-tool coverage" section above for how the two get bridged.
+_MCP_PALACE_PATH_ENV_VAR = "MEMPALACE_PALACE_PATH"
 
 #: Metadata keys that mempalace/mempalace#1733 (see RankingSignal's
 #: docstring in adapters/base.py) identified as the fields
@@ -227,6 +294,21 @@ class _PalaceProtocol(Protocol):
     def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]: ...
 
 
+class _MCPMetadataToolsProtocol(Protocol):
+    """Shape this adapter expects from `mempalace.mcp_server` (or a fake
+    standing in for it in tests). Confirmed real against the installed
+    `mempalace` package -- see the module docstring's "MCP metadata-tool
+    coverage" section -- unlike `_PalaceProtocol` above, whose method
+    names remain an unconfirmed guess.
+    """
+
+    def tool_status(self) -> dict[str, Any]: ...
+
+    def tool_list_wings(self) -> dict[str, Any]: ...
+
+    def tool_list_rooms(self, wing: str | None = None) -> dict[str, Any]: ...
+
+
 class MemPalaceAdapter(MemoryBackendAdapter):
     name = "mempalace"
     env_var = "MEMPALACE_STORAGE_PATH"
@@ -235,13 +317,27 @@ class MemPalaceAdapter(MemoryBackendAdapter):
     #: names come from mempalace/mempalace#27, not a confirmed API
     #: reference.
     supported_modes = ("raw", "AAAK")
+    #: See the module docstring's "MCP metadata-tool coverage" section --
+    #: metadata_overview()/list_metadata_categories()/
+    #: list_metadata_subcategories() below wrap the real, confirmed
+    #: mempalace.mcp_server.tool_status/tool_list_wings/tool_list_rooms
+    #: functions.
+    supports_metadata_overview = True
 
-    def __init__(self, palace: _PalaceProtocol | None = None) -> None:
+    def __init__(
+        self,
+        palace: _PalaceProtocol | None = None,
+        mcp_tools: _MCPMetadataToolsProtocol | None = None,
+    ) -> None:
         storage_path = os.environ.get(self.env_var)
         if not storage_path and palace is None:
             raise BackendNotConfiguredError(self.name, self.env_var)
         self._storage_path = storage_path
         self._palace = palace
+        #: See `_get_mcp_metadata_tools()` below -- lazily imported from
+        #: the real `mempalace.mcp_server` module unless a fake is
+        #: injected here (tests only; see tests/test_adapters.py).
+        self._mcp_tools = mcp_tools
 
     def _get_palace(self) -> _PalaceProtocol:
         if self._palace is not None:
@@ -266,6 +362,134 @@ class MemPalaceAdapter(MemoryBackendAdapter):
                 "reference -- see docs/methodology.md.",
             ) from exc
         return self._palace
+
+    def _get_mcp_metadata_tools(self) -> _MCPMetadataToolsProtocol:
+        """Lazily import `mempalace.mcp_server`, mirroring `_get_palace()`
+        above -- except this module IS confirmed real against the
+        installed package (see the module docstring's "MCP metadata-tool
+        coverage" section), so the only failure mode here is the package
+        not being installed at all, not a guessed-wrong method name.
+        """
+        if self._mcp_tools is not None:
+            return self._mcp_tools
+        try:
+            import mempalace.mcp_server as _mcp_server  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise BackendAPIError(
+                self.name,
+                "the `mempalace` package is not installed, or its "
+                "`mcp_server` submodule failed to import. Install it with "
+                "`pip install mempalace` to exercise the "
+                "mempalace_status/mempalace_list_wings/mempalace_list_rooms "
+                "MCP-tool code path (see this module's docstring's 'MCP "
+                "metadata-tool coverage' section).",
+            ) from exc
+        self._mcp_tools = _mcp_server
+        return self._mcp_tools
+
+    def _sync_mcp_palace_path(self) -> None:
+        """Bridge this adapter's MEMPALACE_STORAGE_PATH into the real
+        `mempalace.mcp_server` module's actual config env var,
+        MEMPALACE_PALACE_PATH (confirmed different names -- see the module
+        docstring). `mempalace.config.MempalaceConfig.palace_path` is a
+        property that re-reads the env var on every access, so setting it
+        immediately before each call (rather than once at __init__ time)
+        is what lets a single process safely point this adapter at more
+        than one storage path across its lifetime, and is a no-op when
+        `_storage_path` was never set (fake-only unit tests that inject
+        `palace`/`mcp_tools` directly without ever going through a real
+        storage path).
+        """
+        if self._storage_path:
+            os.environ[_MCP_PALACE_PATH_ENV_VAR] = self._storage_path
+
+    def metadata_overview(self) -> MetadataOverviewResult:
+        """Real, confirmed library-level equivalent of MemPalace's
+        `mempalace_status` MCP tool -- see the module docstring's "MCP
+        metadata-tool coverage" section for how this was confirmed against
+        the installed package, and MemPalace/mempalace#1871 for the O(N^2)
+        full-collection-scan bug that made this code path worth covering
+        at all.
+        """
+        timer = self._timed()
+        tools = self._get_mcp_metadata_tools()
+        self._sync_mcp_palace_path()
+        try:
+            raw = tools.tool_status()
+        except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
+            raise BackendAPIError(self.name, str(exc)) from exc
+        if not isinstance(raw, dict):
+            raise BackendAPIError(
+                self.name,
+                f"tool_status() returned {type(raw).__name__}, expected dict",
+            )
+        error = raw.get("error")
+        return MetadataOverviewResult(
+            total_records=raw.get("total_drawers"),
+            categories=dict(raw.get("wings") or {}),
+            subcategories=dict(raw.get("rooms") or {}),
+            latency_ms=timer.elapsed_ms(),
+            partial=bool(raw.get("partial")) or error is not None,
+            error=str(error) if error is not None else None,
+        )
+
+    def list_metadata_categories(self) -> MetadataCategoryCountsResult:
+        """Real, confirmed library-level equivalent of MemPalace's
+        `mempalace_list_wings` MCP tool -- see metadata_overview() above.
+        """
+        timer = self._timed()
+        tools = self._get_mcp_metadata_tools()
+        self._sync_mcp_palace_path()
+        try:
+            raw = tools.tool_list_wings()
+        except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
+            raise BackendAPIError(self.name, str(exc)) from exc
+        if not isinstance(raw, dict):
+            raise BackendAPIError(
+                self.name,
+                f"tool_list_wings() returned {type(raw).__name__}, expected dict",
+            )
+        error = raw.get("error")
+        return MetadataCategoryCountsResult(
+            counts=dict(raw.get("wings") or {}),
+            scope=None,
+            latency_ms=timer.elapsed_ms(),
+            partial=bool(raw.get("partial")) or error is not None,
+            error=str(error) if error is not None else None,
+        )
+
+    def list_metadata_subcategories(
+        self, category: str | None = None
+    ) -> MetadataCategoryCountsResult:
+        """Real, confirmed library-level equivalent of MemPalace's
+        `mempalace_list_rooms` MCP tool -- see metadata_overview() above.
+
+        Args:
+            category: restrict the listing to this wing name, or None to
+                list rooms across every wing (mirrors the real
+                `tool_list_rooms(wing=None)` signature exactly).
+        """
+        timer = self._timed()
+        tools = self._get_mcp_metadata_tools()
+        self._sync_mcp_palace_path()
+        try:
+            raw = tools.tool_list_rooms(wing=category)
+        except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
+            raise BackendAPIError(self.name, str(exc)) from exc
+        if not isinstance(raw, dict):
+            raise BackendAPIError(
+                self.name,
+                f"tool_list_rooms() returned {type(raw).__name__}, expected dict",
+            )
+        error = raw.get("error")
+        reported_scope = raw.get("wing")
+        return MetadataCategoryCountsResult(
+            counts=dict(raw.get("rooms") or {}),
+            scope=str(reported_scope) if reported_scope not in (None, "all") else category,
+            latency_ms=timer.elapsed_ms(),
+            partial=bool(raw.get("partial")) or error is not None,
+            error=str(error) if error is not None else None,
+        )
 
     def store(
         self,
