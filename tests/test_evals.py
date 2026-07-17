@@ -19,6 +19,7 @@ from memtrust.adapters.base import (
     BackendAPIError,
     ConflictSignal,
     DeleteResult,
+    EmbeddingDriftSignal,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -34,6 +35,13 @@ from memtrust.evals.contradiction import (
 )
 from memtrust.evals.contradiction import (
     load_dataset as load_contradiction_dataset,
+)
+from memtrust.evals.embedding_drift import (
+    classify_embedding_drift_record,
+    run_embedding_drift_eval,
+)
+from memtrust.evals.embedding_drift import (
+    load_dataset as load_embedding_drift_dataset,
 )
 from memtrust.evals.locomo import load_dataset as load_locomo_dataset
 from memtrust.evals.locomo import load_exclude_question_ids as load_locomo_exclude_question_ids
@@ -275,6 +283,132 @@ class FailingFakeAdapter(MemoryBackendAdapter):
 
     def delete(self, memory_id: str) -> DeleteResult:
         raise BackendAPIError(self.name, "simulated network failure")
+
+
+class EmbeddingDriftCorruptingFakeAdapter(MemoryBackendAdapter):
+    """Reproduces the volcengine/OpenViking#1523 bug shape in-memory:
+    store() reads the fixture-level `embedding_model_label` metadata tag,
+    and whenever a session's *active* label changes (i.e. a "migration"),
+    every previously-stored record carrying a *different* label silently
+    stops being searchable -- modeling an in-place vector-index overwrite
+    with no dimension/model validation. No exception is raised and no
+    signal is returned anywhere; the record's content is technically still
+    held (unlike a real deletion), it simply can never be matched by
+    query() again. Records stored under the label already active when they
+    were written are never affected -- only a genuine label change
+    triggers the corruption, so a same-label "migration" (see fixture case
+    mt-embed-003) never affects retrievability, matching the honest scope
+    of what this eval is designed to catch."""
+
+    name = "fake-embedding-drift-corrupting"
+    env_var = "FAKE_API_KEY"
+
+    def __init__(self) -> None:
+        self._records: dict[str, list[dict[str, Any]]] = {}
+        self._active_label: dict[str, str] = {}
+        self._counter = 0
+
+    def store(
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
+    ) -> StoreResult:
+        del mode
+        metadata = metadata or {}
+        label = metadata.get("embedding_model_label", "unknown")
+        records = self._records.setdefault(session_id, [])
+        prev_label = self._active_label.get(session_id)
+        if prev_label is not None and label != prev_label:
+            # Simulated in-place vector-index overwrite: every record
+            # carrying a different label than the newly-active one silently
+            # stops being searchable -- no exception, no signal.
+            for record in records:
+                if record["label"] != label:
+                    record["searchable"] = False
+        self._active_label[session_id] = label
+        self._counter += 1
+        memory_id = f"m{self._counter}"
+        records.append(
+            {"memory_id": memory_id, "content": content, "label": label, "searchable": True}
+        )
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
+        del mode
+        matches = [
+            MemoryRecord(
+                memory_id=str(r["memory_id"]),
+                content=str(r["content"]),
+                embedding_model=str(r["label"]),
+            )
+            for r in self._records.get(session_id, [])
+            if r["searchable"] and query.lower() in str(r["content"]).lower()
+        ][:top_k]
+        return QueryResult(
+            records=matches, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+
+class EmbeddingDriftCleanFakeAdapter(MemoryBackendAdapter):
+    """Models a backend whose vector store correctly validates/segregates
+    embedding-model dimensions: switching the fixture's
+    `embedding_model_label` metadata tag mid-session never affects
+    retrievability of previously-stored records. This is the negative
+    control -- the embedding-drift eval must NOT flag EMBEDDING_DRIFT
+    against this adapter."""
+
+    name = "fake-embedding-drift-clean"
+    env_var = "FAKE_API_KEY"
+
+    def __init__(self) -> None:
+        self._records: dict[str, list[MemoryRecord]] = {}
+        self._counter = 0
+
+    def store(
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
+    ) -> StoreResult:
+        del mode
+        metadata = metadata or {}
+        self._counter += 1
+        memory_id = f"m{self._counter}"
+        record = MemoryRecord(
+            memory_id=memory_id,
+            content=content,
+            embedding_model=metadata.get("embedding_model_label"),
+        )
+        self._records.setdefault(session_id, []).append(record)
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
+        del mode
+        matches = [
+            r for r in self._records.get(session_id, []) if query.lower() in r.content.lower()
+        ][:top_k]
+        return QueryResult(
+            records=matches, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -1431,3 +1565,122 @@ def test_ranking_quality_registered_in_eval_list() -> None:
     from memtrust.cli import ALL_EVALS
 
     assert "ranking_quality" in ALL_EVALS
+
+
+# ---------------------------------------------------------------------------
+# Embedding-Drift/Consistency eval -- closes a gap none of the other evals
+# in this file can see: a record broken not by the query touching it, but
+# by a *different*, earlier store() call that happened to migrate
+# embedding models. Modeled on volcengine/OpenViking#1523
+# (A0nameless0man). Every test here runs against fake, in-memory adapters
+# -- see evals/embedding_drift.py's module docstring and
+# docs/methodology.md for why this cannot be adapter-native against any
+# real backend in this repo.
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_drift_dataset_loads() -> None:
+    cases = load_embedding_drift_dataset()
+    assert len(cases) == 3
+    case_ids = {c.case_id for c in cases}
+    assert case_ids == {"mt-embed-001", "mt-embed-002", "mt-embed-003"}
+
+
+def test_embedding_drift_dataset_has_a_same_label_case() -> None:
+    """mt-embed-003 seeds model_a_label == model_b_label -- a "migration"
+    that never actually changes embedding model. Even a buggy adapter must
+    not flag drift here, since nothing about the embedding model changed."""
+    cases = {c.case_id: c for c in load_embedding_drift_dataset()}
+    same_label_case = cases["mt-embed-003"]
+    assert same_label_case.model_a_label == same_label_case.model_b_label
+
+
+def test_embedding_drift_detects_drift_matching_issue_1523() -> None:
+    """The exact bug shape: a fake adapter that silently corrupts
+    pre-migration vectors in place (no dimension/model validation) when a
+    second embedding-model label appears in the same session. Every
+    model-A record in mt-embed-001 and mt-embed-002 (distinct labels) must
+    be confirmed retrievable before the migration and flagged
+    EMBEDDING_DRIFT after it."""
+    adapter = EmbeddingDriftCorruptingFakeAdapter()
+    result = run_embedding_drift_eval(adapter)
+
+    drifted = [r for r in result.record_results if r.case_id in {"mt-embed-001", "mt-embed-002"}]
+    assert drifted
+    for record_result in drifted:
+        assert record_result.error is None
+        assert record_result.retrievable_before_migration is True
+        assert record_result.retrievable_after_migration is False
+        assert record_result.signal == EmbeddingDriftSignal.EMBEDDING_DRIFT
+
+    assert result.drift_rate is not None
+    assert result.drift_rate > 0.0
+
+
+def test_embedding_drift_no_drift_when_model_label_does_not_change() -> None:
+    """mt-embed-003's model_a_label == model_b_label -- even the buggy
+    corrupting adapter must not flag drift here, since its corruption logic
+    only triggers on a genuine label change."""
+    adapter = EmbeddingDriftCorruptingFakeAdapter()
+    result = run_embedding_drift_eval(adapter)
+    case_records = [r for r in result.record_results if r.case_id == "mt-embed-003"]
+    assert case_records
+    for record_result in case_records:
+        assert record_result.error is None
+        assert record_result.signal == EmbeddingDriftSignal.CLEAN
+
+
+def test_embedding_drift_does_not_false_positive_on_clean_migration() -> None:
+    """Negative control this eval must get right: a backend that validates/
+    segregates embedding dimensions correctly must never be flagged, across
+    every case in the fixture."""
+    adapter = EmbeddingDriftCleanFakeAdapter()
+    result = run_embedding_drift_eval(adapter)
+
+    assert result.record_results
+    for record_result in result.record_results:
+        assert record_result.error is None
+        assert record_result.retrievable_before_migration is True
+        assert record_result.retrievable_after_migration is True
+        assert record_result.signal == EmbeddingDriftSignal.CLEAN
+
+    assert result.drift_rate == 0.0
+    assert result.clean_rate == 1.0
+
+
+def test_embedding_drift_handles_backend_failure() -> None:
+    adapter = FailingFakeAdapter()
+    result = run_embedding_drift_eval(adapter)
+    # 3 cases: 3 + 2 + 1 model-A records total.
+    assert len(result.record_results) == 6
+    assert all(r.error is not None for r in result.record_results)
+    assert all(r.signal == EmbeddingDriftSignal.NOT_APPLICABLE for r in result.record_results)
+
+
+def test_embedding_drift_eval_result_rates_ignore_errored_cases() -> None:
+    adapter = EmbeddingDriftCorruptingFakeAdapter()
+    result = run_embedding_drift_eval(adapter)
+    assert result.drift_rate is not None
+    assert 0.0 <= result.drift_rate <= 1.0
+    assert len(result.scored_records) == len(result.record_results)
+
+
+def test_classify_embedding_drift_record_never_retrievable_is_not_applicable() -> None:
+    """A record that was never observed retrievable before any migration
+    step has no valid baseline -- must never be misattributed to drift."""
+    assert classify_embedding_drift_record(False, False) == EmbeddingDriftSignal.NOT_APPLICABLE
+    assert classify_embedding_drift_record(False, True) == EmbeddingDriftSignal.NOT_APPLICABLE
+
+
+def test_classify_embedding_drift_record_lost_after_migration_is_drift() -> None:
+    assert classify_embedding_drift_record(True, False) == EmbeddingDriftSignal.EMBEDDING_DRIFT
+
+
+def test_classify_embedding_drift_record_retrievable_both_times_is_clean() -> None:
+    assert classify_embedding_drift_record(True, True) == EmbeddingDriftSignal.CLEAN
+
+
+def test_embedding_drift_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "embedding_drift" in ALL_EVALS

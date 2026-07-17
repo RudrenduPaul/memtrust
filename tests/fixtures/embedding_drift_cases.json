@@ -1,0 +1,46 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case stores several records under a fixture-level 'model_a_label' embedding-model tag, confirms they're retrievable, then stores a second batch of records under a different 'model_b_label' tag into the same session (simulating an embedder migration), and re-checks whether the model-A records are still retrievable. Modeled on volcengine/OpenViking#1523 (contributor A0nameless0man): an embedder migration silently degrades search quality mid-migration because switching embedding models overwrites previously-stored vectors in place with no dimension/model validation. See docs/methodology.md and evals/embedding_drift.py for the full scoring logic and honesty caveats.",
+  "cases": [
+    {
+      "case_id": "mt-embed-001",
+      "session_id": "embed-session-1",
+      "model_a_label": "text-embedding-a-768d",
+      "model_b_label": "text-embedding-b-1536d",
+      "model_a_records": [
+        {"content": "The user's favorite programming language is Rust.", "metadata": {}},
+        {"content": "The user's timezone is America/Los_Angeles.", "metadata": {}},
+        {"content": "The user's dog is named Biscuit.", "metadata": {}}
+      ],
+      "model_b_records": [
+        {"content": "The user just adopted a second dog named Waffles.", "metadata": {}}
+      ]
+    },
+    {
+      "case_id": "mt-embed-002",
+      "session_id": "embed-session-2",
+      "model_a_label": "text-embedding-3-small",
+      "model_b_label": "text-embedding-3-large",
+      "model_a_records": [
+        {"content": "Quarterly revenue target for the sales team is 2.4 million.", "metadata": {}},
+        {"content": "The onboarding doc lives at docs/onboarding.md.", "metadata": {}}
+      ],
+      "model_b_records": [
+        {"content": "The new hire's start date is September 3rd.", "metadata": {}},
+        {"content": "The offsite venue was changed to the downtown hotel.", "metadata": {}}
+      ]
+    },
+    {
+      "case_id": "mt-embed-003",
+      "session_id": "embed-session-3",
+      "model_a_label": "local-minilm-384d",
+      "model_b_label": "local-minilm-384d",
+      "model_a_records": [
+        {"content": "The project's release cadence is every two weeks.", "metadata": {}}
+      ],
+      "model_b_records": [
+        {"content": "The project's changelog is generated from conventional commits.", "metadata": {}}
+      ]
+    }
+  ]
+}

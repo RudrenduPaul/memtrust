@@ -31,6 +31,7 @@ from memtrust.adapters import ADAPTER_REGISTRY
 from memtrust.adapters.base import BackendNotConfiguredError, MemoryBackendAdapter
 from memtrust.evals.compression import CompressionEvalResult, run_compression_eval
 from memtrust.evals.contradiction import ContradictionEvalResult, run_contradiction_eval
+from memtrust.evals.embedding_drift import EmbeddingDriftEvalResult, run_embedding_drift_eval
 from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
 from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
@@ -43,13 +44,13 @@ from memtrust.evals.scale_stress import (
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 5
-#: evals now registered, the `report` table has 7 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 6
+#: evals now registered, the `report` table has 8 columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
 #: rendering deterministic in both contexts.
-console = Console(width=200)
+console = Console(width=220)
 
 #: The 4 canonical, non-aliased backend names v0.1 tracks at full eval
 #: depth. "zep" and "graphiti" both resolve to the same adapter in
@@ -64,6 +65,7 @@ ALL_EVALS = [
     "compression",
     "ranking_quality",
     "scale_stress",
+    "embedding_drift",
 ]
 
 
@@ -233,6 +235,26 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for c in result.checkpoints
             ],
         }
+    if isinstance(result, EmbeddingDriftEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "drift_rate": result.drift_rate,
+            "clean_rate": result.clean_rate,
+            "not_applicable_rate": result.not_applicable_rate,
+            "n_records": len(result.record_results),
+            "records": [
+                {
+                    "case_id": r.case_id,
+                    "content": r.content,
+                    "model_a_label": r.model_a_label,
+                    "model_b_label": r.model_b_label,
+                    "signal": str(r.signal),
+                    "error": r.error,
+                }
+                for r in result.record_results
+            ],
+        }
     raise TypeError(f"no serializer for {type(result)!r}")
 
 
@@ -253,7 +275,8 @@ def main() -> None:
     show_default=True,
     help=(
         "Comma-separated eval list (longmemeval,locomo,contradiction,"
-        "resource_sync_safety,compression,ranking_quality,scale_stress), or 'all'."
+        "resource_sync_safety,compression,ranking_quality,scale_stress,"
+        "embedding_drift), or 'all'."
     ),
 )
 @click.option(
@@ -474,6 +497,18 @@ def run(
                     "[/yellow] (earliest-stored content became unrecoverable as volume grew)"
                 )
 
+        if "embedding_drift" in eval_names:
+            console.print(f"  Running Embedding-Drift/Consistency against {backend_name}...")
+            drift_result = run_embedding_drift_eval(adapter)
+            backend_report["evals"]["embedding_drift"] = _serialize_eval_result(drift_result)
+            dr = drift_result.drift_rate
+            if dr is not None:
+                console.print(
+                    f"    drift-rate: {dr:.1%}  clean-rate: {drift_result.clean_rate:.1%}"
+                )
+            else:
+                console.print("    N/A (no scoreable records)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -518,10 +553,11 @@ def report(report_path: Path) -> None:
     table.add_column("Compression fidelity by mode")
     table.add_column("Ranking Quality (missing-ordering-key rate)")
     table.add_column("Scale/Volume Stress (signal, recall degradation)")
+    table.add_column("Embedding Drift (drift rate)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
-            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-", "-", "-")
+            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-", "-", "-", "-")
             continue
 
         evals = backend_data.get("evals", {})
@@ -532,6 +568,7 @@ def report(report_path: Path) -> None:
         compression = evals.get("compression", {})
         ranking = evals.get("ranking_quality", {})
         scale_stress = evals.get("scale_stress", {})
+        drift = evals.get("embedding_drift", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -571,6 +608,7 @@ def report(report_path: Path) -> None:
             scale_stress_str = f"{scale_stress.get('signal', 'unknown')} ({degradation_str})"
         else:
             scale_stress_str = "-"
+        drift_str = _fmt_pct(drift.get("drift_rate")) if drift else "-"
         table.add_row(
             backend_name,
             "configured",
@@ -581,6 +619,7 @@ def report(report_path: Path) -> None:
             compression_str or "-",
             ranking_str,
             scale_stress_str,
+            drift_str,
         )
 
     console.print(table)
