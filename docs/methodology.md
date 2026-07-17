@@ -4,7 +4,8 @@ This document is the source of truth for how memtrust scores agent-memory backen
 decision, a prompt, or a dataset choice is not written down here, it should not be trusted and it
 should not ship. Every claim in the README traces back to something on this page.
 
-Last updated: 2026-07-16, adding the Scale/Volume-Stress eval.
+Last updated: 2026-07-16, adding the Scale/Volume-Stress eval and the embedding-drift/
+consistency eval (volcengine/OpenViking#1523).
 
 ## What requires a live vendor API key, and what runs fully offline
 
@@ -19,6 +20,7 @@ This matters because it changes what a number *means*.
 | Compression/round-trip-fidelity eval | Yes, one vendor API key (more if the backend declares more than one `supported_modes` entry) | No LLM judge involved -- fidelity is scored by a direct, deterministic text-similarity ratio against the literal stored content (see below). **Has not been run against any live backend as of this writing.** |
 | Ranking-Quality eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct comparison of returned record order against per-record metadata values and known insertion order (see below). **Has not been run against any live backend as of this writing.** |
 | Scale/Volume-Stress eval | Yes, one vendor API key, to reach a real backend at all -- but see the honest limitation below, this has only ever been run against fake in-memory adapters so far | No LLM judge involved -- classification is a direct comparison of re-query recall at small vs. large synthetic-corpus checkpoints (see below). **Has not been run against any live backend at real scale (10K+ records / 300+ episodes) as of this writing; `pytest`'s coverage is entirely against fake adapters engineered to model the two motivating bug shapes.** |
+| Embedding-Drift/Consistency eval | Technically yes, one vendor API key, but see the caveat below | No LLM judge involved -- classification is a direct before/after retrievability comparison across two store() calls tagged with different fixture-level embedding-model labels (see below). **Structurally cannot be adapter-native against any backend in this repo, live or not**: no adapter's query() response exposes per-record embedding-model/dimension metadata (`MemoryRecord.embedding_model`/`embedding_dims`, both default `None` everywhere), so a live run would only ever observe whatever this eval's own fixture-level store()/query() sequence happens to trigger in a real backend's actual (unknown to this harness) internal embedding pipeline -- it would not be able to attribute a result to the real bug with the same confidence the fake-adapter unit tests can. Every test covering this eval's classification logic runs against fake, in-memory adapters purpose-built to reproduce (or avoid) the exact volcengine/OpenViking#1523 bug shape. **Has not been run against any live backend as of this writing.** |
 | Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
@@ -223,6 +225,69 @@ To use it:
   `RankingSignal.NOT_APPLICABLE`, and are scored the same way `ConflictSignal.NOT_APPLICABLE`
   scores an adapter with `supports_update = False`: recorded explicitly, never silently dropped.
   See CONTRIBUTING.md.
+
+### MemTrust Embedding-Drift/Consistency Eval (original)
+
+- **Not derived from any published dataset.** Built specifically to close a gap none of the other
+  evals in this document can see: every eval above classifies a single store()/query() round trip
+  (or, for resource-sync-safety, one seed file's before/after state across one resync call). This
+  eval targets a failure mode where a record that was perfectly fine when stored is silently broken
+  by a *later, unrelated* store() call for a *different* record -- no single query() response
+  carries any evidence of this, because the record that broke was never touched by the call that
+  reveals the breakage.
+- **Origin: volcengine/OpenViking#1523** (contributor A0nameless0man). An embedder migration
+  silently degrades search quality mid-migration: switching embedding models overwrites
+  previously-stored vectors in place with no dimension/model validation, so records embedded under
+  the old model can stop being retrievable once new-model writes start landing into the same
+  session -- no exception, no error, no signal anywhere in the pipeline that this happened.
+- **This could not be built adapter-native against any backend in this repo, and that is stated
+  plainly rather than hidden.** `OpenVikingAdapter.query()` -- the adapter this bug report names --
+  talks to OpenViking's documented `/v1/search` response shape, confirmed during this build to
+  return `path`, `content`/`snippet`, `score`, `updated_at`, and `metadata` per result and nothing
+  that identifies which embedding model or vector dimensionality produced a given record (see
+  `openviking_adapter.py`'s module docstring). No other adapter in this repo exposes this either.
+  `MemoryRecord.embedding_model`/`embedding_dims` (`src/memtrust/adapters/base.py`) were added as
+  purely additive, default-`None` fields so an adapter COULD report this if a future backend's API
+  ever surfaced it -- as of this writing, none does, and every adapter's `query()` in this repo
+  leaves both fields at their default.
+- **So this eval is built at the harness level instead**, the same way `resource_sync_safety.py`'s
+  `NESTED_CONTENT_UNINDEXED` signal and `ranking_quality.py`'s `MISSING_ORDERING_KEY` signal are:
+  it drives the shared store()/query() interface with a fixture-level construct -- a plain string
+  metadata tag, `embedding_model_label`, that the fixture assigns to each seeded record -- rather
+  than a real embedder concept any adapter has to understand, and observes whether the adapter's OWN
+  behavior across two store() calls reproduces the exact bug shape (in-place overwrite with no
+  dimension validation): records seeded under one label become unrecoverable once records seeded
+  under a second label are stored into the same session.
+- **Fixture:** `tests/fixtures/embedding_drift_cases.json` -- 3 hand-written cases. `mt-embed-001`
+  and `mt-embed-002` each seed several `model_a_records` under one `model_a_label`, then several
+  `model_b_records` under a genuinely different `model_b_label` in the same session. `mt-embed-003`
+  is a deliberate same-label case (`model_a_label == model_b_label`) -- a "migration" that never
+  actually changes embedding model -- exercised so even a buggy adapter's corruption logic (which
+  only triggers on a genuine label change) is confirmed not to fire when nothing about the embedding
+  model actually changed.
+- **What this closes, precisely, and what it does not.** `tests/test_evals.py`'s
+  `EmbeddingDriftCorruptingFakeAdapter` reproduces A0nameless0man's exact bug shape end-to-end
+  (confirmed retrievable before a label change, silently unretrievable after it, no error raised)
+  and the eval correctly flags every such record `EMBEDDING_DRIFT`
+  (`test_embedding_drift_detects_drift_matching_issue_1523`); `EmbeddingDriftCleanFakeAdapter`
+  models a backend that segregates embedding dimensions correctly and the eval correctly never
+  flags it (`test_embedding_drift_does_not_false_positive_on_clean_migration`). This proves the
+  *eval's own classification logic* correctly distinguishes genuine embedding-drift from normal
+  recall variance (by requiring a confirmed pre-migration baseline before ever assigning
+  `EMBEDDING_DRIFT` -- see `classify_embedding_drift_record()` below) against fake adapters
+  purpose-built to model both the bug and its absence. It does **not**, and cannot, prove that
+  OpenViking's (or any other tracked vendor's) real embedding pipeline exhibits this bug --
+  reproducing that requires a live instance whose actual vector-write path this harness has no way
+  to observe, since the wire-level metadata that would make this adapter-native does not exist in
+  any documented API this repo's adapters talk to.
+- **Extending this eval:** adding more cases means adding entries to the fixture file with the same
+  `case_id`/`session_id`/`model_a_label`/`model_b_label`/`model_a_records`/`model_b_records` shape.
+  If a future backend's real API does expose per-record embedding-model/dimension metadata, the
+  adapter-native path is to populate `MemoryRecord.embedding_model`/`embedding_dims` in that
+  adapter's `query()` and extend `classify_embedding_drift_record()` (or a corroborating check
+  alongside it, the same way `classify_case()` in `contradiction.py` cross-checks invalidation
+  metadata) to use that field as additional evidence rather than relying on before/after
+  retrievability alone. No adapter does this today. See CONTRIBUTING.md.
 
 ### MemTrust Resource-Sync-Safety Eval (original)
 
@@ -495,6 +560,46 @@ anything about whether a live OpenViking or Graphiti deployment currently exhibi
 -- that requires an actual `memtrust run --backends openviking --eval scale_stress
 --scale-stress-n-records 10000` (or the Graphiti equivalent, driven through real episode
 ingestion) against a real, credentialed instance, which this build did not do.
+
+## Embedding-drift/consistency scoring logic
+
+Implemented in `src/memtrust/evals/embedding_drift.py`, function
+`classify_embedding_drift_record()`, called from `run_embedding_drift_eval()`. For every case:
+
+1. Store every `model_a_records` entry via `adapter.store(session_id, content, metadata={...,
+   "embedding_model_label": model_a_label})`.
+2. Query for each record's own content (`adapter.query(session_id, content, top_k=5)`) and record
+   whether it's retrievable -- this is the baseline, established BEFORE any migration step runs.
+3. Store every `model_b_records` entry the same way, tagged `embedding_model_label: model_b_label`
+   -- this is what simulates "switching to model B for new stores." Their own retrievability is
+   never scored; they exist purely to trigger whatever the adapter's own store() does when a second
+   embedding-model label appears in the same session.
+4. Re-query for each model-A record's own content and record whether it's still retrievable.
+
+Classification (`classify_embedding_drift_record(retrievable_before, retrievable_after)`):
+
+| Condition | Signal |
+|---|---|
+| Not retrievable before the migration step | **NOT_APPLICABLE** -- no valid baseline; a record never confirmed retrievable in the first place can never be attributed to drift |
+| Retrievable before, not retrievable after | **EMBEDDING_DRIFT** -- the volcengine/OpenViking#1523 shape |
+| Retrievable before and after | **CLEAN** |
+
+**Why the confirmed-baseline requirement matters.** Requiring step 2's positive baseline before a
+record can ever be classified `EMBEDDING_DRIFT` is what keeps this eval honest about "normal recall
+variance": a record that a backend simply never returns well (nothing to do with any embedding-model
+migration) is recorded `NOT_APPLICABLE`, never misattributed to drift. Only a record that was
+provably retrievable immediately after being stored, and then stops being retrievable strictly after
+a *different* embedding-model label's records were stored into the same session, counts as drift.
+
+**Why this doesn't (and structurally can't) cross-check an adapter self-report the way
+`classify_case()`/`classify_ranking_case()` do.** Every other eval's classifier in this document
+recomputes its verdict from ground truth and only uses the adapter's own reported signal
+(`conflict_signal`, `ranking_signal`) as a secondary, never-trusted-alone corroboration. This eval
+has no adapter self-report to even distinguish from: no adapter's `query()` in this repo populates
+`MemoryRecord.embedding_model`/`embedding_dims` (see the section above), so there is nothing for
+`classify_embedding_drift_record()` to cross-check against beyond the before/after retrievability
+comparison itself. If a future adapter does populate those fields, extending the classifier to use
+them as corroborating evidence is a documented, contribution-shaped gap (see above).
 
 ## LLM-judge prompt template
 
@@ -1021,6 +1126,24 @@ OpenViking instance is currently affected -- it confirms only that memtrust's st
 scoring logic are now capable of detecting that failure mode *if* a live instance exhibits it.
 Confirming the live bug itself requires running `resource_sync_safety` against a real, running
 OpenViking server with `OPENVIKING_API_KEY` configured, which this build pass did not do.
+
+The strongest version of this objection in this repo applies to the embedding-drift/consistency
+eval added for volcengine/OpenViking#1523. Every other eval added against an OpenViking bug report
+(#3029, #1703) at least drives a real HTTP call through `OpenVikingAdapter` when live credentials
+are configured, even if the classification logic itself is only unit-tested against a fake. This
+eval cannot do even that: no adapter in this repo, OpenViking included, exposes per-record
+embedding-model or dimensionality metadata on its `query()` response, so there is no wire-level
+signal for a live run to read that would let this eval attribute a result to the real #1523 bug with
+any confidence, live credentials or not. What this change actually built and verified: a fixture-level
+harness (`evals/embedding_drift.py`) that drives two labeled store() calls and a before/after
+retrievability check through the existing shared adapter interface, and a classifier
+(`classify_embedding_drift_record()`) proven, against fake adapters purpose-built for both the bug
+and its absence, to correctly separate genuine drift from ordinary recall variance. What it does not,
+and structurally cannot, do without a wire-format change on OpenViking's (or any tracked vendor's)
+side: confirm that any real backend's actual embedding pipeline reproduces #1523 today. A reader
+should treat an `EMBEDDING_DRIFT` result from a live run of this eval as "this harness's fixture
+sequence triggered *something* that looked like drift against this backend, worth investigating
+directly" -- not as confirmation of the specific root cause A0nameless0man reported.
 
 `ZepGraphitiSelfHostedAdapter` deserves the strongest version of this objection of any adapter in
 this repo: it was built and unit-tested entirely against a Protocol double, because the real
