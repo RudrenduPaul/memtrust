@@ -776,6 +776,44 @@ class DeleteResult:
     raw: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass
+class MigrationFailureResult:
+    """Result of MemoryBackendAdapter.simulate_migration_failure().
+
+    Reports whether the ORIGINAL pre-migration data survived a simulated
+    mid-migration failure -- the primitive
+    MemoryBackendAdapter.supports_migration_rollback_simulation gates and
+    evals/migration_rollback.py drives. Modeled on the exact shape
+    MemPalace/mempalace#1028 (GitHub user eldar702) reports: an unguarded
+    `shutil.rmtree()`-then-`shutil.move()` swap at the end of
+    MemPalace's own `migrate.migrate()` function deletes the old backup
+    FIRST, so if the `move()` step fails partway (e.g. a cross-device
+    `EXDEV` error), the palace directory is permanently lost -- there is
+    no backup left to fall back to. MemPalace/mempalace#935 is the real
+    upstream fix: a safer "rename-aside" swap that renames the new data
+    into place first, keeps the old backup renamed-aside, and only
+    deletes the backup after confirming the swap succeeded, so a failure
+    mid-swap leaves the original data recoverable.
+    """
+
+    session_id: str
+    memory_id: str
+    content: str
+    """The exact content simulate_migration_failure() stored as the
+    ORIGINAL pre-migration data before simulating the failure."""
+    original_data_recoverable: bool
+    """This adapter's OWN observation (via its normal query() path) of
+    whether `content` is still retrievable after the simulated failure.
+    Kept as a diagnostic/cross-check field only -- evals/
+    migration_rollback.py's run_migration_rollback_eval() does not trust
+    this self-report as the classification's ground truth. It makes its
+    own independent query() call after simulate_migration_failure()
+    returns and classifies from that instead, the same "never trust a
+    single response" principle every eval in this package follows (see
+    evals/crash_recovery.py's classify_crash_recovery_case and
+    evals/ranking_quality.py's classify_ranking_case for precedent)."""
+
+
 class MemoryBackendAdapter(ABC):
     """Abstract base every backend adapter must implement.
 
@@ -845,6 +883,23 @@ class MemoryBackendAdapter(ABC):
     #: this gates, and docs/methodology.md for why that eval cannot prove
     #: anything about a real backend's process-lifecycle behavior.
     supports_crash_recovery_simulation: bool = False
+
+    #: Whether this adapter can simulate a storage-migration's final swap
+    #: step failing partway through, via simulate_migration_failure()
+    #: below. Defaults to False -- same "no adapter in this repo has real
+    #: process/filesystem-lifecycle control over a live backend" reasoning
+    #: as supports_crash_recovery_simulation above: no adapter here holds
+    #: a handle to a live vendor package's internal migration code path it
+    #: could actually interrupt partway through. Only a purpose-built
+    #: in-memory fake adapter (see
+    #: tests/test_evals.py::MigrationRollbackFakeAdapter) can genuinely
+    #: model both the buggy unguarded-rmtree()-then-move() swap and the
+    #: fixed rename-aside swap -- see evals/migration_rollback.py for the
+    #: eval this gates, and that module's docstring plus
+    #: mempalace_adapter.py's module docstring for why this cannot prove
+    #: anything about a real MemPalace deployment's migrate.migrate()
+    #: behavior.
+    supports_migration_rollback_simulation: bool = False
 
     @abstractmethod
     def store(
@@ -1074,6 +1129,56 @@ class MemoryBackendAdapter(ABC):
         raise NotImplementedError(
             f"{self.name} does not implement raw_store_contains() "
             f"(supports_crash_recovery_simulation={self.supports_crash_recovery_simulation})"
+        )
+
+    def simulate_migration_failure(self, session_id: str, content: str) -> MigrationFailureResult:
+        """Store `content` as the ORIGINAL pre-migration data, then
+        simulate a storage migration whose final swap step is interrupted
+        before the commit step completes, and report whether `content` is
+        still recoverable afterward.
+
+        This is deliberately NOT a real migration or a real filesystem
+        fault injection -- no adapter in this repo holds a handle to a
+        live vendor package's actual migrate() code path it could
+        genuinely interrupt partway through (every real adapter here is
+        either a pure HTTP client or, for MemPalaceAdapter, a thin wrapper
+        around whatever the installed `mempalace` package's own
+        remember()/recall()/invalidate() do internally -- see
+        mempalace_adapter.py's module docstring). It is an explicit, named
+        simulation primitive an in-memory fake adapter implements to model
+        the specific failure shape MemPalace/mempalace#1028 (GitHub user
+        eldar702) reports: MemPalace's own `migrate.migrate()` function had
+        an unguarded `shutil.rmtree()`-then-`shutil.move()` swap at the end
+        of a migration -- if the `move()` step failed partway (e.g. a
+        cross-device `EXDEV` error), the palace directory could be
+        permanently lost, since the old backup was already deleted first.
+        MemPalace/mempalace#935 is the real upstream fix this primitive
+        exists to let an eval verify the CONCEPT of (not a specific merged
+        diff): a "rename-aside" swap that renames the new data into place
+        first, keeps the old backup renamed-aside, and only deletes it
+        after confirming the swap succeeded, so a failure mid-swap leaves
+        the original data recoverable.
+
+        Optional capability, same convention as simulate_crash_restart()/
+        raw_store_contains() above -- default raises NotImplementedError,
+        only adapters with supports_migration_rollback_simulation = True
+        are expected to override it. See evals/migration_rollback.py.
+
+        Args:
+            session_id: logical conversation/user scope to store the
+                original pre-migration content under.
+            content: the exact text to treat as the original pre-migration
+                data whose survival across the simulated failure is being
+                tested.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_migration_rollback_simulation is False).
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement simulate_migration_failure() "
+            f"(supports_migration_rollback_simulation="
+            f"{self.supports_migration_rollback_simulation})"
         )
 
     @staticmethod
