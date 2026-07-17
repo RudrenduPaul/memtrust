@@ -4,9 +4,11 @@ This document is the source of truth for how memtrust scores agent-memory backen
 decision, a prompt, or a dataset choice is not written down here, it should not be trusted and it
 should not ship. Every claim in the README traces back to something on this page.
 
-Last updated: 2026-07-16, adding the Scale/Volume-Stress eval, the embedding-drift/
+Last updated: 2026-07-17, adding the Scale/Volume-Stress eval, the embedding-drift/
 consistency eval (volcengine/OpenViking#1523), the Crash-Recovery eval
-(volcengine/OpenViking#2644), and the Extraction-Quality-at-Scale eval (mem0ai/mem0#4573).
+(volcengine/OpenViking#2644), the Extraction-Quality-at-Scale eval (mem0ai/mem0#4573), the
+Lock-Contention/Hang-Detection eval (volcengine/OpenViking#1581), and the Stats/Dashboard-Accuracy
+eval (volcengine/OpenViking#1255).
 
 ## What requires a live vendor API key, and what runs fully offline
 
@@ -24,6 +26,8 @@ This matters because it changes what a number *means*.
 | Embedding-Drift/Consistency eval | Technically yes, one vendor API key, but see the caveat below | No LLM judge involved -- classification is a direct before/after retrievability comparison across two store() calls tagged with different fixture-level embedding-model labels (see below). **Structurally cannot be adapter-native against any backend in this repo, live or not**: no adapter's query() response exposes per-record embedding-model/dimension metadata (`MemoryRecord.embedding_model`/`embedding_dims`, both default `None` everywhere), so a live run would only ever observe whatever this eval's own fixture-level store()/query() sequence happens to trigger in a real backend's actual (unknown to this harness) internal embedding pipeline -- it would not be able to attribute a result to the real bug with the same confidence the fake-adapter unit tests can. Every test covering this eval's classification logic runs against fake, in-memory adapters purpose-built to reproduce (or avoid) the exact volcengine/OpenViking#1523 bug shape. **Has not been run against any live backend as of this writing.** |
 | Crash-Recovery eval | **No -- cannot run against any live backend at all, by design.** | This eval requires `MemoryBackendAdapter.supports_crash_recovery_simulation = True`, and no adapter in this repo sets it to `True` -- every real adapter is a pure HTTP client with zero ability to start, kill, or restart a live vendor server process. It only ever runs against a purpose-built in-memory fake adapter and reports SKIPPED for every real backend (`mempalace`, `mem0`, `zep`, `openviking`). See below and CONTRIBUTING.md for what would be required to close this gap for real. |
 | Extraction-Quality-at-Scale eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct substring check of query() responses against each case's `should_be_stored` ground truth, plus a store/query/re-store/query record-count comparison for the feedback-loop cases (see below). **Has not been run against any live backend, and has never been run at anything close to jamebobob's real 10,134-entry scale -- this eval's own unit tests only prove its classification logic is correct against hand-written fake adapters, see below.** |
+| Lock-Contention/Hang-Detection eval | Yes, one vendor API key, for a backend that also sets `supports_resource_sync = True` -- but see the honest limitation below | No LLM judge involved -- classification is a direct wall-clock response-time-budget check across concurrent store() calls against the same `resource_path` (see below). This eval CAN technically run against `openviking` (the one adapter with `supports_resource_sync = True`) with real credentials configured, unlike Crash-Recovery -- it needs no process-lifecycle control, only ordinary concurrent HTTP calls. **Has not been run against any live backend as of this writing; `pytest`'s coverage is entirely against a fake adapter engineered to model volcengine/OpenViking#1581's exact "0 means unlimited retries" shape.** |
+| Stats/Dashboard-Accuracy eval | Yes, one vendor API key, for a backend that also sets `supports_stats = True` | No LLM judge involved -- classification is a direct comparison of `get_stats()`'s self-reported count against an independently verified count from ordinary query() calls (see below). **Has not been run against any live backend as of this writing; `pytest`'s coverage is entirely against fake adapters engineered to reproduce (and avoid) volcengine/OpenViking#1255's exact "stats endpoint always reports zero despite verified data" shape.** |
 | Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
@@ -559,6 +563,116 @@ To use it:
   `feedback_loop_cases`). Every case needs its own unique `session_id` so cases never contaminate
   each other's query results. See CONTRIBUTING.md.
 
+### MemTrust Lock-Contention/Hang-Detection Eval (original)
+
+- **Not derived from any published dataset.** Built to close a gap none of the other evals can
+  see: every other eval issues requests sequentially, one at a time, against a single adapter
+  instance. None of them ever fire multiple concurrent requests at the same logical target, so
+  none of them can observe what happens when two writers genuinely contend for the same resource.
+- **Origin: volcengine/OpenViking#1581** (contributor 0xble). `memory.v2_lock_max_retries` uses
+  `0` to mean "unlimited retries" -- the opposite of the usual convention where `0` means "one
+  attempt, then fail." Because `0` is also the default, any deployment that never explicitly sets
+  this field inherits infinite-retry semantics for free: a session-commit path contending for a
+  stale lock (e.g. one left behind by a crashed holder) spins forever, with the only surface signal
+  a repeated `logger.warning` line -- never a raised error, never an API-observable field.
+- **This eval CAN technically run against a real, configured backend, unlike Crash-Recovery.** It
+  needs no process-lifecycle control at all -- only ordinary concurrent HTTP calls against the same
+  `resource_path`, using the same `metadata={"resource_path": ...}` key `openviking_adapter.py`'s
+  `store()` already honors (see the resource-sync-safety precedent this reuses). Gated on
+  `MemoryBackendAdapter.supports_resource_sync` (not a new capability flag) because a backend with
+  no resource-path-scoped write concept has no shared target for concurrent writers to actually
+  contend over -- the eval reports SKIPPED for any adapter where this is `False`.
+- **What this eval does instead of engineering a real stuck lock server-side: proves the harness's
+  timing-based classification against a fake adapter built to model the bug's exact shape.**
+  `tests/test_lock_contention.py::LockContentionFakeAdapter` maintains one simulated lock per
+  `resource_path`; the first `store()` call for a given path acquires it and never releases it
+  (modeling the issue's own "a stale lock file from a crashed holder" repro step). Constructed with
+  `max_retries=0` it reproduces the buggy default (retries bounded internally at a large test-safe
+  cap, standing in for the real "unlimited" semantics -- see the fake's own docstring for why an
+  actually-infinite loop would hang the test suite). Constructed with `max_retries>0` it reproduces
+  the fixed, post-#1581 semantics: bounded retries, fails fast with a raised error.
+- **How the timing assertion works without risking a hung test suite.** `run_lock_contention_eval()`
+  fires `n_concurrent` real `threading.Thread(daemon=True)` workers, each issuing one `store()`
+  call, then joins each thread with a remaining-time budget derived from a single shared deadline.
+  A request that has not resolved (succeeded or raised) by the deadline is classified
+  `UNBOUNDED_STALL` without ever blocking on it further -- daemon threads cannot block process/test
+  exit, and the fake adapter's own internal retry cap ensures an abandoned worker thread terminates
+  on its own in a bounded, short time rather than truly running forever.
+- **Why a new `LockContentionSignal` enum rather than reusing an existing one.** Every other signal
+  enum in this repo classifies either a single `QueryResult` (`ConflictSignal`, `RankingSignal`) or
+  a sequence of calls against the SAME logical record over time (`CrashRecoverySignal`,
+  `EmbeddingDriftSignal`). This is the first eval that classifies TIMING across multiple
+  SIMULTANEOUS calls against a SHARED target -- a structurally different kind of observation none
+  of the existing enums' vocabularies cover.
+- **Honest limitation -- read this before trusting a `BOUNDED_RESPONSE`/`UNBOUNDED_STALL` verdict
+  for a real backend.** This eval, as shipped, proves one thing: *the classification logic
+  correctly separates "every concurrent request resolved within budget" from "at least one request
+  never did," given real wall-clock timing.* It has been proven against
+  `LockContentionFakeAdapter` configured both ways (buggy and fixed) -- a purpose-built in-memory
+  fake, not a real backend. It does **not**, and as of this writing has not, prove that any real
+  OpenViking instance currently has the #1581 bug, ever had it (the issue itself is closed/fixed
+  upstream), or would produce `UNBOUNDED_STALL` if actually run under contention -- see the
+  "What requires a live vendor API key" table above.
+- **Extending this eval:** run it against a real, configured `openviking` adapter with
+  `run_lock_contention_eval(adapter, n_concurrent=..., budget_ms=...)` to actually measure this for
+  real -- nothing about the eval itself requires a fake, only this build's environment lacked a
+  live, configured instance to point it at. See CONTRIBUTING.md.
+
+### MemTrust Stats/Dashboard-Accuracy Eval (original)
+
+- **Not derived from any published dataset.** Every other eval treats a backend's store()/query()
+  responses (with independent cross-checks where relevant) as the only source of truth about what
+  is stored. None of them look at a backend's own self-reported summary statistics at all.
+- **Origin: volcengine/OpenViking#1255** (contributor SeeYangZhi). `GET /api/v1/stats/memories`
+  returned an all-zero count on a fresh instance immediately after memory extraction had already
+  completed -- confirmed still present via two independent observations quoted in the bug report
+  itself: Docker logs showing the memories were extracted and written, and a real
+  `POST /v1/search/find` call that successfully returned those same memory files. The reporter's
+  own root-cause read: the stats endpoint reads from a dedicated metrics index populated only by a
+  synchronous write path, never by the async extraction pipeline that actually persisted the data.
+- **New `MemoryBackendAdapter.get_stats()` primitive and `supports_stats` flag**
+  (`src/memtrust/adapters/base.py`), same optional-capability convention as
+  `list_resource_paths()`/`trigger_resync()`/`probe_raw_filter()`: default raises
+  `NotImplementedError`, only adapters that genuinely have a stats endpoint override it, and an
+  adapter without the capability is reported SKIPPED rather than crashing or being silently dropped.
+  `openviking_adapter.py`'s implementation hits `GET /api/v1/stats/memories` and reads
+  `total_memories` -- confidence HIGH on this specific endpoint and response shape, both quoted
+  verbatim in #1255's real bug report, unlike the LOW-confidence guessed endpoints elsewhere in
+  that adapter (see its module docstring).
+- **How the independent verification works.** `run_stats_accuracy_eval()` stores N uniquely
+  markered records, then re-queries for each marker individually via the adapter's normal
+  `query()` path (the same surface #1255's own report used `/v1/search/find` for) to build an
+  independently verified retrievable count -- never trusting `get_stats()` alone, the same
+  "never trust a single response" principle every eval in this package follows (see
+  `evals/crash_recovery.py`'s `raw_store_contains()` cross-check).
+- **What this eval does instead of running against a live instance: proves the harness's
+  classification logic against fake adapters built to model both the bug's exact shape and its
+  absence.** `tests/test_stats_accuracy.py::StatsUndercountingFakeAdapter` stores and retrieves
+  correctly but always reports `total_memories=0` from `get_stats()`, regardless of the real
+  count -- the exact #1255 shape. `StatsAccurateFakeAdapter` is the negative control: its
+  `get_stats()` genuinely counts what was stored, and must be classified `STATS_MATCH`.
+- **Why a new `StatsSignal` enum rather than a new `ConflictSignal` member.**
+  `ConflictSignal.EMPTY_OR_LOST` fires when a single `query()` call succeeds but returns nothing --
+  it is about *retrieval* silently coming back empty. This eval's failure mode is different in
+  kind: in #1255's own report, `query()`/`/v1/search/find` worked perfectly, while a *separate,
+  independently maintained* stats/dashboard endpoint reported a number that disagreed with that
+  working retrieval path. Folding this into `ConflictSignal` would blur "retrieval failed" and
+  "retrieval works, but a different, unrelated counter is wrong" into the same signal -- the same
+  reasoning that already justifies `CrashRecoverySignal`, `ResourceSyncSignal`, and `RankingSignal`
+  each being their own enum.
+- **Honest limitation.** This eval, as shipped, proves one thing: *the classification logic
+  correctly separates "reported count matches or exceeds verified count" from "reported count
+  undercounts verified count," given two independently obtained counts.* It has been proven
+  against `StatsUndercountingFakeAdapter` (the bug shape) and `StatsAccurateFakeAdapter` (the
+  negative control) -- both purpose-built in-memory fakes, not a real backend. It does **not**
+  prove that any real OpenViking instance currently has the #1255 bug (the issue is open,
+  unconfirmed-fixed upstream as of this writing) or would produce `STATS_UNDERCOUNTED` if actually
+  queried -- see the "What requires a live vendor API key" table above.
+- **Extending this eval:** run it against a real, configured `openviking` adapter with
+  `run_stats_accuracy_eval(adapter, n_records=...)` to actually measure this for real. A second
+  real adapter gaining a genuine stats endpoint means implementing `get_stats()` and setting
+  `supports_stats = True` on it -- this eval's own logic needs no changes. See CONTRIBUTING.md.
+
 ## Resource-Sync-Safety scoring logic
 
 Implemented in `src/memtrust/evals/resource_sync_safety.py`, function `classify_resource_sync_file()`,
@@ -872,6 +986,74 @@ this repo's own hand-written fake adapters (`tests/test_evals.py`'s
 `NoExtractionGateFakeAdapter`, `GatedExtractionFakeAdapter`, and
 `FeedbackLoopDuplicatingFakeAdapter`), never against a live backend. See the "Honest limitation"
 paragraph in the Extraction-Quality-at-Scale Eval section above for the full caveat.
+
+## Lock-contention scoring logic
+
+Implemented in `src/memtrust/evals/lock_contention.py`, function `classify_lock_contention_result()`,
+called from `run_lock_contention_eval()`. If `adapter.supports_resource_sync` is `False`, the eval
+is skipped entirely for that adapter -- not run, not guessed (a backend with no resource-path-scoped
+write concept has no shared target for concurrent writers to contend over). Otherwise:
+
+1. Fire `n_concurrent` real, concurrent `store()` calls -- each on its own `threading.Thread` -- all
+   targeting the SAME `resource_path` via `metadata={"resource_path": resource_path}`.
+2. Join every thread against a single shared wall-clock deadline (`budget_ms` from when the run
+   started).
+3. Any request whose thread has not finished by the deadline is recorded `completed=False`; every
+   other request is recorded with its actual outcome (succeeded, or raised `BackendAPIError`) and
+   its real latency.
+
+Classification:
+
+| Condition | Signal |
+|---|---|
+| No requests were issued | **NOT_APPLICABLE** |
+| Every request resolved (succeeded OR raised) within the budget | **BOUNDED_RESPONSE** -- contention may still exist (requests can legitimately queue behind each other), but it never silently exceeds a bounded SLA |
+| At least one request neither succeeded nor raised within the budget | **UNBOUNDED_STALL** -- the volcengine/OpenViking#1581 shape: a request stuck retrying forever, with no exception and no other signal a caller could act on |
+
+**Why this doesn't just check "did anything raise an exception."** #1581's bug is specifically that
+NOTHING raises -- the request just never returns, with only a repeated WARN log as evidence. A
+classifier that only watched for raised exceptions would never see this failure mode at all; only a
+wall-clock budget on completion (success OR failure, either is fine) can catch it, which is why
+`LockContentionRequestResult.completed` -- not `succeeded` -- is what `classify_lock_contention_result()`
+keys its verdict on.
+
+**Honest limitation.** This eval, as shipped, proves the classification logic correctly separates
+"every concurrent request resolved within budget" from "at least one never did," given real
+wall-clock timing against `tests/test_lock_contention.py::LockContentionFakeAdapter` in both its
+buggy (`max_retries=0`) and fixed (`max_retries>0`) configurations. It has not been run against a
+live OpenViking instance. See the "What requires a live vendor API key" table above.
+
+## Stats-accuracy scoring logic
+
+Implemented in `src/memtrust/evals/stats_accuracy.py`, function `classify_stats_accuracy()`, called
+from `run_stats_accuracy_eval()`. If `adapter.supports_stats` is `False`, the eval is skipped
+entirely for that adapter. Otherwise:
+
+1. Store `n_records` records, each carrying a unique marker token.
+2. For every marker that was successfully stored, independently re-query for it via
+   `adapter.query()` and count how many are actually retrievable -- `verified_count`, the ground
+   truth this eval trusts.
+3. Call `adapter.get_stats()` and read `total_memories` -- `reported_count`, the number under test.
+
+Classification:
+
+| Condition | Signal |
+|---|---|
+| Nothing was stored, or `get_stats()` raised/returned no usable count | **NOT_APPLICABLE** |
+| `reported_count < verified_count` | **STATS_UNDERCOUNTED** -- the volcengine/OpenViking#1255 shape: memories are demonstrably retrievable, but the dedicated stats endpoint reports fewer of them |
+| `reported_count >= verified_count` | **STATS_MATCH** -- see `StatsSignal.STATS_MATCH`'s docstring for why a reported count higher than this eval's own narrow verification is not itself flagged as a separate failure |
+
+**Why this doesn't just trust `get_stats()` alone.** That is exactly the ambiguity #1255 exploits:
+a caller with no independent verification path has no way to tell "the stats endpoint is accurate"
+apart from "the stats endpoint reads from a completely different, out-of-sync code path." Only an
+independent `query()`-based count, the same evidence class #1255's own bug report used, can tell
+the two apart.
+
+**Honest limitation.** This eval, as shipped, proves the classification logic correctly separates
+"reported count keeps up with verified count" from "reported count undercounts it," given two
+independently obtained counts against `tests/test_stats_accuracy.py::StatsUndercountingFakeAdapter`
+(the bug shape) and `StatsAccurateFakeAdapter` (the negative control). It has not been run against
+a live OpenViking instance. See the "What requires a live vendor API key" table above.
 
 ## LLM-judge prompt template
 

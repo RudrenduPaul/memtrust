@@ -667,6 +667,101 @@ def test_openviking_delete_raises_backend_api_error_on_http_failure(
 
 
 # ---------------------------------------------------------------------------
+# OpenVikingAdapter.get_stats() -- volcengine/OpenViking#1255
+#
+# #1255 (real bug, reported by SeeYangZhi): GET /api/v1/stats/memories
+# returns an all-zero count even when memories genuinely exist (confirmed
+# via filesystem listing and /v1/search/find in the issue's own repro).
+# These tests confirm this adapter parses the real, issue-quoted response
+# shape correctly -- they do not, and cannot, prove the live endpoint
+# still exhibits the undercounting bug; see evals/stats_accuracy.py for
+# the eval that classifies undercounting against an independently
+# verified count.
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_get_stats_parses_total_memories(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="GET",
+        url="http://localhost:1933/api/v1/stats/memories",
+        json={
+            "total_memories": 10,
+            "by_category": {"profile": 1, "preferences": 3, "entities": 6},
+        },
+    )
+    result = adapter.get_stats()
+    assert result.total_memories == 10
+    assert result.raw["by_category"]["entities"] == 6
+    adapter.close()
+
+
+def test_openviking_get_stats_reproduces_1255_zero_count_shape(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """The exact response shape quoted verbatim in #1255's bug report --
+    this adapter must parse it faithfully (0, not None or an error) so
+    evals/stats_accuracy.py's undercount comparison has a real number to
+    compare against."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="GET",
+        url="http://localhost:1933/api/v1/stats/memories",
+        json={
+            "total_memories": 0,
+            "by_category": {
+                "profile": 0,
+                "preferences": 0,
+                "entities": 0,
+                "events": 0,
+                "cases": 0,
+                "patterns": 0,
+                "tools": 0,
+                "skills": 0,
+            },
+            "hotness_distribution": {"cold": 0, "warm": 0, "hot": 0},
+        },
+    )
+    result = adapter.get_stats()
+    assert result.total_memories == 0
+    adapter.close()
+
+
+def test_openviking_get_stats_raises_backend_api_error_on_http_failure(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(method="GET", status_code=500)
+    with pytest.raises(BackendAPIError):
+        adapter.get_stats()
+    adapter.close()
+
+
+def test_openviking_get_stats_missing_field_returns_none(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="GET",
+        url="http://localhost:1933/api/v1/stats/memories",
+        json={"unexpected_shape": True},
+    )
+    result = adapter.get_stats()
+    assert result.total_memories is None
+    adapter.close()
+
+
+def test_openviking_supports_stats_is_true() -> None:
+    assert OpenVikingAdapter.supports_stats is True
+
+
+# ---------------------------------------------------------------------------
 # OpenVikingAdapter.store() resource_path -- volcengine/OpenViking#1703 gap
 #
 # #1703 (real bug, reported by SonicBotMan): OpenViking's own
