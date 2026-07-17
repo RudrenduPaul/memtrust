@@ -1,6 +1,6 @@
 {
   "_synthetic": true,
-  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case stores several records under one session, each tagged with a `ranking_field` metadata value, then queries the session and checks whether the returned order actually correlates with that field. Case mt-rank-001 and mt-rank-004 reproduce the exact mempalace/mempalace#1733 shape (GitHub user Kartalops): a ranking-relevant field that is either present-but-constant or entirely absent on every record, so any apparent ordering has no real per-record signal behind it. Case mt-rank-002 is the negative control: genuinely varied importance values that a correctly-behaving backend orders by descending value -- this must NOT be flagged. Case mt-rank-003 is a backend that has a real varying signal but doesn't order by it. See docs/methodology.md and evals/ranking_quality.py for the full scoring logic.",
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case stores several records under one session, each tagged with a `ranking_field` metadata value, then queries the session and checks whether the returned order actually correlates with that field. Case mt-rank-001 and mt-rank-004 reproduce the exact mempalace/mempalace#1733 shape (GitHub user Kartalops): a ranking-relevant field that is either present-but-constant or entirely absent on every record, so any apparent ordering has no real per-record signal behind it. Case mt-rank-002 is the negative control: genuinely varied importance values that a correctly-behaving backend orders by descending value -- this must NOT be flagged. Case mt-rank-003 is a backend that has a real varying signal but doesn't order by it. Case mt-rank-005 models MemPalace/mempalace PR#1890's `authored_at` timestamp tie-breaker: two records tied on `hybrid_score` (present in metadata for realism, not itself the declared ranking_field) but differentiated only by `authored_at` -- the newer record (larger epoch value) must rank first. See docs/methodology.md and evals/ranking_quality.py for the full scoring logic.",
   "cases": [
     {
       "case_id": "mt-rank-001",
@@ -45,6 +45,16 @@
         {"content": "Had coffee with Alex near the office.", "metadata": {}},
         {"content": "Signed the lease for the new apartment.", "metadata": {}},
         {"content": "Grandmother's health scare, went to the hospital.", "metadata": {}}
+      ]
+    },
+    {
+      "case_id": "mt-rank-005",
+      "session_id": "ranking-session-5",
+      "query": "wake me up with my recent important memories",
+      "ranking_field": "authored_at",
+      "records": [
+        {"content": "Filed the annual tax return.", "metadata": {"hybrid_score": "0.72", "authored_at": "1700000000"}},
+        {"content": "Watered the office plants.", "metadata": {"hybrid_score": "0.72", "authored_at": "1650000000"}}
       ]
     }
   ]
