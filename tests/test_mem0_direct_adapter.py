@@ -10,15 +10,20 @@ Two distinct layers are tested here, deliberately kept separate:
    shaping, corruption_signal derivation) is correct given a response
    shape -- they do NOT touch the real `mem0ai` package at all.
 
-2. **Real-package regression tests** -- the embedder-dims-forwarding and
-   redis/valkey vector=None-guard tests import and exercise the actual,
-   installed `mem0.embeddings.*`/`mem0.vector_stores.*` classes directly
-   (mocking only each vendor's own network/model-load boundary: `boto3`,
-   the `openai`/`google.genai` SDK clients, `fastembed.TextEmbedding`, the
-   `redis`/`valkey` wire clients). These are what let this build honestly
-   claim mem0ai/mem0#5671, #4362, #4711, and #2304 are confirmed fixed in
-   the currently pinned `mem0ai` version, not just "the GitHub issue says
-   merged" -- see mem0_direct_adapter.py's module docstring.
+2. **Real-package regression tests** -- the embedder-dims-forwarding,
+   redis/valkey vector=None-guard, qdrant dimension-sizing, and
+   score_and_rank/VectorStoreBase threshold-contract tests import and
+   exercise the actual, installed `mem0.embeddings.*`/`mem0.vector_stores.*`/
+   `mem0.configs.vector_stores.*`/`mem0.utils.scoring` classes and functions
+   directly (mocking only each vendor's own network/model-load boundary:
+   `boto3`, the `openai`/`google.genai` SDK clients, `fastembed.TextEmbedding`,
+   the `redis`/`valkey`/`qdrant_client` wire clients). These are what let
+   this build honestly claim mem0ai/mem0#5671, #4362, #4711, #2304, and
+   #4453 are confirmed fixed in the currently pinned `mem0ai` version (not
+   just "the GitHub issue says merged"), and, just as importantly, that
+   #4297's dimension-mismatch bug class is confirmed STILL REACHABLE in
+   the same version -- see mem0_direct_adapter.py's module docstring for
+   the full, honest breakdown of which is which.
 
 Layer 2 requires the optional `mem0-direct` dependency group
 (`pip install -e ".[dev,mem0-direct]"`) -- `pytest.importorskip` below
@@ -48,6 +53,7 @@ pytest.importorskip("google.genai")
 pytest.importorskip("fastembed")
 pytest.importorskip("redis")
 pytest.importorskip("valkey")
+pytest.importorskip("qdrant_client")
 
 from memtrust.adapters.base import (  # noqa: E402
     BackendAPIError,
@@ -119,10 +125,12 @@ class _FakeMemory:
         self.add_calls.append({"messages": messages, "user_id": user_id, "metadata": metadata})
         return {"results": [{"id": "mem-1", "memory": str(messages), "event": "ADD"}]}
 
-    def search(self, query: str, *, filters=None, top_k=5) -> dict[str, object]:
+    def search(self, query: str, *, filters=None, top_k=5, threshold=None) -> dict[str, object]:
         if self.raise_on_search:
             raise self.raise_on_search
-        self.search_calls.append({"query": query, "filters": filters, "top_k": top_k})
+        self.search_calls.append(
+            {"query": query, "filters": filters, "top_k": top_k, "threshold": threshold}
+        )
         return {
             "results": [
                 {
@@ -174,16 +182,35 @@ def test_query_parses_records_and_reports_not_applicable_conflict_signal() -> No
     assert result.records[0].content == "My dog is named Baxter."
     assert result.conflict_signal == ConflictSignal.NOT_APPLICABLE
     assert fake.search_calls == [
-        {"query": "what is my dog's name?", "filters": {"user_id": "session-1"}, "top_k": 5}
+        {
+            "query": "what is my dog's name?",
+            "filters": {"user_id": "session-1"},
+            "top_k": 5,
+            "threshold": None,
+        }
     ]
 
 
 def test_query_wraps_vendor_exception_in_backend_api_error() -> None:
     fake = _FakeMemory()
-    fake.raise_on_search = RuntimeError("qdrant unreachable")
+    fake.raise_on_search = RuntimeError("vector store unreachable")
     adapter = Mem0DirectAdapter(memory=fake)
     with pytest.raises(BackendAPIError):
         adapter.query("session-1", "query")
+
+
+def test_query_forwards_threshold_to_memory_search() -> None:
+    """mem0ai/mem0#4453 reachability: this adapter's own `threshold`
+    parameter must reach the real `Memory.search()` call, the same way
+    `Mem0SelfHostedAdapter.query()`'s `threshold` reaches `SearchRequest`
+    over REST. See module docstring for what this build confirmed about
+    #4453 against the installed package (the bug class does not currently
+    reproduce -- this test only proves the parameter is plumbed through).
+    """
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)
+    adapter.query("session-1", "what is my dog's name?", threshold=0.6)
+    assert fake.search_calls[-1]["threshold"] == 0.6
 
 
 def test_update_full_content_reports_clean_and_calls_memory_update_with_text() -> None:
@@ -324,7 +351,7 @@ def test_rejects_unsupported_embedder_provider(monkeypatch: pytest.MonkeyPatch) 
 
 def test_rejects_unsupported_vector_store_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
-    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "qdrant")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "pinecone")
     monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "redis://localhost:6379")
     with pytest.raises(BackendAPIError, match="unsupported vector_store_provider"):
         Mem0DirectAdapter()
@@ -332,7 +359,7 @@ def test_rejects_unsupported_vector_store_provider(monkeypatch: pytest.MonkeyPat
 
 def test_supported_provider_tuples_match_the_bugs_this_adapter_targets() -> None:
     assert SUPPORTED_EMBEDDER_PROVIDERS == ("openai", "aws_bedrock", "gemini", "fastembed")
-    assert SUPPORTED_VECTOR_STORE_PROVIDERS == ("redis", "valkey")
+    assert SUPPORTED_VECTOR_STORE_PROVIDERS == ("redis", "valkey", "qdrant")
 
 
 # ---------------------------------------------------------------------------
@@ -619,3 +646,208 @@ def test_real_valkey_vector_store_update_leaves_embedding_untouched_when_vector_
         )
         written_2 = mock_client.hset.call_args.kwargs["mapping"]
         assert "embedding" in written_2
+
+
+# ---------------------------------------------------------------------------
+# Qdrant support: adapter-level config-building tests for
+# vector_store_provider="qdrant" -- see mem0_direct_adapter.py's module
+# docstring for the #4297/#4453 findings these exist to make reachable.
+# ---------------------------------------------------------------------------
+
+
+def test_qdrant_vector_store_config_threads_embedder_dims_into_embedding_model_dims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defensive pattern this adapter already uses for redis/valkey
+    (see _build_vector_store_config) applies identically to qdrant: the
+    resolved embedder dimension is threaded into `embedding_model_dims`
+    explicitly, so this adapter never relies on QdrantConfig's own 1536
+    default -- see the #4297 finding in the module docstring.
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "qdrant")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "http://localhost:6333")
+
+    adapter = Mem0DirectAdapter()
+
+    vector_store_config = adapter._config_dict["vector_store"]["config"]  # type: ignore[index]
+    assert vector_store_config["embedding_model_dims"] == 384  # fastembed's default
+    assert vector_store_config["url"] == "http://localhost:6333"
+    assert adapter._config_dict["vector_store"]["provider"] == "qdrant"  # type: ignore[index]
+
+
+def test_qdrant_vector_store_url_env_var_is_provider_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEM0_DIRECT_QDRANT_URL (the provider-specific fallback) works the
+    same way MEM0_DIRECT_REDIS_URL/MEM0_DIRECT_VALKEY_URL already do.
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "qdrant")
+    monkeypatch.delenv("MEM0_DIRECT_VECTOR_STORE_URL", raising=False)
+    monkeypatch.setenv("MEM0_DIRECT_QDRANT_URL", "http://qdrant.internal:6333")
+
+    adapter = Mem0DirectAdapter()
+
+    vector_store_config = adapter._config_dict["vector_store"]["config"]  # type: ignore[index]
+    assert vector_store_config["url"] == "http://qdrant.internal:6333"
+
+
+# ---------------------------------------------------------------------------
+# Real-package regression: mem0ai/mem0#4297 (embedding-dimension mismatch).
+# Exercises the actual installed mem0.vector_stores.qdrant.Qdrant and
+# mem0.configs.vector_stores.qdrant.QdrantConfig classes directly (mocking
+# only the QdrantClient wire boundary), not a memtrust reimplementation.
+# See module docstring's "Qdrant support" section for the full finding:
+# this bug class is confirmed STILL REACHABLE in the installed Python
+# package -- unlike #5671/#4362/#4711/#2304 above, this is not a PASS.
+# ---------------------------------------------------------------------------
+
+
+def test_real_qdrant_config_defaults_embedding_model_dims_to_1536() -> None:
+    """Pins the exact field default that makes the #4297 bug class possible
+    in the installed mem0ai==2.0.12 Python package: QdrantConfig.
+    embedding_model_dims defaults to 1536 -- OpenAI's dimension -- the same
+    hardcoded value #4297's TS SDK fix removed for the equivalent JS
+    config. If a future mem0ai release changes this default (or starts
+    deriving it from the embedder), this test fails loudly, which is the
+    signal to revisit the module docstring's #4297 finding.
+    """
+    from mem0.configs.vector_stores.qdrant import QdrantConfig
+
+    config = QdrantConfig(path="/tmp/memtrust-qdrant-config-test")
+    assert config.embedding_model_dims == 1536
+
+
+def test_real_qdrant_store_creates_default_1536_collection_when_dims_not_overridden() -> None:
+    """Reproduces the #4297 bug-class mechanism against the real, installed
+    Qdrant vector store: constructing it with QdrantConfig's own 1536
+    default (i.e. what happens if a caller doesn't override
+    embedding_model_dims for a non-OpenAI embedder) creates a Qdrant
+    collection sized 1536 -- the wrong size for, e.g., fastembed's 384-dim
+    model. This is the exact "Bad Request on insert" setup #4297 describes,
+    reproduced against the real, installed mem0ai package with only the
+    QdrantClient wire boundary mocked.
+    """
+    from mem0.vector_stores.qdrant import Qdrant
+    from qdrant_client.models import VectorParams
+
+    mock_client = MagicMock()
+    mock_client.get_collections.return_value.collections = []
+
+    Qdrant(collection_name="test_default_dims", embedding_model_dims=1536, client=mock_client)
+
+    create_kwargs = mock_client.create_collection.call_args.kwargs
+    vectors_config = create_kwargs["vectors_config"]
+    assert isinstance(vectors_config, VectorParams)
+    assert vectors_config.size == 1536
+
+
+def test_real_qdrant_vector_store_creates_correct_size_collection_when_dims_are_explicit() -> None:
+    """Same real Qdrant class, but with the dimension a non-OpenAI embedder
+    (fastembed, 384-dim) would actually produce, threaded through
+    explicitly -- exactly what Mem0DirectAdapter._build_vector_store_config
+    does for vector_store_provider="qdrant" (see the adapter-level tests
+    above). Proves the collection is created at the *correct* size once a
+    caller supplies the real dims, instead of silently trusting the 1536
+    default -- this is what keeps Mem0DirectAdapter itself from hitting the
+    bug in practice, even though the bug class remains reachable through
+    the raw mem0ai package (see the test above).
+    """
+    from mem0.vector_stores.qdrant import Qdrant
+    from qdrant_client.models import VectorParams
+
+    mock_client = MagicMock()
+    mock_client.get_collections.return_value.collections = []
+
+    Qdrant(collection_name="test_384_dims", embedding_model_dims=384, client=mock_client)
+
+    create_kwargs = mock_client.create_collection.call_args.kwargs
+    vectors_config = create_kwargs["vectors_config"]
+    assert isinstance(vectors_config, VectorParams)
+    assert vectors_config.size == 384
+
+
+# ---------------------------------------------------------------------------
+# Real-package regression: mem0ai/mem0#4453 (search-threshold inversion).
+# Exercises the actual installed mem0.vector_stores.base.VectorStoreBase
+# contract and mem0.utils.scoring.score_and_rank -- the real function
+# Memory._search_vector_store() calls to apply `threshold` -- not a
+# memtrust reimplementation. See module docstring's "Qdrant support"
+# section: this bug class is confirmed FIXED in the installed package.
+# ---------------------------------------------------------------------------
+
+
+def test_real_vector_store_base_documents_the_similarity_score_contract() -> None:
+    """Pins the exact fix that closes mem0ai/mem0#4453 in the installed
+    mem0ai==2.0.12 package: VectorStoreBase.search()'s docstring now states
+    a binding contract every vector-store implementation must follow --
+    always return similarity scores where higher is better, converting
+    from a raw distance metric before returning. This is a documented
+    interface contract, not an accident -- if a future mem0ai release
+    weakens or removes this docstring, this test fails loudly.
+    """
+    from mem0.vector_stores.base import VectorStoreBase
+
+    doc = VectorStoreBase.search.__doc__ or ""
+    assert "higher values" in doc
+    assert "indicate greater similarity" in doc
+
+
+def test_real_score_and_rank_keeps_closest_matches_and_drops_farthest() -> None:
+    """Exercises the real, installed mem0.utils.scoring.score_and_rank with
+    already-similarity-scored candidates (the contract every vector store
+    must satisfy per VectorStoreBase.search() above) and confirms it keeps
+    candidates at/above threshold, drops those below, and ranks best-first
+    by that same higher-is-better score -- i.e. genuine similarity
+    semantics, not the inverted "lower score = closer, keep it" semantics
+    #4453 originally described.
+    """
+    from mem0.utils.scoring import score_and_rank
+
+    candidates = [
+        {"id": "close", "score": 0.92, "payload": {"data": "close match"}},
+        {"id": "mid", "score": 0.55, "payload": {"data": "mid match"}},
+        {"id": "far", "score": 0.10, "payload": {"data": "far match"}},
+    ]
+    results = score_and_rank(
+        semantic_results=candidates, bm25_scores={}, entity_boosts={}, threshold=0.5, top_k=10
+    )
+    kept_ids = {r["id"] for r in results}
+    assert kept_ids == {"close", "mid"}
+    assert "far" not in kept_ids
+    assert results[0]["id"] == "close"  # best (highest score) ranked first
+
+
+def test_hypothetical_raw_distance_scores_would_invert_threshold_filtering() -> None:
+    """Negative/hypothetical case, deliberately NOT a claim about any real
+    installed vector store: if a store violated VectorStoreBase.search()'s
+    documented contract and returned raw distance (lower = closer/better)
+    instead of similarity, the real, installed score_and_rank's
+    `if semantic_score < threshold: continue` would silently keep only the
+    *worst* (most distant) matches and drop the *best* (closest) ones --
+    the exact inversion mem0ai/mem0#4453 originally described. Every real
+    vector store this build inspected (see module docstring) complies with
+    the contract, so this specific failure is not reachable through any
+    adapter this repo ships today; this test exists only to make the
+    contract's importance concrete against the real scoring function, not
+    to claim the bug reproduces live anywhere.
+    """
+    from mem0.utils.scoring import score_and_rank
+
+    raw_distance_candidates = [
+        {"id": "actually_close", "score": 0.05, "payload": {"data": "closest (small distance)"}},
+        {"id": "actually_far", "score": 0.95, "payload": {"data": "farthest (large distance)"}},
+    ]
+    results = score_and_rank(
+        semantic_results=raw_distance_candidates,
+        bm25_scores={},
+        entity_boosts={},
+        threshold=0.5,
+        top_k=10,
+    )
+    kept_ids = {r["id"] for r in results}
+    # If scores were misinterpreted as similarity, the CLOSEST real match
+    # (raw distance 0.05) is wrongly dropped and the FARTHEST (0.95) kept.
+    assert kept_ids == {"actually_far"}
+    assert "actually_close" not in kept_ids

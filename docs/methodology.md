@@ -445,7 +445,7 @@ relying on its output.
 |---|---|---|---|
 | `mem0_adapter.py` (`Mem0Adapter`, hosted Platform API) | **High** | `MemoryClient(api_key=...)` reading `MEM0_API_KEY`, `.add()`/`.search()`/`.update()` method names and behavior, confirmed via docs.mem0.ai and the June 2026 SDK v2.0.8 release notes. Mem0's internal ADD/UPDATE/DELETE memory-pipeline decision is documented vendor behavior. | Exact REST path strings (`/v1/memories/`, `/v1/memories/search/`) are a best-effort reconstruction of what the documented SDK wraps, not copied from an OpenAPI spec. |
 | `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
-| `mem0_direct_adapter.py` (`Mem0DirectAdapter`, direct in-process library, embedder/vector-store selection) | **High on what the installed `mem0ai==2.0.12` package's code actually does (confirmed by reading its real, installed source, not documentation or the GitHub issues), Low on live end-to-end behavior** | Every embedder-dims-forwarding and vector-store vector=None-guard claim below was confirmed by reading the *installed* `mem0.embeddings.{aws_bedrock,fastembed,gemini,openai}.py` and `mem0.vector_stores.{redis,valkey}.py` source directly, and `tests/test_mem0_direct_adapter.py` exercises those real classes with only the vendor SDK/wire-client boundary mocked (`boto3`, `openai`, `google.genai`, `fastembed.TextEmbedding`, `redis`/`valkey`) -- see "Mem0DirectAdapter and the retired Kuzu bug" below for the full finding, including the one surprising negative result (`graph_store`/Kuzu support does not exist in this package version at all). | Never run against a live Redis/Valkey server, a live Bedrock/Gemini/OpenAI embedding endpoint, or a live FastEmbed model download in this environment -- every test mocks the vendor boundary, same convention this document already states for `mem0_adapter.py`. `_read_raw_embedding_bytes()`'s raw-client inspection (used by `update_metadata_only()` to derive `CorruptionSignal.CLEAN`/`VECTOR_ZEROED`) reaches into each vector store's private-ish `schema`/`prefix`/`client` attributes rather than a documented public API, since `VectorStoreBase.get()` does not expose raw vector bytes at all -- confirmed by reading the base class, but still an internals-reaching workaround that could break on a future `mem0ai` release's internal refactor (it would fail closed, into `NOT_APPLICABLE`, not silently misreport). |
+| `mem0_direct_adapter.py` (`Mem0DirectAdapter`, direct in-process library, embedder/vector-store selection) | **High on what the installed `mem0ai==2.0.12` package's code actually does (confirmed by reading its real, installed source, not documentation or the GitHub issues), Low on live end-to-end behavior** | Every embedder-dims-forwarding and vector-store vector=None-guard claim below was confirmed by reading the *installed* `mem0.embeddings.{aws_bedrock,fastembed,gemini,openai}.py` and `mem0.vector_stores.{redis,valkey,qdrant}.py` source directly, and `tests/test_mem0_direct_adapter.py` exercises those real classes with only the vendor SDK/wire-client boundary mocked (`boto3`, `openai`, `google.genai`, `fastembed.TextEmbedding`, `redis`/`valkey`/`qdrant_client`) -- see "Mem0DirectAdapter and the retired Kuzu bug" and "Qdrant support: #4297 and #4453" below for the full findings, including two surprising results: `graph_store`/Kuzu support does not exist in this package version at all, and #4297's dimension-mismatch bug class is confirmed **still reachable** (not fixed) in the installed Qdrant path, even though its companion bug #4453 (threshold inversion) is confirmed fixed comprehensively across every vector store. | Never run against a live Redis/Valkey/Qdrant server, a live Bedrock/Gemini/OpenAI embedding endpoint, or a live FastEmbed model download in this environment -- every test mocks the vendor boundary, same convention this document already states for `mem0_adapter.py`. `_read_raw_embedding_bytes()`'s raw-client inspection (used by `update_metadata_only()` to derive `CorruptionSignal.CLEAN`/`VECTOR_ZEROED`) reaches into each vector store's private-ish `schema`/`prefix`/`client` attributes rather than a documented public API, since `VectorStoreBase.get()` does not expose raw vector bytes at all -- confirmed by reading the base class, but still an internals-reaching workaround that could break on a future `mem0ai` release's internal refactor (it would fail closed, into `NOT_APPLICABLE`, not silently misreport). The #4297 finding was confirmed by mocking `QdrantClient` and inspecting the `VectorParams(size=...)` passed to `create_collection` -- never against a real running Qdrant server, so nothing here demonstrates the actual "Bad Request on insert" HTTP response a live server would return. |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
 | `zep_graphiti_selfhosted_adapter.py` (`ZepGraphitiSelfHostedAdapter`, self-hosted `graphiti-core`) | **Medium on wire-level shape, Low on live end-to-end behavior** | Every `graphiti_core` constructor/method signature this adapter calls (`Graphiti(uri=, user=, password=)`, `Graphiti(graph_driver=)`, `FalkorDriver(host=, port=, username=, password=)`, `add_episode(name=, episode_body=, source_description=, reference_time=, group_id=, update_communities=)` returning an `AddEpisodeResults` with an `.episode.uuid`, `search(query, group_ids=, num_results=)` returning `list[EntityEdge]` directly, `remove_episode(episode_uuid)`) was confirmed by fetching the real source files from `getzep/graphiti`'s `main` branch on GitHub (`raw.githubusercontent.com/getzep/graphiti/main/...`) on 2026-07-16 and reading them directly -- not reconstructed from documentation. The four bug citations this adapter's module docstring makes (getzep/graphiti#1302, #836, #1013, #1001) were confirmed the same way: #1302's per-character `O`/`R`/`N`/`T`/`A`/`D` escape-map entries and #836's `communities, community_edges = await semaphore_gather(...)` unpack-of-a-list-of-2-tuples were read verbatim out of `helpers.py`/`graphiti.py`/`community_operations.py` on `main`; #1013's fix (`SET e = edge` replacing an enumerated field list in the Neo4j bulk edge-save query -- Neo4j is the default case in `get_entity_edge_save_bulk_query()`; FalkorDB's own branch of the same function uses the equivalent `SET r = edge`) and #1001's closure (FalkorDB's old `add_triplet()` no longer exists anywhere in the rewritten `falkordb_driver.py`) were confirmed the same way. | The real `graphiti-core` package is not installed in this build environment, and no Neo4j or FalkorDB instance was started or reached during this build -- every signature above was confirmed by reading source, never by importing and calling the real package or a live database. This adapter's own unit tests (`tests/test_adapters.py`) mock a `graphiti_core`-shaped Protocol double, the same convention `mempalace_adapter.py`'s `_PalaceProtocol` already establishes. The `update_communities` toggle is confirmed to thread through to `add_episode()` (and is unit-tested doing so), but nothing in this build can demonstrate it actually triggers #836's `ValueError` without a live instance and real LLM credentials driving entity extraction. `lucene_sanitize()` (#1302) is internal to graphiti-core's search pipeline and is not called anywhere in this adapter's own code -- fixture case `mt-contra-006` (see below) only sets up a query a contributor with a live instance could use to observe the ranking degradation directly, it does not reproduce the bug in this repo's own test suite. `EDGE_INTEGRITY_VIOLATION` (#1013/#1001) is checked at the harness level in `evals/contradiction.py`, but both underlying bugs are confirmed fixed/closed on the `graphiti-core` version this adapter was built against, so a live run today should not actually trigger it. |
 | `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** The `importance`/`emotional_weight`/`weight` metadata keys `_classify_ranking_signal()` checks (see the Ranking-Quality eval above) are the same LOW-confidence category: they come from mempalace/mempalace#1733's own root-cause report on `layers.py`, not a confirmed field-name reference for what `recall()`'s response `metadata` actually contains on a live instance. |
@@ -551,32 +551,52 @@ scopes to, and is called out here as unfinished rather than silently left out. S
 table above and `mem0_adapter.py`'s module docstring for exactly what was and was not confirmed
 against live source.
 
+**Update (2026-07-16): #4297 and #4453 now have a genuine construction-time parameter surface,
+via `Mem0DirectAdapter`'s `vector_store_provider="qdrant"` support, not `Mem0SelfHostedAdapter`.**
+`vector_store` provider/config selection was never reachable through either REST adapter's HTTP
+surface to begin with (see "Why `Mem0DirectAdapter` exists" below) -- `Mem0SelfHostedAdapter`'s
+`threshold` parameter reaches the self-hosted server's *own* threshold filtering, not the
+vector-store-level scoring #4453 actually concerns. `Mem0DirectAdapter` now wires up
+`vector_store_provider="qdrant"` (in addition to the `redis`/`valkey` support this document
+already covered) plus a `query(threshold=...)` parameter that forwards to the real, installed
+`mem0.Memory.search()`. See "Qdrant support: #4297 and #4453" below for what this build actually
+confirmed against the installed Python package for each: #4297's bug class is confirmed **still
+present and reachable** (not fixed) in the installed Qdrant vector-store config; #4453 is confirmed
+**fixed**, comprehensively, across every vector store the installed package ships, not just Qdrant.
+
 **Why `Mem0DirectAdapter` exists, and the retired Kuzu bug it could not reproduce.** Neither
 `Mem0Adapter` nor `Mem0SelfHostedAdapter` can select a `graph_store`, `embedder`, or
 `vector_store` *provider* -- those are construction-time Python config
 (`MemoryConfig(embedder=..., vector_store=..., graph_store=...)`), not REST parameters either
-adapter's HTTP surface exposes. Five real, cited mem0 bug reports trace to exactly that
+adapter's HTTP surface exposes. Seven real, cited mem0 bug reports trace to exactly that
 unreachable configuration surface: mem0ai/mem0#3558 (Kuzu graph store raising `ValueError` on a
 bad `embedding_dims`), #5671 (AWS Bedrock not forwarding `embedding_dims`), #4362 (Redis/Valkey
 silently zeroing a vector on a metadata-only update), #4711 (FastEmbed defaulting to a hardcoded
-1536 instead of the loaded model's real dimension), and #2304 (Gemini/OpenAI silently dropping
-`embedding_dims`). `Mem0DirectAdapter` (`mem0_direct_adapter.py`) holds a direct, in-process
+1536 instead of the loaded model's real dimension), #2304 (Gemini/OpenAI silently dropping
+`embedding_dims`), #4297 (a vector-store collection created at a hardcoded/default 1536-dim size
+regardless of the actual embedder's output dimension), and #4453 (search-threshold filtering
+assuming similarity when a vector store returns raw distance, silently inverting which results
+pass). `Mem0DirectAdapter` (`mem0_direct_adapter.py`) holds a direct, in-process
 `mem0.Memory` handle via `Memory.from_config()` specifically to make that configuration surface
 reachable, gated on `MEM0_DIRECT_EMBEDDER_PROVIDER` and not included in `cli.ALL_BACKENDS` --
 same opt-in-only precedent as `Mem0SelfHostedAdapter` above, since this adapter targets a
 self-assembled in-process stack rather than a single hosted vendor API.
 
-Of the five, **four are confirmed fixed in the installed `mem0ai==2.0.12` package** (the newest
+Of the seven, **five are confirmed fixed in the installed `mem0ai==2.0.12` package** (the newest
 version on PyPI as of this build, 2026-07-16) by reading that package's actual source, not by
 trusting the GitHub issues' "merged" status: `aws_bedrock.py` forwards `embedding_dims` into the
 Bedrock Titan V2 request body (#5671); `fastembed.py`'s `FastEmbedEmbedding` reads
 `self.dense_model.embedding_size` at init instead of defaulting to 1536 (#4711); `gemini.py` and
-`openai.py` both forward `embedding_dims` into their respective embed calls (#2304); and
+`openai.py` both forward `embedding_dims` into their respective embed calls (#2304);
 `redis.py`/`valkey.py` both guard `if vector is not None:` before overwriting the stored
-`"embedding"` field (#4362). `tests/test_mem0_direct_adapter.py` exercises the real, installed
-classes for all four directly (mocking only each vendor's network/model-load boundary), so a
-regression that reintroduced any of them in a future `mem0ai` release would fail those tests
-against the *installed* package -- this is what justifies re-validating all four as PASS against
+`"embedding"` field (#4362); and #4453 (search-threshold inversion) is fixed comprehensively
+across every vector store the installed package ships, not just the ones this adapter wires up
+(see "Qdrant support: #4297 and #4453" below). **One, #4297 (dimension mismatch), is confirmed
+still present and reachable, not fixed**, in the installed Qdrant vector-store config -- also see
+that section below. `tests/test_mem0_direct_adapter.py` exercises the real, installed classes for
+all six directly (mocking only each vendor's network/model-load boundary), so a regression that
+reintroduced any of the five fixed ones in a future `mem0ai` release would fail those tests
+against the *installed* package -- this is what justifies re-validating those five as PASS against
 the currently pinned `mem0ai` version, not just restating the issue tracker.
 
 **#3558 (Kuzu) could not be reproduced, and this was the one genuinely surprising finding of this
@@ -605,6 +625,69 @@ against `mem0_direct` should not conclude mem0ai/mem0#3558 itself was reproduced
 no-op) is what this adapter can demonstrate against the currently installed package. See
 `mem0_direct_adapter.py`'s module docstring and `CorruptionSignal.CONFIG_REJECTED`'s docstring
 in `base.py` for the same caveat stated where the code itself lives.
+
+**Qdrant support: #4297 and #4453 (added 2026-07-16).** `Mem0DirectAdapter` now also wires up
+`vector_store_provider="qdrant"` (alongside the existing `redis`/`valkey` support above), gated
+on `MEM0_DIRECT_VECTOR_STORE_URL`/`MEM0_DIRECT_QDRANT_URL` the same way, and `query()` now accepts
+an optional `threshold` keyword argument forwarded straight through to the real, installed
+`mem0.Memory.search()`. This was built specifically to give mem0ai/mem0#4297 (embedding-dimension
+mismatch -- a `Bad Request` on insert when a vector-store collection is sized for OpenAI's
+1536-dim embeddings but the actual embedder produces a different dimension) and its companion bug
+#4453 (search-threshold inversion -- filtering assumes similarity, higher-is-better, when a
+vector store actually returns raw distance, lower-is-better) a genuine, construction-time
+parameter surface to reach, following the same "add the config surface, then read the real
+installed source to find out what it actually does" method already used for #5671/#4362/#4711/
+#2304 above. **The two verdicts landed differently, and this is the honest result, not the
+convenient one:**
+
+- **#4297 (dimension mismatch) is confirmed still present and reachable in the installed
+  `mem0ai==2.0.12` package -- it is not fixed.** `mem0/configs/vector_stores/qdrant.py`'s
+  `QdrantConfig.embedding_model_dims` field defaults to `1536` (OpenAI's dimension), and nothing
+  in `mem0/memory/main.py`'s `Memory.__init__`/`Memory.from_config()` reconciles that default
+  against the embedder's actual output dimension -- `EmbedderFactory.create(...)` and
+  `VectorStoreFactory.create(...)` are built independently, from `config.embedder.config` and
+  `config.vector_store.config` respectively, with no cross-check between them anywhere in the
+  installed source. `tests/test_mem0_direct_adapter.py` reproduces the mechanism against the real,
+  installed `mem0.vector_stores.qdrant.Qdrant` class directly (mocking only the `QdrantClient`
+  wire boundary, never a live server): constructing it with the config's own 1536 default creates
+  a Qdrant collection sized 1536 regardless of what embedder is actually in use, the same
+  "hardcoded 1536" shape #4297's TS SDK fix removed for the equivalent JS config. `Mem0DirectAdapter`
+  itself never hits this in practice -- `_build_vector_store_config()` always threads the resolved
+  embedder dimension into `embedding_model_dims` explicitly, the same defensive pattern already
+  used for `redis`/`valkey` -- but that is a property of this adapter's own config-building code,
+  not evidence the bug is fixed upstream. A caller constructing `mem0.Memory.from_config()`
+  directly, without this adapter, remains exposed to it today.
+- **#4453 (search-threshold inversion) is confirmed fixed in the installed package, and
+  comprehensively, not just for Qdrant.** `mem0/vector_stores/base.py`'s
+  `VectorStoreBase.search()` docstring states an explicit, binding interface contract: every
+  vector-store implementation must return similarity scores where higher is better, converting
+  from a raw distance metric before returning (`max(0, 1-distance)` for cosine, `1/(1+distance)`
+  for L2). Every vector-store implementation this build inspected in the installed package
+  complies -- `chroma.py`, `faiss.py`, `milvus.py`, `pgvector.py`, `redis.py`, `valkey.py`,
+  `supabase.py`, `turbopuffer.py`, `vertex_ai_vector_search.py`, and `s3_vectors.py` all convert a
+  raw distance to a similarity-shaped score before returning it; `qdrant.py`, `pinecone.py`,
+  `weaviate.py`, `opensearch.py`, `elasticsearch.py`, `azure_ai_search.py`, and `mongodb.py`
+  return each vendor's own already-higher-is-better native score directly, with no conversion
+  needed. `mem0/utils/scoring.py`'s `score_and_rank()` -- the real function
+  `Memory._search_vector_store()` calls to apply `threshold` -- filters with
+  `if semantic_score < threshold: continue`, which is only correct because every store's `score`
+  is already similarity-oriented by the time it reaches that function.
+  `tests/test_mem0_direct_adapter.py` exercises `score_and_rank()` directly (the real, installed
+  function, not a memtrust reimplementation) with similarity-shaped candidates and confirms it
+  keeps the closest matches and drops the farthest, plus a separate, clearly-labeled hypothetical
+  test showing what *would* happen if a store violated the contract and returned raw distance
+  instead (the best match gets dropped and the worst kept -- the literal inversion #4453
+  originally described) to make the contract's importance concrete without claiming any real,
+  installed store actually violates it.
+
+**What this build did not, and could not, verify for either bug.** No real Qdrant server (local or
+remote) was ever started or reached in this environment -- every Qdrant-related test mocks
+`QdrantClient` at the wire boundary, so nothing here demonstrates the actual `Bad Request` HTTP
+response a live server returns on a dimension mismatch, or confirms end-to-end that a real insert
+against a live collection fails the way #4297 describes. The `mem0ai==2.0.12` PyPI release is the
+newest available as of this build (2026-07-16, confirmed via `pip index versions mem0ai`) --
+whether the maintainers have since patched #4297 in an unreleased `main`-branch commit is not
+something this build's installed-package inspection can see.
 
 **Why MemPalace's "configuration" is a storage path, not an API key.** MemPalace is genuinely
 local-first and documented as requiring no API key at all. Forcing it to read a fake API key
