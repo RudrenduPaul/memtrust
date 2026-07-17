@@ -20,6 +20,7 @@ from memtrust.adapters.base import (
     ConflictSignal,
     DeleteResult,
     EmbeddingDriftSignal,
+    ExtractionQualitySignal,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -51,6 +52,15 @@ from memtrust.evals.embedding_drift import (
 )
 from memtrust.evals.embedding_drift import (
     load_dataset as load_embedding_drift_dataset,
+)
+from memtrust.evals.extraction_quality import (
+    ExtractionQualityCase,
+    classify_extraction_case,
+    classify_feedback_loop_case,
+    run_extraction_quality_eval,
+)
+from memtrust.evals.extraction_quality import (
+    load_dataset as load_extraction_quality_dataset,
 )
 from memtrust.evals.locomo import load_dataset as load_locomo_dataset
 from memtrust.evals.locomo import load_exclude_question_ids as load_locomo_exclude_question_ids
@@ -510,6 +520,126 @@ class EmbeddingDriftCleanFakeAdapter(MemoryBackendAdapter):
 
     def delete(self, memory_id: str) -> DeleteResult:
         return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+
+class NoExtractionGateFakeAdapter(MemoryBackendAdapter):
+    """Retains every stored item indiscriminately and returns everything
+    stored under a session on every query, regardless of content -- models
+    a backend with no effective extraction-quality gate at all, matching
+    mem0's real reported behavior per mem0ai/mem0#4573 (jamebobob's audit
+    found 97.8% of 10,134 stored entries were junk that should never have
+    been kept). Also used as the negative control for the feedback-loop
+    duplication tests: a plain store() call here always adds exactly one
+    record, so re-storing recalled text should never trigger unexpected
+    growth."""
+
+    name = "fake-no-extraction-gate"
+    env_var = "FAKE_API_KEY"
+
+    def __init__(self) -> None:
+        self._store: dict[str, list[MemoryRecord]] = {}
+        self._counter = 0
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        self._counter += 1
+        memory_id = f"m{self._counter}"
+        record = MemoryRecord(memory_id=memory_id, content=content, metadata=metadata or {})
+        self._store.setdefault(session_id, []).append(record)
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        records = self._store.get(session_id, [])[:top_k]
+        return QueryResult(
+            records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+
+class GatedExtractionFakeAdapter(NoExtractionGateFakeAdapter):
+    """Models a backend WITH an extraction-quality gate: refuses to
+    persist any item whose `category` metadata (threaded through by
+    `run_extraction_quality_eval` -- see evals/extraction_quality.py)
+    names a junk category. This is a stand-in for "a backend that
+    correctly filters junk," not a claim about any real vendor's actual
+    LLM-driven extraction pipeline -- no adapter in this repo talks to a
+    live one. Its purpose is to prove the eval's classification logic
+    correctly credits a backend that filters junk while still retaining
+    valid content."""
+
+    name = "fake-gated-extraction"
+
+    _JUNK_CATEGORIES = frozenset(
+        {
+            "boot_file_restating",
+            "cron_heartbeat_noise",
+            "system_dump",
+            "hallucinated_profile",
+            "other_junk",
+        }
+    )
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        metadata = metadata or {}
+        self._counter += 1
+        memory_id = f"m{self._counter}"
+        if metadata.get("category") in self._JUNK_CATEGORIES:
+            # The gate rejects this item outright -- never persisted, so
+            # it can never come back on a later query().
+            return StoreResult(memory_id=memory_id, latency_ms=0.1)
+        record = MemoryRecord(memory_id=memory_id, content=content, metadata=metadata)
+        self._store.setdefault(session_id, []).append(record)
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+
+class FeedbackLoopDuplicatingFakeAdapter(NoExtractionGateFakeAdapter):
+    """Models jamebobob's exact production mechanism (mem0ai/mem0#4573):
+    the first time a given piece of content is stored it is written once,
+    same as any normal backend -- but if that *exact* content is stored a
+    second time (as happens when previously-recalled content is fed back
+    in and re-extracted), the write fans out into several duplicate
+    records instead of one. This is the generalized shape of his real
+    808-duplicate finding, scaled down to a small, deterministic fanout
+    for a fast unit test."""
+
+    name = "fake-feedback-loop-duplicating"
+
+    #: Number of records a *repeat* store() of the same content produces.
+    #: >1 so the eval's growth check (single re-store adds at most 1
+    #: record) reliably fires in tests -- the real bug produced 808 from
+    #: one call, but the classification logic only cares that growth
+    #: exceeded the expected-per-call maximum, not the exact multiplier.
+    _DUPLICATE_FANOUT = 5
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._seen_content: dict[str, set[str]] = {}
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        seen = self._seen_content.setdefault(session_id, set())
+        is_repeat = content in seen
+        seen.add(content)
+        fanout = self._DUPLICATE_FANOUT if is_repeat else 1
+        first_id = ""
+        for i in range(fanout):
+            self._counter += 1
+            memory_id = f"m{self._counter}"
+            self._store.setdefault(session_id, []).append(
+                MemoryRecord(memory_id=memory_id, content=content, metadata=metadata or {})
+            )
+            if i == 0:
+                first_id = memory_id
+        return StoreResult(memory_id=first_id, latency_ms=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -1904,3 +2034,201 @@ def test_crash_recovery_registered_in_eval_list() -> None:
     from memtrust.cli import ALL_EVALS
 
     assert "crash_recovery" in ALL_EVALS
+
+
+# ---------------------------------------------------------------------------
+# Extraction-quality-at-scale eval -- mem0ai/mem0#4573 (jamebobob)
+# ---------------------------------------------------------------------------
+
+
+def test_extraction_quality_dataset_loads() -> None:
+    cases, feedback_cases = load_extraction_quality_dataset()
+    assert len(cases) == 15
+    assert all(isinstance(c, ExtractionQualityCase) for c in cases)
+    assert len(feedback_cases) == 2
+    junk = [c for c in cases if not c.should_be_stored]
+    valid = [c for c in cases if c.should_be_stored]
+    assert len(junk) == 12
+    assert len(valid) == 3
+    # every one of jamebobob's real junk categories is represented
+    categories = {c.category for c in junk}
+    assert {
+        "boot_file_restating",
+        "cron_heartbeat_noise",
+        "system_dump",
+        "hallucinated_profile",
+    } <= categories
+
+
+def test_extraction_quality_no_gate_backend_retains_junk_at_high_rate() -> None:
+    """The core regression this eval exists to catch: a backend with no
+    extraction-quality gate at all (mem0's real reported behavior per
+    mem0ai/mem0#4573 -- 97.8% of 10,134 stored entries were junk) must
+    show a high junk_retained_rate. This fake retains everything
+    indiscriminately, so every junk case should come back RETAINED_JUNK."""
+    adapter = NoExtractionGateFakeAdapter()
+    result = run_extraction_quality_eval(adapter)
+    assert result.junk_retained_rate == 1.0
+    assert result.junk_rejected_rate == 0.0
+    assert result.valid_retained_rate == 1.0
+    assert result.valid_lost_rate == 0.0
+    junk_results = [c for c in result.case_results if not c.case.should_be_stored]
+    assert junk_results  # sanity: fixture actually has junk cases
+    assert all(c.signal == ExtractionQualitySignal.RETAINED_JUNK for c in junk_results)
+
+
+def test_extraction_quality_gated_backend_rejects_junk_at_low_rate() -> None:
+    """The positive case: a backend with a real extraction-quality gate
+    (here, one keyed off the case's `category` metadata) should show a
+    low junk_retained_rate and a high junk_rejected_rate, while still
+    retaining every genuinely valuable item."""
+    adapter = GatedExtractionFakeAdapter()
+    result = run_extraction_quality_eval(adapter)
+    assert result.junk_retained_rate == 0.0
+    assert result.junk_rejected_rate == 1.0
+    assert result.valid_retained_rate == 1.0
+    assert result.valid_lost_rate == 0.0
+    junk_results = [c for c in result.case_results if not c.case.should_be_stored]
+    assert all(c.signal == ExtractionQualitySignal.REJECTED_JUNK for c in junk_results)
+    valid_results = [c for c in result.case_results if c.case.should_be_stored]
+    assert all(c.signal == ExtractionQualitySignal.RETAINED_VALID for c in valid_results)
+
+
+def test_extraction_quality_over_aggressive_filter_flags_lost_valid() -> None:
+    """The necessary counterweight: a backend that filters everything
+    (including genuinely valuable content) must not be rewarded for a
+    perfect junk_rejected_rate -- it should show a high valid_lost_rate
+    too. A backend that discards every real user's content would score
+    perfectly on junk-rejection alone if this axis didn't exist."""
+
+    class RejectEverythingFakeAdapter(NoExtractionGateFakeAdapter):
+        name = "fake-reject-everything"
+
+        def store(
+            self, session_id: str, content: str, metadata: dict[str, str] | None = None
+        ) -> StoreResult:
+            self._counter += 1
+            return StoreResult(memory_id=f"m{self._counter}", latency_ms=0.1)
+
+    adapter = RejectEverythingFakeAdapter()
+    result = run_extraction_quality_eval(adapter)
+    assert result.junk_rejected_rate == 1.0
+    assert result.valid_lost_rate == 1.0
+    assert result.valid_retained_rate == 0.0
+
+
+def test_extraction_quality_feedback_loop_duplication_fires() -> None:
+    """Reproduces jamebobob's exact 808-duplicate mechanism at small
+    scale: store a seed item, query it back (simulating recall into an
+    agent's context), re-store that exact recalled text as new input, and
+    check whether the record count grew by more than the single re-store
+    call should have added. Must fire FEEDBACK_LOOP_DUPLICATE against a
+    backend whose write path fans a repeat store() out into duplicates."""
+    adapter = FeedbackLoopDuplicatingFakeAdapter()
+    result = run_extraction_quality_eval(adapter)
+    assert result.feedback_loop_results
+    assert result.feedback_loop_duplicate_rate == 1.0
+    for fb_result in result.feedback_loop_results:
+        assert fb_result.error is None
+        assert fb_result.signal == ExtractionQualitySignal.FEEDBACK_LOOP_DUPLICATE
+        assert fb_result.records_after_first_store == 1
+        assert fb_result.records_after_second_store > fb_result.records_after_first_store + 1
+
+
+def test_extraction_quality_feedback_loop_no_duplication_on_clean_backend() -> None:
+    """Negative control: a backend that just stores each call once (no
+    duplication bug) must NOT be flagged -- one seed store plus one
+    re-store legitimately grows the matching count by exactly one."""
+    adapter = NoExtractionGateFakeAdapter()
+    result = run_extraction_quality_eval(adapter)
+    assert result.feedback_loop_results
+    for fb_result in result.feedback_loop_results:
+        assert fb_result.error is None
+        assert fb_result.signal == ExtractionQualitySignal.NO_UNEXPECTED_GROWTH
+        assert fb_result.records_after_second_store == fb_result.records_after_first_store + 1
+
+
+def test_extraction_quality_handles_backend_failure() -> None:
+    adapter = FailingFakeAdapter()
+    result = run_extraction_quality_eval(adapter)
+    assert len(result.case_results) == 15
+    assert all(c.error is not None for c in result.case_results)
+    assert all(c.signal == ExtractionQualitySignal.NOT_APPLICABLE for c in result.case_results)
+    assert len(result.feedback_loop_results) == 2
+    assert all(c.error is not None for c in result.feedback_loop_results)
+    assert all(
+        c.signal == ExtractionQualitySignal.NOT_APPLICABLE for c in result.feedback_loop_results
+    )
+    assert result.junk_retained_rate is None
+    assert result.feedback_loop_duplicate_rate is None
+
+
+def test_classify_extraction_case_retained_junk() -> None:
+    case = ExtractionQualityCase(
+        case_id="t1",
+        session_id="s",
+        query="q",
+        content="Heartbeat check: all systems nominal.",
+        category="cron_heartbeat_noise",
+        should_be_stored=False,
+    )
+    query_result = QueryResult(
+        records=[MemoryRecord(memory_id="m1", content="Heartbeat check: all systems nominal.")],
+        conflict_signal=ConflictSignal.NOT_APPLICABLE,
+        latency_ms=0.1,
+    )
+    signal, retrieved = classify_extraction_case(case, query_result)
+    assert signal == ExtractionQualitySignal.RETAINED_JUNK
+    assert retrieved is True
+
+
+def test_classify_extraction_case_rejected_junk() -> None:
+    case = ExtractionQualityCase(
+        case_id="t2",
+        session_id="s",
+        query="q",
+        content="Heartbeat check: all systems nominal.",
+        category="cron_heartbeat_noise",
+        should_be_stored=False,
+    )
+    query_result = QueryResult(
+        records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, retrieved = classify_extraction_case(case, query_result)
+    assert signal == ExtractionQualitySignal.REJECTED_JUNK
+    assert retrieved is False
+
+
+def test_classify_extraction_case_lost_valid() -> None:
+    case = ExtractionQualityCase(
+        case_id="t3",
+        session_id="s",
+        query="q",
+        content="User prefers async standups.",
+        category="valid_content",
+        should_be_stored=True,
+    )
+    query_result = QueryResult(
+        records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+    )
+    signal, retrieved = classify_extraction_case(case, query_result)
+    assert signal == ExtractionQualitySignal.LOST_VALID
+    assert retrieved is False
+
+
+def test_classify_feedback_loop_case_no_growth_is_clean() -> None:
+    assert classify_feedback_loop_case(1, 1) == ExtractionQualitySignal.NO_UNEXPECTED_GROWTH
+
+
+def test_classify_feedback_loop_case_expected_single_growth_is_clean() -> None:
+    assert classify_feedback_loop_case(1, 2) == ExtractionQualitySignal.NO_UNEXPECTED_GROWTH
+
+
+def test_classify_feedback_loop_case_excess_growth_is_flagged() -> None:
+    assert classify_feedback_loop_case(1, 6) == ExtractionQualitySignal.FEEDBACK_LOOP_DUPLICATE
+
+
+def test_extraction_quality_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "extraction_quality" in ALL_EVALS

@@ -1,0 +1,142 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Modeled on mem0ai/mem0#4573 (GitHub user jamebobob), whose real 32-day production audit found 97.8% of 10,134 stored mem0 entries were junk the extraction pipeline should never have persisted, broken down as boot-file restating (~52.7%), cron/heartbeat noise (~11.5%), system dumps (~8.2%), hallucinated profiles (~5.2%), and a smaller remainder of other junk shapes. This fixture's `cases` array is small (15 hand-written items) and its per-category counts are chosen for coverage, not to statistically reproduce those exact percentages at 10,134-entry scale -- see docs/methodology.md for the honest caveat on what this fixture can and cannot prove. Each case carries a ground-truth `should_be_stored` label memtrust itself assigns (never read from any backend), a `category` tag, a `session_id` unique to that case so cases never contaminate each other's query results, and a `query` used to try to recall the stored content back out. The separate `feedback_loop_cases` array reproduces jamebobob's exact 808-duplicate mechanism: store a seed item, query it back (simulating recall into an agent's context), re-store that exact recalled text as new input, then check whether the matching record count grew by more than the single re-store call should have added. See evals/extraction_quality.py for the full scoring logic.",
+  "cases": [
+    {
+      "case_id": "mt-extract-001",
+      "session_id": "extract-session-1",
+      "query": "what tools and config were loaded this session",
+      "content": "Loaded personality config from ~/.config/agent/persona.md. Initialized 14 tool definitions. Session start: connected to primary LLM backend, model=gpt-4-class, context_window=128000.",
+      "category": "boot_file_restating",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-002",
+      "session_id": "extract-session-2",
+      "query": "what tools and config were loaded this session",
+      "content": "Agent boot sequence: loaded 3 MCP servers (filesystem, browser, shell), restored 22 prior memory entries, persona.md hash unchanged since last session, no config drift detected.",
+      "category": "boot_file_restating",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-003",
+      "session_id": "extract-session-3",
+      "query": "what tools and config were loaded this session",
+      "content": "Startup: environment variables validated, working directory set to /home/user/project, git branch detected as main, initializing 9 registered subagents.",
+      "category": "boot_file_restating",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-004",
+      "session_id": "extract-session-4",
+      "query": "what tools and config were loaded this session",
+      "content": "System prompt loaded (4,821 tokens). Tool schema cache warm. Reconnected to vector store at localhost:6333. No pending migrations.",
+      "category": "boot_file_restating",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-005",
+      "session_id": "extract-session-5",
+      "query": "any recent system health checks",
+      "content": "Heartbeat check: all systems nominal. Uptime: 14d 6h. CPU: 3%. Memory: 41%. No action required.",
+      "category": "cron_heartbeat_noise",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-006",
+      "session_id": "extract-session-6",
+      "query": "any recent system health checks",
+      "content": "Cron job 'daily-sync' completed successfully at 03:00 UTC. 0 errors, 0 warnings. Next run in 24h.",
+      "category": "cron_heartbeat_noise",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-007",
+      "session_id": "extract-session-7",
+      "query": "were there any errors recently",
+      "content": "Traceback (most recent call last): File \"agent.py\", line 214, in run KeyError: 'session_id'. Handled gracefully, retried once, succeeded on attempt 2.",
+      "category": "system_dump",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-008",
+      "session_id": "extract-session-8",
+      "query": "were there any errors recently",
+      "content": "{\"status\": \"error\", \"code\": 500, \"message\": \"upstream timeout\", \"retry_after_ms\": 1200, \"request_id\": \"a1b2c3d4\"}",
+      "category": "system_dump",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-009",
+      "session_id": "extract-session-9",
+      "query": "what does the user like",
+      "content": "User's favorite color is teal and they have three cats named Whiskers, Mochi, and Luna.",
+      "category": "hallucinated_profile",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-010",
+      "session_id": "extract-session-10",
+      "query": "what does the user like",
+      "content": "User is a former competitive chess player who now collects vintage typewriters and lives in a converted lighthouse.",
+      "category": "hallucinated_profile",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-011",
+      "session_id": "extract-session-11",
+      "query": "any confirmation messages",
+      "content": "Acknowledged. Acknowledged. Message received and processed. OK.",
+      "category": "other_junk",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-012",
+      "session_id": "extract-session-12",
+      "query": "any confirmation messages",
+      "content": "Ping. Pong. Connection alive. No new events.",
+      "category": "other_junk",
+      "should_be_stored": false
+    },
+    {
+      "case_id": "mt-extract-013",
+      "session_id": "extract-session-13",
+      "query": "how does the user prefer to run standups",
+      "content": "User prefers async standups over live meetings because their team in Berlin is 7 hours ahead and live meetings keep landing outside their working hours.",
+      "category": "valid_content",
+      "should_be_stored": true
+    },
+    {
+      "case_id": "mt-extract-014",
+      "session_id": "extract-session-14",
+      "query": "what deployment process does the user follow",
+      "content": "User's team deploys via a manual approval gate in GitHub Actions -- staging auto-deploys on merge to main, production requires a second engineer's sign-off before the workflow proceeds.",
+      "category": "valid_content",
+      "should_be_stored": true
+    },
+    {
+      "case_id": "mt-extract-015",
+      "session_id": "extract-session-15",
+      "query": "what is the user's project deadline",
+      "content": "The user's project deadline moved from August 15th to September 1st after the client requested an extra QA pass.",
+      "category": "valid_content",
+      "should_be_stored": true
+    }
+  ],
+  "feedback_loop_cases": [
+    {
+      "case_id": "mt-extract-fb-001",
+      "session_id": "extract-feedback-session-1",
+      "seed_content": "Marker-7f3a1c: user mentioned they have a dog named Biscuit who is afraid of thunderstorms.",
+      "unique_marker": "Marker-7f3a1c",
+      "recall_query": "what does the user's dog Biscuit need"
+    },
+    {
+      "case_id": "mt-extract-fb-002",
+      "session_id": "extract-feedback-session-2",
+      "seed_content": "Marker-9d82be: reminder that the quarterly report is due the last Friday of every quarter.",
+      "unique_marker": "Marker-9d82be",
+      "recall_query": "when is the quarterly report due"
+    }
+  ]
+}
