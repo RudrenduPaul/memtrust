@@ -62,6 +62,7 @@ from memtrust.adapters.base import (  # noqa: E402
     ConflictSignal,
     CorruptionSignal,
     ExtractionSignal,
+    LanguageDegradationSignal,
 )
 from memtrust.adapters.mem0_direct_adapter import (  # noqa: E402
     SUPPORTED_EMBEDDER_PROVIDERS,
@@ -72,6 +73,7 @@ from memtrust.evals.embedder_cost import (  # noqa: E402
     EmbedderCostSignal,
     run_embedder_cost_eval,
 )
+from memtrust.evals.language_degradation import run_language_degradation_eval  # noqa: E402
 from memtrust.scoring.cost_tracker import CostTracker  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -149,6 +151,12 @@ class _FakeMemory:
         self.delete_calls: list[str] = []
         self.raise_on_add: Exception | None = None
         self.raise_on_search: Exception | None = None
+        self.search_results_override: list[dict[str, object]] | None = None
+        """When set, search() returns exactly this results list instead of
+        its default single-record response -- lets tests control each
+        result's `score_details` shape directly (the field
+        LanguageDegradationSignal classification reads) without needing a
+        separate fake-adapter subclass per scenario."""
         self.add_returns_empty_results: bool = False
         """When True, add() returns a well-formed response with zero
         extracted memories -- the exact mem0ai/mem0#5178 shape: no
@@ -180,12 +188,22 @@ class _FakeMemory:
             return {"results": []}
         return {"results": [{"id": "mem-1", "memory": str(messages), "event": "ADD"}]}
 
-    def search(self, query: str, *, filters=None, top_k=5, threshold=None) -> dict[str, object]:
+    def search(
+        self, query: str, *, filters=None, top_k=5, threshold=None, explain=False
+    ) -> dict[str, object]:
         if self.raise_on_search:
             raise self.raise_on_search
         self.search_calls.append(
-            {"query": query, "filters": filters, "top_k": top_k, "threshold": threshold}
+            {
+                "query": query,
+                "filters": filters,
+                "top_k": top_k,
+                "threshold": threshold,
+                "explain": explain,
+            }
         )
+        if self.search_results_override is not None:
+            return {"results": self.search_results_override}
         return {
             "results": [
                 {
@@ -383,6 +401,7 @@ def test_query_parses_records_and_reports_not_applicable_conflict_signal() -> No
             "filters": {"user_id": "session-1"},
             "top_k": 5,
             "threshold": None,
+            "explain": False,
         }
     ]
 
@@ -407,6 +426,166 @@ def test_query_forwards_threshold_to_memory_search() -> None:
     adapter = Mem0DirectAdapter(memory=fake)
     adapter.query("session-1", "what is my dog's name?", threshold=0.6)
     assert fake.search_calls[-1]["threshold"] == 0.6
+
+
+# ---------------------------------------------------------------------------
+# LanguageDegradationSignal (wangjiawei-vegetable, rank 147,
+# mem0ai/mem0#4884) -- query(explain=True) surfaces whether mem0's real
+# hybrid-retrieval BM25/entity-boost signals fired, from score_details.
+# ---------------------------------------------------------------------------
+
+
+def test_query_forwards_explain_to_memory_search() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)
+    adapter.query("session-1", "q", explain=True)
+    assert fake.search_calls[-1]["explain"] is True
+
+
+def test_query_language_degradation_not_applicable_when_explain_false() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q")  # explain defaults to False
+    assert result.language_degradation_signal == LanguageDegradationSignal.NOT_APPLICABLE
+
+
+def test_query_language_degradation_not_applicable_when_no_records() -> None:
+    fake = _FakeMemory()
+    fake.search_results_override = []
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.NOT_APPLICABLE
+
+
+def test_query_language_degradation_active_when_bm25_score_nonzero() -> None:
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "用户的部署窗口是每周二早上。",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.6, "entity_boost": 0.0},
+        }
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+
+
+def test_query_language_degradation_active_when_entity_boost_nonzero() -> None:
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "content",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.5},
+        }
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+
+
+def test_query_language_degradation_semantic_only_when_every_result_has_zero_bm25_and_entity() -> (
+    None
+):
+    """The exact mem0ai/mem0#4884 shape: every returned result's
+    score_details shows zero contribution from BM25/entity-boost --
+    hybrid retrieval silently degraded to semantic-only for this query."""
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "用户的部署窗口是每周二早上。",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.0},
+        },
+        {
+            "id": "m2",
+            "memory": "不相关的内容",
+            "score": 0.3,
+            "score_details": {"semantic_score": 0.3, "bm25_score": 0.0, "entity_boost": 0.0},
+        },
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.SEMANTIC_ONLY_DEGRADED
+
+
+def test_query_language_degradation_active_if_any_single_result_shows_signal() -> None:
+    """One result with a genuine BM25/entity contribution is enough to
+    classify HYBRID_SIGNALS_ACTIVE, even when other results in the same
+    response show zero -- never a blind "all-or-nothing on the first
+    result" check."""
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "content one",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.0},
+        },
+        {
+            "id": "m2",
+            "memory": "content two",
+            "score": 0.5,
+            "score_details": {"semantic_score": 0.5, "bm25_score": 0.4, "entity_boost": 0.0},
+        },
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+
+
+def test_query_language_degradation_not_applicable_when_score_details_absent() -> None:
+    # explain=True was requested but results carry no score_details field
+    # at all (e.g. an older mem0 version, or a vector store that doesn't
+    # populate it) -- must not crash, and must not guess either signal.
+    fake = _FakeMemory()  # default search() response has no score_details
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.NOT_APPLICABLE
+
+
+def test_language_degradation_eval_reports_per_script_breakdown() -> None:
+    """run_language_degradation_eval() end to end: a fake mem0 instance
+    whose search() always reports zero bm25_score/entity_boost (modeling
+    mem0ai/mem0#4884's exact bug) classifies every case
+    SEMANTIC_ONLY_DEGRADED, and the per-script breakdown reflects that."""
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "content",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.0},
+        }
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+
+    result = run_language_degradation_eval(adapter)
+
+    assert len(result.case_results) == 8
+    assert result.semantic_only_degraded_rate == 1.0
+    assert result.hybrid_signals_active_rate == 0.0
+    by_script = result.rate_by_script(LanguageDegradationSignal.SEMANTIC_ONLY_DEGRADED)
+    assert by_script["chinese"] == 1.0
+    assert by_script["arabic"] == 1.0
+    assert by_script["thai"] == 1.0
+    assert by_script["hindi"] == 1.0
+    assert by_script["japanese"] == 1.0
+
+
+def test_language_degradation_eval_records_error_without_crashing() -> None:
+    fake = _FakeMemory()
+    fake.raise_on_search = RuntimeError("vendor exploded")
+    adapter = Mem0DirectAdapter(memory=fake)
+
+    result = run_language_degradation_eval(adapter)
+    assert len(result.case_results) == 8
+    assert all(c.error is not None for c in result.case_results)
+    assert result.scored_cases == []
 
 
 def test_update_full_content_reports_clean_and_calls_memory_update_with_text() -> None:
