@@ -35,6 +35,14 @@ from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_l
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
 from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
 from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_resource_sync_eval
+from memtrust.receipt import (
+    PUBLIC_KEY_ENV_VAR,
+    ReceiptError,
+    receipt_path_for,
+    sign_report_with_keyfile,
+    verify_receipt_file,
+    write_keypair,
+)
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
@@ -243,11 +251,25 @@ def main() -> None:
         "No such list ships with memtrust by default."
     ),
 )
+@click.option(
+    "--sign",
+    "sign_key_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        "Path to an Ed25519 private key PEM file (see `memtrust keygen`). When given, "
+        "writes a signed receipt alongside the normal JSON report -- "
+        "<output>.receipt.json -- proving the report was produced by the holder of "
+        "this key and has not been altered since. Omit for plain, unsigned JSON "
+        "output (the default, unchanged from before this flag existed)."
+    ),
+)
 def run(
     backends: str,
     eval_arg: str,
     output_path: Path | None,
     locomo_exclude_ids_path: Path | None,
+    sign_key_path: Path | None,
 ) -> None:
     """Run the eval suite against the requested backends.
 
@@ -422,6 +444,16 @@ def run(
     out_path.write_text(json.dumps(report, indent=2, default=str))
     console.print(f"\nFull report: {out_path}")
 
+    if sign_key_path is not None:
+        try:
+            receipt = sign_report_with_keyfile(report, sign_key_path)
+        except ReceiptError as exc:
+            console.print(f"[red]Could not sign report: {exc}[/red]")
+            sys.exit(1)
+        receipt_path = receipt_path_for(out_path)
+        receipt_path.write_text(json.dumps(receipt, indent=2))
+        console.print(f"Signed receipt: {receipt_path}  (public key: {receipt['public_key']})")
+
 
 @main.command()
 @click.argument("report_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
@@ -507,6 +539,99 @@ def report(report_path: Path) -> None:
     cost = data.get("cost", {})
     if cost:
         console.print(f"\nEstimated cost: ${cost.get('total_usd', 0):.4f}")
+
+
+@main.command()
+@click.option(
+    "--private-key-out",
+    "private_key_path",
+    default=Path("memtrust-key.pem"),
+    show_default=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Where to write the new Ed25519 private key (PEM, unencrypted). Keep this secret.",
+)
+@click.option(
+    "--public-key-out",
+    "public_key_path",
+    default=Path("memtrust-key.pub"),
+    show_default=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Where to write the matching public key (PEM). Safe to publish/share.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite the output files if they already exist.",
+)
+def keygen(private_key_path: Path, public_key_path: Path, force: bool) -> None:
+    """Generate a new Ed25519 keypair for signing `memtrust run` receipts.
+
+    Equivalent to:
+
+        openssl genpkey -algorithm ed25519 -out <private-key-out>
+        openssl pkey -in <private-key-out> -pubout -out <public-key-out>
+
+    Publish the public key file (or its contents via MEMTRUST_RECEIPT_PUBLIC_KEY)
+    so others can run `memtrust verify` against your signed receipts. Never
+    share the private key.
+    """
+    try:
+        write_keypair(private_key_path, public_key_path, overwrite=force)
+    except ReceiptError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(1)
+    console.print(f"[green]Wrote private key:[/green] {private_key_path} (keep secret)")
+    console.print(f"[green]Wrote public key:[/green]  {public_key_path} (safe to publish)")
+    console.print(
+        "\nSign a run with:   memtrust run --sign "
+        f"{private_key_path} ...\n"
+        "Verify a receipt with:   memtrust verify <receipt.json> --public-key "
+        f"{public_key_path}"
+    )
+
+
+@main.command()
+@click.argument("receipt_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--public-key",
+    "public_key_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        f"Path to the trusted Ed25519 public key (PEM). Falls back to the "
+        f"{PUBLIC_KEY_ENV_VAR} env var if omitted -- one of the two is required. "
+        "Never taken from the receipt file itself: a receipt cannot vouch for its own key."
+    ),
+)
+def verify(receipt_path: Path, public_key_path: Path | None) -> None:
+    """Verify a signed receipt produced by `memtrust run --sign`.
+
+    Proves exactly two things when valid: the receipt's payload has not
+    been altered since it was signed, and it was signed by the holder of
+    the supplied public key. It does NOT prove the benchmark numbers
+    inside the payload are accurate -- see docs/methodology.md.
+
+    Exits 0 and prints "valid: True" on success; exits 1 on any failure
+    (bad signature, tampered payload, missing/wrong public key, malformed
+    receipt).
+    """
+    try:
+        result = verify_receipt_file(receipt_path, public_key_path=public_key_path)
+    except ReceiptError as exc:
+        console.print(f"[red]Could not verify: {exc}[/red]")
+        sys.exit(1)
+
+    color = "green" if result.valid else "red"
+    console.print(f"[{color}]valid: {result.valid}[/{color}]")
+    console.print(result.reason)
+    if result.embedded_key_matches_trusted_key is False:
+        console.print(
+            "[yellow]Note: the public key embedded in the receipt does not match "
+            "the trusted public key you supplied.[/yellow]"
+        )
+    if not result.valid:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
