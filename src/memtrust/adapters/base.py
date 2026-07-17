@@ -252,6 +252,63 @@ class CorruptionSignal(StrEnum):
     field."""
 
 
+class EmbeddingDriftSignal(StrEnum):
+    """Whether a record stored before an embedding-model migration remained
+    retrievable after the migration, or silently stopped being findable --
+    a structurally distinct failure mode from every enum above. ConflictSignal
+    classifies a query response after a *content* contradiction;
+    RankingSignal classifies whether correct content came back in the right
+    *order*; CorruptionSignal classifies a single write call's own
+    construction/write-path failure. None of those can express "this record
+    was fine, a completely unrelated later store() call for a *different*
+    record silently broke it" -- which is exactly the shape of the
+    motivating bug.
+
+    Motivating case: volcengine/OpenViking#1523 (contributor A0nameless0man).
+    An embedder migration silently degrades search quality mid-migration:
+    switching embedding models overwrites previously-stored vectors in
+    place with no dimension/model validation, so records embedded under the
+    old model can stop being retrievable once new-model writes start
+    landing -- with no exception, no error, and no signal in any single
+    query response that this happened. A single query() call has no way to
+    see this: the record that broke wasn't touched by the query, it was
+    broken by a *different*, earlier store() call that happened to migrate
+    embedding models. This is why detecting it requires an eval that
+    controls two store() calls under two different fixture-level model
+    labels and compares retrievability before vs. after, not a per-response
+    classification like ConflictSignal/RankingSignal/CorruptionSignal
+    above -- see evals/embedding_drift.py for the harness-level eval this
+    signal is scored by, and its module docstring plus docs/methodology.md
+    for the honest scope of what this can and cannot prove without a real
+    backend that exposes embedding-model metadata (none in this repo do,
+    as of this writing).
+    """
+
+    EMBEDDING_DRIFT = "embedding_drift"
+    """A record confirmed retrievable (by its own content, as a substring
+    of a returned record's content) immediately after being stored under
+    one fixture-level embedding-model label became unretrievable after
+    later records were stored under a *different* fixture-level
+    embedding-model label in the same session -- the exact volcengine/
+    OpenViking#1523 shape. Only assigned when the record was provably
+    retrievable BEFORE the migration step, so a record that was never
+    retrievable in the first place (a generic recall miss, unrelated to
+    any migration) is never misattributed to drift -- see
+    evals/embedding_drift.py's classify_embedding_drift_record()."""
+
+    CLEAN = "clean"
+    """The record was confirmed retrievable before the migration step and
+    remained retrievable (same content match) afterward -- no drift
+    observed for this record."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """The record's pre-migration retrievability could not be confirmed at
+    all (it was never observed retrievable even before any migration step
+    ran), so there is no valid baseline to compare against -- recorded
+    explicitly rather than guessed at either way, same convention as every
+    other NOT_APPLICABLE member in this module."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
@@ -260,6 +317,24 @@ class MemoryRecord:
     content: str
     score: float | None = None
     created_at: str | None = None
+    embedding_model: str | None = None
+    """Identifier of the embedding model that produced this record's stored
+    vector, IF the backend's query response exposes that information.
+    Defaults to `None` ("unknown/not reported") for every adapter -- most
+    real backends' search APIs do not surface per-record embedding-model
+    provenance at all (confirmed absent from OpenViking's documented
+    `/v1/search` response shape during this build; see
+    openviking_adapter.py's module docstring). This field exists so an
+    adapter that CAN report it has somewhere typed to put it, and so
+    evals/embedding_drift.py's fixture-level model-label tracking has a
+    real adapter-native field to cross-check against on the rare backend
+    that does expose this -- it is not itself proof any adapter populates
+    it. See EmbeddingDriftSignal above and evals/embedding_drift.py for the
+    eval this supports."""
+    embedding_dims: int | None = None
+    """Dimensionality of this record's stored vector, IF the backend's
+    query response exposes it. Same default-`None`, same-rarity caveat as
+    `embedding_model` above -- see its docstring."""
     metadata: dict[str, str] = field(default_factory=dict)
     attributes: dict[str, object] = field(default_factory=dict)
     """Structured, non-string-coerced properties this record's backend
