@@ -374,6 +374,24 @@ their own separate `_get_mcp_metadata_tools()` -- one lazy-import point
 for the whole confirmed-real `mempalace.mcp_server` surface this adapter
 uses, since there is no longer a second, fictional-API code path to keep
 separate from it.
+
+NO CLOUD API KEY REQUIRED -- BUT NETWORK ACCESS IS, ON FIRST USE
+(MemPalace/mempalace#524, contributor gaby)
+-------------------------------------------------------------------------
+This adapter's own "configuration" is just `MEMPALACE_STORAGE_PATH` --
+unlike Mem0Adapter/ZepGraphitiAdapter, there is no `MEMPALACE_API_KEY`
+env var, because MemPalace's default embedder is local (ChromaDB's
+bundled embedding function), not a cloud API call. That is a narrower
+claim than "fully offline," and this rewrite's live testing reproduced
+exactly the gap gaby reported: on first use in a given environment,
+ChromaDB's default embedder downloads its ONNX model from S3 the first
+time it is actually invoked -- so `mempalace mine .` (and, by extension,
+this adapter's first `store()`/`tool_add_drawer()` call against a fresh
+palace) fails outright on a network-restricted host, even though no API
+key was ever required. Once that one-time download has succeeded (or the
+model is pre-cached), no further network access is needed for that
+palace. Treat "no API key" and "no network access" as two independent
+claims -- this adapter only confirms the former.
 """
 
 from __future__ import annotations
@@ -405,23 +423,33 @@ from memtrust.adapters.base import (
 #: adapter's own MEMPALACE_STORAGE_PATH -- see `_sync_mcp_palace_path()`.
 _MCP_PALACE_PATH_ENV_VAR = "MEMPALACE_PALACE_PATH"
 
-#: The real, confirmed per-record field `tool_search`'s own ranking is
-#: actually driven by (`effective_distance`, surfaced to callers as
-#: `similarity`) -- see the module docstring's "RANKING SIGNAL" section
-#: for why this replaces the old importance/emotional_weight/weight/
-#: authored_at keys, which belong to a different method this adapter never
-#: calls.
-_RANKING_METADATA_KEYS = ("similarity",)
+#: The real, confirmed per-record fields ranking signal can be derived
+#: from. `similarity` (surfaced from `effective_distance`) is the primary
+#: signal `tool_search`'s own ranking is actually driven by. `authored_at`
+#: is real too -- confirmed via `gh pr diff 1890` and a live read of the
+#: installed package's `mempalace/searcher.py` (MemPalace/mempalace#1890,
+#: contributor JosefAschauer): `search_memories()` sets it as a flat,
+#: top-level field on every result
+#: (`meta.get("authored_at", meta.get("filed_at", "unknown"))`), which
+#: `tool_search` passes through unchanged. It is checked second, as a
+#: fallback signal only used when `similarity` itself is entirely absent
+#: from a response -- unlike the old, removed importance/emotional_weight/
+#: weight keys, which belong to `mempalace/layers.py`'s `Layer1.generate()`
+#: "wake-up" sort, a code path this adapter has never called, in any
+#: version.
+_RANKING_METADATA_KEYS = ("similarity", "authored_at")
 
 
 def _classify_ranking_signal(records: list[MemoryRecord]) -> RankingSignal:
     """Inspect a query response's records for a ranking-relevant metadata
     field and report whether a real per-record signal appears to exist.
 
-    See the module docstring's "RANKING SIGNAL" section for why this
-    checks `similarity` (the field the real, confirmed `tool_search`
-    actually sorts by) rather than the fictional-API-era
-    importance/emotional_weight/weight/authored_at keys.
+    Checks `similarity` first (the field the real, confirmed `tool_search`
+    actually sorts by), then falls back to `authored_at` (also real and
+    confirmed, per `_RANKING_METADATA_KEYS`'s comment above) when
+    `similarity` is absent -- rather than the fictional-API-era
+    importance/emotional_weight/weight keys, which belong to a different
+    method (`Layer1.generate()`) this adapter has never called.
 
     Fewer than 2 records is treated as NOT_APPLICABLE -- there is nothing
     to compare an "identical across records" claim against with 0 or 1

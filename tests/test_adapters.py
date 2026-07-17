@@ -2106,6 +2106,49 @@ def test_mempalace_query_ranking_signal_not_applicable_with_fewer_than_two_recor
     assert query_result.ranking_signal == RankingSignal.NOT_APPLICABLE
 
 
+def test_mempalace_query_falls_back_to_authored_at_when_similarity_absent() -> None:
+    """`authored_at` is a real, confirmed, flat field on `tool_search`
+    results (MemPalace/mempalace#1890, contributor JosefAschauer) --
+    `_RANKING_METADATA_KEYS` checks it as a fallback signal when
+    `similarity` itself is entirely absent from a response. This proves
+    the fallback against `MemPalaceAdapter` itself, not a synthetic fake
+    adapter standing in for it."""
+
+    class NoSimilarityVariedAuthoredAtTools(FakeMCPTools):
+        def tool_search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raw = super().tool_search(*args, **kwargs)
+            for i, item in enumerate(raw["results"]):
+                del item["similarity"]
+                item["authored_at"] = f"2026-01-{i + 1:02d}T00:00:00"
+            return raw
+
+    tools = NoSimilarityVariedAuthoredAtTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    for content in ["Had coffee with Alex.", "Signed the lease.", "Grandmother's health scare."]:
+        adapter.store("room-1", content)
+
+    query_result = adapter.query("room-1", "wake me up with important memories", top_k=10)
+    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
+
+
+def test_mempalace_query_flags_missing_ordering_key_when_authored_at_constant() -> None:
+    class NoSimilarityConstantAuthoredAtTools(FakeMCPTools):
+        def tool_search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raw = super().tool_search(*args, **kwargs)
+            for item in raw["results"]:
+                del item["similarity"]
+                item["authored_at"] = "2026-01-01T00:00:00"
+            return raw
+
+    tools = NoSimilarityConstantAuthoredAtTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    for content in ["Had coffee with Alex.", "Signed the lease.", "Grandmother's health scare."]:
+        adapter.store("room-1", content)
+
+    query_result = adapter.query("room-1", "wake me up with important memories", top_k=10)
+    assert query_result.ranking_signal == RankingSignal.MISSING_ORDERING_KEY
+
+
 # ---------------------------------------------------------------------------
 # MemPalaceAdapter.query() -- no per-record id, metadata carries every
 # other real response field (see the module docstring's "NO PER-RECORD ID"
