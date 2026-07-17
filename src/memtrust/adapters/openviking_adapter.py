@@ -116,6 +116,29 @@ from memtrust.adapters.base import (
 DEFAULT_BASE_URL = "http://localhost:1933"
 
 
+def _error_detail(exc: httpx.HTTPError) -> str:
+    """Build a BackendAPIError detail that includes the real response body
+    when one is available, not just the generic status-line `str(exc)`.
+
+    Motivating case: volcengine/OpenViking#1227, where a server-side
+    Pydantic validation error (e.g. `"id" extra_forbidden`) was silently
+    swallowed down to a useless status-line-only message like
+    "Client error '400 Bad Request' for url ..." -- the actual validation
+    detail explaining WHAT failed was discarded entirely. `exc.response`
+    is `None` for request-level failures (a connection error, a timeout)
+    that never got a response back at all, not just for
+    `httpx.HTTPStatusError` -- handled explicitly rather than assumed
+    present, since not every `httpx.HTTPError` subclass carries one.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return str(exc)
+    body = response.text
+    if not body:
+        return str(exc)
+    return f"{exc} -- response body: {body}"
+
+
 class OpenVikingAdapter(MemoryBackendAdapter):
     name = "openviking"
     env_var = "OPENVIKING_API_KEY"
@@ -173,7 +196,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, _error_detail(exc)) from exc
         memory_id = str(data.get("path", payload["path"]))
         return StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data)
 
@@ -188,7 +211,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, _error_detail(exc)) from exc
 
         items = data.get("results", data.get("matches", []))
         records = [
@@ -223,7 +246,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, _error_detail(exc)) from exc
         return UpdateResult(
             memory_id=memory_id, acknowledged=True, latency_ms=timer.elapsed_ms(), raw=data
         )
@@ -243,7 +266,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             resp.raise_for_status()
             data = resp.json() if resp.content else {}
         except httpx.HTTPError as exc:
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, _error_detail(exc)) from exc
         return DeleteResult(
             success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data
         )
@@ -275,7 +298,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, _error_detail(exc)) from exc
         entries = data.get("paths", data.get("entries", []))
         paths: list[str] = []
         for entry in entries:
@@ -310,7 +333,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             resp = self._http.post("/v1/fs/resync", json=payload)
             resp.raise_for_status()
         except httpx.HTTPError as exc:
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, _error_detail(exc)) from exc
 
     def close(self) -> None:
         self._http.close()
