@@ -346,7 +346,7 @@ Apache 2.0. See `LICENSE`.
 
 ## Success stories
 
-Nine real bugs, reported by real contributors against MemPalace, mem0, Zep/Graphiti, and
+Ten real bugs, reported by real contributors against MemPalace, mem0, Zep/Graphiti, and
 OpenViking, that memtrust's own harness either couldn't have caught before this work or can now
 catch directly. Each one below has been re-verified live against the current codebase, not just
 cited from a changelog. Full write-ups and live-validation evidence are tracked internally; the
@@ -382,6 +382,14 @@ summary here is for anyone deciding whether this harness would have caught their
   `invalid_at` correctness gap. memtrust's contradiction classifier used to discard Graphiti's own
   `invalid_at` metadata and infer everything from a fixed top-5 text match, misreading a correctly
   flagged case as a silent overwrite. It now checks the metadata first.
+- [#1275](https://github.com/getzep/graphiti/issues/1275) (@rafaelreis-r, still open): O(n)
+  entity-resolution context growth silently dropping episodes past roughly 300 ingested. The same
+  scale/volume-stress eval that addresses OpenViking#2850 below tracks a fixed "anchor" record's
+  recall across ascending checkpoints specifically to catch older content silently falling out of
+  a search window as volume grows -- the same shape this issue describes. It has not been run
+  against a live Graphiti backend through real `add_episode()` ingestion at 300+ episodes as of
+  this writing, so this one is also partial: structurally reachable, not yet confirmed live. See
+  `docs/methodology.md`.
 
 **OpenViking**
 - [#3029](https://github.com/volcengine/OpenViking/issues/3029) (@dfwgj, still open): Feishu resync
@@ -389,6 +397,10 @@ summary here is for anyone deciding whether this harness would have caught their
   dedicated resource-sync-safety eval now seeds generated and user files, triggers a resync, and
   checks what survives.
 - [#2850](https://github.com/volcengine/OpenViking/issues/2850) (@lg320531124, still open): BM25
-  search silently returning empty results at scale. memtrust now flags an empty result as distinct
-  from an ordinary miss, though it doesn't yet attribute the cause or reproduce the scale
-  condition, so this one stays partial too.
+  search silently returning empty results at scale. memtrust flags an empty result as distinct
+  from an ordinary miss, and a dedicated scale/volume-stress eval (`memtrust run --eval
+  scale_stress`) now stores a large synthetic corpus and re-queries it at ascending checkpoints to
+  reproduce the *shape* of this condition -- recall collapsing past a volume threshold with no
+  exception raised. It has not been run against a live OpenViking instance at real scale (10K+
+  records) as of this writing, so this one stays partial: structurally reachable, not yet
+  confirmed live. See `docs/methodology.md`.
