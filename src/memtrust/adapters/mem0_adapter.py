@@ -116,6 +116,7 @@ from memtrust.adapters.base import (
     BackendNotConfiguredError,
     ConflictSignal,
     DeleteResult,
+    ExtractionSignal,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -170,7 +171,19 @@ class Mem0Adapter(MemoryBackendAdapter):
         except httpx.HTTPError as exc:
             raise BackendAPIError(self.name, str(exc)) from exc
         memory_id = _extract_memory_id(data)
-        return StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data)
+        # See ExtractionSignal in base.py -- mem0ai/mem0#5178: a store()
+        # call can complete without raising and still carry no usable
+        # memory id anywhere in the response, which is byte-identical to a
+        # genuine successful store unless flagged explicitly here.
+        extraction_signal = (
+            ExtractionSignal.EMPTY_EXTRACTION if not memory_id else ExtractionSignal.FACTS_EXTRACTED
+        )
+        return StoreResult(
+            memory_id=memory_id,
+            latency_ms=timer.elapsed_ms(),
+            raw=data,
+            extraction_signal=extraction_signal,
+        )
 
     def query(
         self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
@@ -315,7 +328,19 @@ class Mem0SelfHostedAdapter(MemoryBackendAdapter):
         except httpx.HTTPError as exc:
             raise BackendAPIError(self.name, str(exc)) from exc
         memory_id = _extract_memory_id(data)
-        return StoreResult(memory_id=memory_id, latency_ms=timer.elapsed_ms(), raw=data)
+        # See ExtractionSignal in base.py -- mem0ai/mem0#5178: a store()
+        # call can complete without raising and still carry no usable
+        # memory id anywhere in the response, which is byte-identical to a
+        # genuine successful store unless flagged explicitly here.
+        extraction_signal = (
+            ExtractionSignal.EMPTY_EXTRACTION if not memory_id else ExtractionSignal.FACTS_EXTRACTED
+        )
+        return StoreResult(
+            memory_id=memory_id,
+            latency_ms=timer.elapsed_ms(),
+            raw=data,
+            extraction_signal=extraction_signal,
+        )
 
     def query(
         self,
