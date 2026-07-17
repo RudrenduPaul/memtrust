@@ -137,8 +137,14 @@ verification is attempted against the wrong public key.
   (single-hop, temporal, multi-hop) plus 1 adversarial case. Again, invented content matching the
   real schema, not copied data.
 - **To run against the real dataset:** download `locomo10.json` from the LoCoMo repository and
-  point `run_locomo(adapter, judge, dataset_path=...)` at it -- the loader expects the same
-  top-level `{"conversations": [...]}` shape already.
+  either pass `memtrust run --locomo-dataset-path /path/to/locomo10.json` on the CLI, or call
+  `run_locomo(adapter, judge, dataset_path=...)` directly from Python -- the loader expects the
+  same top-level `{"conversations": [...]}` shape already. `load_dataset()` validates the file
+  and raises a clear, actionable `ValueError` (not a bare `KeyError`/`JSONDecodeError`) if the
+  path is missing or the JSON doesn't match that shape. The dataset itself is never bundled or
+  auto-fetched by memtrust -- it is not memtrust's dataset to redistribute -- this only closes
+  the gap between "I downloaded it" and "memtrust will actually run against it," which
+  previously required writing custom Python since `memtrust run` had no CLI flag for it at all.
 
 #### Headline accuracy vs. non-adversarial accuracy (category-5 exclusion)
 

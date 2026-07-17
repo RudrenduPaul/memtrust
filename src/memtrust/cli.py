@@ -504,6 +504,20 @@ def main() -> None:
     ),
 )
 @click.option(
+    "--locomo-dataset-path",
+    "locomo_dataset_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        "Path to a real locomo10.json (download it yourself from "
+        "https://github.com/snap-research/locomo -- memtrust does not bundle or "
+        "auto-fetch it) to run the locomo eval against, instead of the bundled "
+        "synthetic tests/fixtures/locomo_sample.json. See docs/methodology.md's "
+        '"LoCoMo" section for the schema and download link. Ignored if --eval does '
+        "not include locomo."
+    ),
+)
+@click.option(
     "--scale-stress-n-records",
     "scale_stress_n_records",
     default=DEFAULT_N_RECORDS,
@@ -535,6 +549,7 @@ def run(
     eval_arg: str,
     output_path: Path | None,
     locomo_exclude_ids_path: Path | None,
+    locomo_dataset_path: Path | None,
     scale_stress_n_records: int,
     sign_key_path: Path | None,
 ) -> None:
@@ -601,7 +616,10 @@ def run(
 
         if "locomo" in eval_names:
             console.print(f"  Running LoCoMo against {backend_name}...")
-            locomo_result = run_locomo(adapter, judge, exclude_question_ids=locomo_exclude_ids)
+            locomo_run_kwargs: dict[str, Any] = {"exclude_question_ids": locomo_exclude_ids}
+            if locomo_dataset_path is not None:
+                locomo_run_kwargs["dataset_path"] = locomo_dataset_path
+            locomo_result = run_locomo(adapter, judge, **locomo_run_kwargs)
             backend_report["evals"]["locomo"] = _serialize_eval_result(locomo_result)
             acc = locomo_result.accuracy
             non_adv_acc = locomo_result.non_adversarial_accuracy
