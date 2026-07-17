@@ -304,6 +304,25 @@ class RankingReversedFakeAdapter(RankingInsertionOrderFakeAdapter):
         )
 
 
+class RankingSortedByAuthoredAtFakeAdapter(RankingInsertionOrderFakeAdapter):
+    """Sorts returned records by descending `authored_at` metadata value --
+    models MemPalace/mempalace PR#1890's `_hybrid_rank` tie-breaker
+    genuinely working: two records tied on every other signal, ordered
+    newest-first by their `authored_at` timestamp."""
+
+    name = "fake-ranking-sorted-authored-at"
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        records = sorted(
+            self._store.get(session_id, []),
+            key=lambda r: float(r.metadata.get("authored_at", "0")),
+            reverse=True,
+        )
+        return QueryResult(
+            records=records[:top_k], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+
 class CrashRecoveryFakeAdapter(MemoryBackendAdapter):
     """Models the exact volcengine/OpenViking#2644 shape (contributor
     yeyitech): a local vectordb's `_recover()` silently skips rebuilding
@@ -1819,7 +1838,7 @@ def test_load_exclude_question_ids_from_text_file(tmp_path: Path) -> None:
 
 def test_ranking_quality_dataset_loads() -> None:
     cases = load_ranking_quality_dataset()
-    assert len(cases) == 4
+    assert len(cases) == 5
     assert all(isinstance(c, RankingQualityCase) for c in cases)
 
 
@@ -1874,9 +1893,27 @@ def test_ranking_quality_flags_order_inconsistent_when_signal_exists_but_unused(
 def test_ranking_quality_handles_backend_failure() -> None:
     adapter = FailingFakeAdapter()
     result = run_ranking_quality_eval(adapter)
-    assert len(result.case_results) == 4
+    assert len(result.case_results) == 5
     assert all(c.error is not None for c in result.case_results)
     assert all(c.signal == RankingSignal.NOT_APPLICABLE for c in result.case_results)
+
+
+def test_ranking_quality_credits_authored_at_as_tiebreaker_signal() -> None:
+    """MemPalace/mempalace PR#1890 added `authored_at` timestamp metadata
+    used as a `_hybrid_rank` tie-breaker. Case mt-rank-005 ties two records
+    on `hybrid_score` and differentiates them only by `authored_at` -- a
+    backend that orders by descending `authored_at` must be credited
+    SIGNAL_DRIVEN, with the newer record ranked first, proving
+    classify_ranking_case correctly recognizes authored_at as a
+    ranking-driving field (not only "importance")."""
+    adapter = RankingSortedByAuthoredAtFakeAdapter()
+    result = run_ranking_quality_eval(adapter)
+    case_result = next(c for c in result.case_results if c.case.case_id == "mt-rank-005")
+    assert case_result.error is None
+    assert case_result.signal == RankingSignal.SIGNAL_DRIVEN
+    present = [v for v in case_result.field_values if v is not None]
+    assert present == sorted(present, reverse=True)
+    assert case_result.retrieved_content.startswith("Filed the annual tax return.")
 
 
 def test_ranking_quality_eval_result_rates_ignore_errored_cases() -> None:

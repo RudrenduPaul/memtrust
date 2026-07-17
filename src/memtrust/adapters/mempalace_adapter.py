@@ -107,7 +107,13 @@ from memtrust.adapters.base import (
 #: written); `emotional_weight`/`weight` are the sort's other documented
 #: keys, checked as fallbacks so this adapter still reports something
 #: meaningful if a future MemPalace version populates one of those instead.
-_RANKING_METADATA_KEYS = ("importance", "emotional_weight", "weight")
+#: `authored_at` was added by MemPalace's own merged PR#1890
+#: (mempalace/mempalace) as a timestamp tie-breaker `_hybrid_rank` falls
+#: back to when two drawers score identically on the other fields -- a
+#: real, ranking-driving metadata field this adapter previously never
+#: checked for at all, silently dropping it from `_classify_ranking_signal`
+#: even when it was the only thing actually varying between records.
+_RANKING_METADATA_KEYS = ("importance", "emotional_weight", "weight", "authored_at")
 
 
 def _classify_ranking_signal(records: list[MemoryRecord]) -> RankingSignal:
@@ -157,6 +163,32 @@ def _classify_ranking_signal(records: list[MemoryRecord]) -> RankingSignal:
     # both the same way is deliberate, not an oversight -- see
     # docs/methodology.md's honesty note on this eval's limits.
     return RankingSignal.MISSING_ORDERING_KEY
+
+
+def _record_metadata(item: dict[str, Any]) -> dict[str, str]:
+    """Build a query() result item's metadata dict, folding in a
+    top-level `authored_at` field when the nested `metadata.authored_at`
+    isn't already present.
+
+    MemPalace's own merged PR#1890 added `authored_at` timestamp metadata
+    (used as a `_hybrid_rank` tie-breaker), but its real API can surface
+    that field at the TOP LEVEL of a response item instead of nested under
+    `metadata` -- confirmed by gemini-code-assist's review comment on that
+    same PR#1890 diff, flagging the exact same top-level-vs-nested
+    inconsistency in MemPalace's own response-building code. Before this
+    fix, this adapter only ever read `item.get("metadata")`, so a
+    top-level `authored_at` was silently dropped and never reached
+    `_classify_ranking_signal` or `MemoryRecord.metadata` at all -- an
+    adapter-side instance of the identical bug shape, not a re-guess at
+    a different problem. Nested `metadata.authored_at` (when present)
+    always wins over a top-level value, so a response that (correctly, per
+    the confirmed shape) nests it is never overridden by a stray top-level
+    duplicate.
+    """
+    metadata = dict(item.get("metadata") or {})
+    if "authored_at" not in metadata and item.get("authored_at") is not None:
+        metadata["authored_at"] = str(item["authored_at"])
+    return metadata
 
 
 class _PalaceProtocol(Protocol):
@@ -332,7 +364,7 @@ class MemPalaceAdapter(MemoryBackendAdapter):
                 content=str(item.get("content", "")),
                 score=item.get("score"),
                 created_at=item.get("created_at"),
-                metadata=item.get("metadata") or {},
+                metadata=_record_metadata(item),
                 raw=item,
             )
             for item in results
