@@ -24,6 +24,71 @@ This matters because it changes what a number *means*.
 Every accuracy or conflict-rate figure comes from either (a) an actual HTTP call to the named
 vendor's real API, or is explicitly labeled as not yet measured.
 
+## Signed receipts: what they prove, and what they do not
+
+`memtrust run --sign <private-key.pem>` writes a second file alongside the normal JSON
+report -- `<report-name>.receipt.json` -- containing an Ed25519 signature (via the
+`cryptography` library, `src/memtrust/receipt.py`) over the report's contents, the
+signer's public key, a timestamp, and a SHA-256 hash of the signed payload. `memtrust
+verify <receipt.json> --public-key <public-key.pem>` (or `MEMTRUST_RECEIPT_PUBLIC_KEY`
+as an env-var fallback) checks that signature and reports `valid: True` or `valid:
+False` with a specific reason. `memtrust keygen` generates a new keypair; the same
+result is produced by the two `openssl` commands documented in `receipt.py`'s module
+docstring, since the file formats are ordinary PEM and interoperate either way.
+
+This exists because comparing memtrust against peer harnesses that publish
+cryptographically signed benchmark receipts (e.g. przm-bench's Ed25519-signed run
+receipts) surfaced a real asymmetry: memtrust asks readers to trust its own numbers
+while auditing other vendors' numbers for exactly this kind of unverifiability. Signing
+is opt-in and off by default -- a plain `memtrust run` with no `--sign` flag produces
+byte-identical JSON output to before this feature existed; nothing about the default,
+unsigned path changed.
+
+**What a `valid: True` verification actually proves:**
+
+1. The `payload` embedded in the receipt is byte-for-byte identical, under a
+   deterministic canonical JSON encoding (`receipt.canonicalize()` -- sorted keys,
+   compact separators), to what was signed. If a single character of the JSON report
+   changed after signing -- a flipped accuracy digit, an added or removed case, a
+   different `run_id` -- verification fails and says so.
+2. The signature was produced by whoever holds the Ed25519 private key matching the
+   public key the verifier was told to trust. `memtrust verify` never trusts the public
+   key embedded inside the receipt itself for this decision -- it always requires the
+   verifier to independently supply the trusted key via `--public-key` or
+   `MEMTRUST_RECEIPT_PUBLIC_KEY`. This matters: if verification instead trusted
+   whatever key the receipt claims signed it, an attacker who can rewrite the payload
+   could just as easily rewrite the embedded key and self-issue a "consistent" forgery.
+   Public-key distribution and trust (e.g. publishing the key's fingerprint in this
+   repo's README, or over a separate channel) is what actually anchors that trust --
+   the receipt format only makes tampering with an already-anchored key detectable, it
+   does not solve initial key distribution.
+
+**What a `valid: True` verification does NOT prove, and never will:**
+
+- That the benchmark numbers inside the payload are accurate, that the eval actually
+  ran against the real vendor API it claims to (versus, say, a bug that silently no-ops
+  and reports a stale or zeroed result), or that the methodology used to produce them
+  matches what this document describes. Signing operates purely on bytes-as-written; it
+  has no way to inspect whether those bytes correspond to a real, correctly-executed
+  run. A dishonest signer can sign a fabricated report just as validly as an honest one
+  can sign a real one -- the signature attests to *authorship and non-tampering-in-
+  transit*, never to *correctness of the contents*.
+- That the private key itself was never compromised, or that whoever ran `memtrust run
+  --sign` was careful about key handling. A receipt says "signed by the holder of this
+  key," full stop -- it cannot distinguish the legitimate maintainer from someone who
+  gained access to the same key file.
+- Anything about a report that predates this feature, or any report generated without
+  `--sign`. Unsigned JSON output carries exactly the trust properties it always did --
+  none from this mechanism -- and remains the default.
+
+**Tamper-evidence, not tamper-prevention.** Signing does not stop anyone from editing a
+report; it only guarantees that editing it after signing becomes detectable, and
+exactly what changed cannot be observed from the receipt alone, but that a mismatch
+exists can be. `tests/test_receipt.py` and `tests/test_cli.py` both exercise this with a
+real Ed25519 keypair, a real signature, and a real post-signing edit -- not a mocked
+crypto stub -- asserting `valid: False` when a signed payload is altered and when
+verification is attempted against the wrong public key.
+
 ## Dataset versions and what is synthetic vs. real
 
 ### LongMemEval

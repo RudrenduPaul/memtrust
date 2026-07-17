@@ -243,3 +243,230 @@ def test_run_accepts_compression_as_a_single_eval_selection(tmp_path: Path) -> N
     # name and the command doesn't crash, matching the "never crash on
     # missing credentials" contract exercised elsewhere in this file.
     assert data["results"]["mem0"]["status"] == "skipped"
+
+
+# ---------------------------------------------------------------------------
+# keygen / run --sign / verify -- signed-receipt commands
+# ---------------------------------------------------------------------------
+
+
+def test_keygen_writes_keypair(tmp_path: Path) -> None:
+    runner = CliRunner()
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    result = runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert priv_path.exists()
+    assert pub_path.exists()
+    assert "BEGIN PRIVATE KEY" in priv_path.read_text()
+
+
+def test_keygen_refuses_overwrite_without_force(tmp_path: Path) -> None:
+    runner = CliRunner()
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    result = runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    assert result.exit_code != 0
+
+
+def test_run_with_sign_produces_valid_receipt_verified_by_verify_command(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    keygen_result = runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    assert keygen_result.exit_code == 0, keygen_result.output
+
+    out_path = tmp_path / "report.json"
+    run_result = runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mem0",
+            "--eval",
+            "contradiction",
+            "--output",
+            str(out_path),
+            "--sign",
+            str(priv_path),
+        ],
+    )
+    assert run_result.exit_code == 0, run_result.output
+
+    receipt_path = out_path.with_name(out_path.stem + ".receipt.json")
+    assert receipt_path.exists()
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["algorithm"] == "Ed25519"
+    assert receipt["payload"]["run_id"] == json.loads(out_path.read_text())["run_id"]
+
+    verify_result = runner.invoke(
+        main, ["verify", str(receipt_path), "--public-key", str(pub_path)]
+    )
+    assert verify_result.exit_code == 0, verify_result.output
+    assert "valid: True" in verify_result.output
+
+
+def test_run_without_sign_does_not_produce_receipt(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        ["run", "--backends", "mem0", "--eval", "contradiction", "--output", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    receipt_path = out_path.with_name(out_path.stem + ".receipt.json")
+    assert not receipt_path.exists()
+
+
+def test_verify_detects_tampered_receipt(tmp_path: Path) -> None:
+    runner = CliRunner()
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    out_path = tmp_path / "report.json"
+    runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mem0",
+            "--eval",
+            "contradiction",
+            "--output",
+            str(out_path),
+            "--sign",
+            str(priv_path),
+        ],
+    )
+    receipt_path = out_path.with_name(out_path.stem + ".receipt.json")
+    receipt = json.loads(receipt_path.read_text())
+    receipt["payload"]["backends_requested"] = ["tampered"]
+    receipt_path.write_text(json.dumps(receipt))
+
+    result = runner.invoke(main, ["verify", str(receipt_path), "--public-key", str(pub_path)])
+    assert result.exit_code != 0
+    assert "valid: False" in result.output
+
+
+def test_verify_with_wrong_public_key_fails(tmp_path: Path) -> None:
+    runner = CliRunner()
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    other_pub_path = tmp_path / "other.pub"
+    runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    runner.invoke(
+        main,
+        [
+            "keygen",
+            "--private-key-out",
+            str(tmp_path / "other.pem"),
+            "--public-key-out",
+            str(other_pub_path),
+        ],
+    )
+    out_path = tmp_path / "report.json"
+    runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mem0",
+            "--eval",
+            "contradiction",
+            "--output",
+            str(out_path),
+            "--sign",
+            str(priv_path),
+        ],
+    )
+    receipt_path = out_path.with_name(out_path.stem + ".receipt.json")
+
+    result = runner.invoke(main, ["verify", str(receipt_path), "--public-key", str(other_pub_path)])
+    assert result.exit_code != 0
+    assert "valid: False" in result.output
+
+
+def test_verify_uses_env_var_when_no_public_key_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = CliRunner()
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    out_path = tmp_path / "report.json"
+    runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mem0",
+            "--eval",
+            "contradiction",
+            "--output",
+            str(out_path),
+            "--sign",
+            str(priv_path),
+        ],
+    )
+    receipt_path = out_path.with_name(out_path.stem + ".receipt.json")
+
+    monkeypatch.setenv("MEMTRUST_RECEIPT_PUBLIC_KEY", pub_path.read_text())
+    result = runner.invoke(main, ["verify", str(receipt_path)])
+    assert result.exit_code == 0, result.output
+    assert "valid: True" in result.output
+
+
+def test_verify_without_public_key_or_env_var_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("MEMTRUST_RECEIPT_PUBLIC_KEY", raising=False)
+    runner = CliRunner()
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    runner.invoke(
+        main,
+        ["keygen", "--private-key-out", str(priv_path), "--public-key-out", str(pub_path)],
+    )
+    out_path = tmp_path / "report.json"
+    runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mem0",
+            "--eval",
+            "contradiction",
+            "--output",
+            str(out_path),
+            "--sign",
+            str(priv_path),
+        ],
+    )
+    receipt_path = out_path.with_name(out_path.stem + ".receipt.json")
+
+    result = runner.invoke(main, ["verify", str(receipt_path)])
+    assert result.exit_code != 0
