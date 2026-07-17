@@ -243,3 +243,83 @@ def test_run_accepts_compression_as_a_single_eval_selection(tmp_path: Path) -> N
     # name and the command doesn't crash, matching the "never crash on
     # missing credentials" contract exercised elsewhere in this file.
     assert data["results"]["mem0"]["status"] == "skipped"
+
+
+def test_scale_stress_eval_is_registered_in_all_evals() -> None:
+    assert "scale_stress" in ALL_EVALS
+
+
+def test_run_accepts_scale_stress_as_a_single_eval_selection(tmp_path: Path) -> None:
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        ["run", "--backends", "mem0", "--eval", "scale_stress", "--output", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    # mem0 is unconfigured (autouse fixture strips credentials), so it's
+    # skipped -- this just confirms "scale_stress" resolves as a known eval
+    # name and the command doesn't crash, matching the "never crash on
+    # missing credentials" contract exercised elsewhere in this file.
+    assert data["results"]["mem0"]["status"] == "skipped"
+
+
+def test_run_scale_stress_against_configured_backend_serializes_full_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Exercises the CLI's scale_stress wiring end to end against a mocked
+    Mem0 HTTP surface: the --scale-stress-n-records flag is honored (kept
+    small here so the mocked HTTP round trips stay fast), the JSON report
+    carries a fully-populated ScaleTestResult, and `memtrust report` renders
+    the new Scale/Volume Stress column without crashing.
+    """
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/",
+        json={"id": "mem-x"},
+        is_reusable=True,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/search/",
+        json={"results": [{"id": "mem-x", "memory": "some recalled content"}]},
+        is_reusable=True,
+    )
+
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mem0",
+            "--eval",
+            "scale_stress",
+            "--scale-stress-n-records",
+            "20",
+            "--output",
+            str(out_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    scale_stress = data["results"]["mem0"]["evals"]["scale_stress"]
+    assert scale_stress["n_records_requested"] == 20
+    assert scale_stress["backend"] == "mem0"
+    assert scale_stress["signal"] in {
+        "worked_at_scale",
+        "silently_degraded_at_scale",
+        "partial_degradation",
+        "error",
+        "not_applicable",
+    }
+    assert scale_stress["records_stored"] == 20
+    assert len(scale_stress["checkpoints"]) >= 2
+    assert "signal:" in result.output
+
+    report_result = runner.invoke(main, ["report", str(out_path)])
+    assert report_result.exit_code == 0, report_result.output
+    assert "Scale/Volume Stress" in report_result.output
