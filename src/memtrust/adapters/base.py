@@ -82,6 +82,40 @@ class CrashSignal(StrEnum):
     awareness first, raising this exact `TypeError` from Python's own
     datetime comparison, surfaced through graphiti_core's internals."""
 
+    QUERY_SANITIZATION_ERROR = "query_sanitization_error"
+    """A RediSearch `Syntax error` raised from FalkorDB's fulltext-query
+    path (message contains both "redisearch" and "syntax error", e.g.
+    `"RediSearch: Syntax error at offset 22 near my_graph"`). Matches the
+    shape of two independently-documented graphiti-core bugs, both in
+    `graphiti_core.driver.falkordb_driver.FalkorDriver`'s `sanitize()`/
+    `build_fulltext_query()`:
+
+      * getzep/graphiti#1222 (closed, superseded by #1475): when a query's
+        sanitized/stopword-filtered token list comes back empty (e.g. an
+        empty query string, such as `explore_node` called with only a
+        `node_uuid` and no `node_name`), `build_fulltext_query()` appends
+        empty parentheses to the group filter, producing invalid RediSearch
+        syntax of the exact shape `(@group_id:"...") ()`.
+      * getzep/graphiti#1183 (merged): before this fix, `sanitize()`'s
+        character-replacement map omitted pipe (`|`), slash (`/`), and
+        backslash (`\\`) -- episode text containing those characters (e.g.
+        `"install.sh | bash"`) survived sanitization, tokenized on
+        whitespace into a stray `|` token, and got rejoined with `" | "`
+        as a RediSearch OR separator, producing an adjacent-pipe malformed
+        query (`"sh | | | bash"`) with an empty token between delimiters.
+        The merged fix added those three characters to `sanitize()`'s map
+        and filters empty tokens before joining.
+
+    Both bugs raise the identical `RediSearch: Syntax error ...` message
+    shape once FalkorDB's RediSearch engine parses the malformed query --
+    this signal does not distinguish which of the two produced a given
+    crash, only that the shape matches. The real exception here is
+    typically a `redis`-client `ResponseError`; see
+    zep_graphiti_selfhosted_adapter.py's `_classify_crash()` for the exact
+    substring match (message-only, not `isinstance`, since this adapter
+    does not import the optional `redis`/`falkordb` packages directly) and
+    docs/methodology.md for the honesty caveat."""
+
     UNKNOWN = "unknown"
     """The caught exception's type/message did not match any known crash
     shape this enum classifies. This is the honest, expected outcome for
