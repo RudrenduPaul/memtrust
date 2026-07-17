@@ -105,6 +105,16 @@ class LoCoMoCaseResult:
     and ConflictSignal.EMPTY_OR_LOST for the same distinction applied
     here: a silent empty-success from the backend is not the same
     diagnostic as a judge-graded wrong answer."""
+    degraded_retrieval: bool = False
+    """True when adapter.query() completed without error and returned at
+    least one record, but the backend's own response signaled it
+    under-delivered anyway -- see LongMemEvalCaseResult.degraded_retrieval
+    and adapters/base.py's RetrievalWarning (confirmed against the real,
+    merged MemPalace/mempalace#1005 PR diff). Distinct from records_empty:
+    a case can have records_empty=False and degraded_retrieval=True at
+    the same time, separating "backend warned us, we surfaced it" from
+    "backend silently returned wrong or incomplete facts with no signal
+    at all."""
     excluded_ground_truth: bool = False
     """True when this case's question_id was listed in the caller's
     exclude_question_ids set -- the case is still recorded (so n_cases
@@ -162,6 +172,13 @@ class LoCoMoResult:
         """Count of cases where the backend call succeeded but returned
         zero records -- see LoCoMoCaseResult.records_empty."""
         return sum(1 for c in self.case_results if c.records_empty)
+
+    @property
+    def n_degraded_retrieval(self) -> int:
+        """Count of cases where the backend's own response signaled
+        under-delivered (but non-empty) retrieval -- see
+        LoCoMoCaseResult.degraded_retrieval."""
+        return sum(1 for c in self.case_results if c.degraded_retrieval)
 
     @property
     def n_excluded_ground_truth(self) -> int:
@@ -315,6 +332,7 @@ def run_locomo(
                     reasoning=judge_result.reasoning,
                     question_id=question_id,
                     records_empty=not query_result.records,
+                    degraded_retrieval=query_result.degraded_retrieval is not None,
                 )
             )
 
