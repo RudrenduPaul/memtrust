@@ -4,7 +4,7 @@ This document is the source of truth for how memtrust scores agent-memory backen
 decision, a prompt, or a dataset choice is not written down here, it should not be trusted and it
 should not ship. Every claim in the README traces back to something on this page.
 
-Last updated: 2026-07-11, alongside the v0.1 release.
+Last updated: 2026-07-16, adding the Scale/Volume-Stress eval.
 
 ## What requires a live vendor API key, and what runs fully offline
 
@@ -18,6 +18,7 @@ This matters because it changes what a number *means*.
 | Contradiction-detection eval | Yes, one vendor API key | No LLM judge involved -- classification is done by direct substring comparison against the known fixture values (see below), which is cheaper and more auditable than an LLM judge for this specific eval. |
 | Compression/round-trip-fidelity eval | Yes, one vendor API key (more if the backend declares more than one `supported_modes` entry) | No LLM judge involved -- fidelity is scored by a direct, deterministic text-similarity ratio against the literal stored content (see below). **Has not been run against any live backend as of this writing.** |
 | Ranking-Quality eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct comparison of returned record order against per-record metadata values and known insertion order (see below). **Has not been run against any live backend as of this writing.** |
+| Scale/Volume-Stress eval | Yes, one vendor API key, to reach a real backend at all -- but see the honest limitation below, this has only ever been run against fake in-memory adapters so far | No LLM judge involved -- classification is a direct comparison of re-query recall at small vs. large synthetic-corpus checkpoints (see below). **Has not been run against any live backend at real scale (10K+ records / 300+ episodes) as of this writing; `pytest`'s coverage is entirely against fake adapters engineered to model the two motivating bug shapes.** |
 | Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
@@ -267,6 +268,56 @@ To use it:
   this change, since `supports_resource_sync` is currently only `True` on `OpenVikingAdapter`. See
   CONTRIBUTING.md.
 
+### MemTrust Scale/Volume-Stress Eval (original)
+
+- **Not derived from any published dataset.** Every other eval in this package (contradiction,
+  ranking-quality, resource-sync-safety, compression) runs against a hand-written fixture of
+  4-7 cases -- fine for exercising correctness logic, but structurally incapable of reaching the
+  corpus size at which two real, documented, still-open vendor reports actually manifest:
+  **volcengine/OpenViking#2850** (lg320531124) -- BM25 search silently returning empty results
+  once a corpus grows large -- and **getzep/graphiti#1275** (rafaelreis-r) -- O(n)
+  entity-resolution context growth silently dropping episodes once ingestion passes roughly 300
+  episodes. Both are the same underlying gap: nothing in this repo, before this change, ever
+  stored more than a handful of records, so neither bug shape had anywhere to show up.
+- **Fixture generator:** `src/memtrust/evals/scale_fixtures.py`'s `generate_scale_corpus(n,
+  seed=...)`, not a checked-in file. A hand-typed fixture cannot reach 10,000+ realistic-looking
+  records; a deterministic generator (seeded `random.Random`) can, reproducibly, for any `n` a
+  caller asks for. Every generated record embeds a unique, greppable marker token
+  (`SCALEMARK{index:06d}`) in fact-shaped prose, so "is this specific record still recoverable"
+  reduces to a literal substring check -- the same shape of query BM25-style lexical search
+  actually serves, and the shape #2850 concerns (a literal keyword search coming back empty).
+- **Eval:** `src/memtrust/evals/scale_stress.py`'s `run_scale_stress_eval()`. Stores `n_records`
+  synthetic records incrementally and, at a small ascending set of checkpoints (default
+  `[5, n//10, n//2, n]` for a typical `n=500` run: `[5, 50, 250, 500]`), re-queries by marker
+  token to measure recall as a function of corpus size, in two independent shapes: a fixed
+  **anchor** record (the very first one ever stored -- becoming unrecoverable as volume grows is
+  the #1275 shape, old content silently evicted) and a **sample** spread across everything stored
+  so far (recall collapsing as volume grows, independent of which record, is the #2850 shape,
+  search itself degrading). `ScaleTestResult`/`ScaleSignal` (`WORKED_AT_SCALE`,
+  `SILENTLY_DEGRADED_AT_SCALE`, `PARTIAL_DEGRADATION`, `ERROR`, `NOT_APPLICABLE`) follow the same
+  ground-truth-driven, never-trust-"didn't raise" convention every other eval's signal enum in
+  this package already follows.
+- **What this closes, precisely, and what it does not.** This change closes the *volume
+  precondition*: memtrust can now generate and store an arbitrarily large synthetic corpus against
+  any adapter and measure recall as corpus size grows, which is what makes a scale-dependent bug
+  class like #2850 or #1275 structurally reachable by this harness at all. It does **not**
+  reproduce either vendor's real production behavior end-to-end -- that requires
+  `run_scale_stress_eval()` to be pointed at a live, credentialed OpenViking or Graphiti backend
+  with `n_records` in the thousands (and, for #1275 specifically, at least ~300 real episodes
+  through Graphiti's actual `add_episode()` path, not memtrust's generic `store()`), and no test in
+  this repo does that. `tests/test_scale_stress.py`'s three purpose-built fake adapters
+  (`ScaleCleanFakeAdapter` as the negative control; `ScaleEmptyAtVolumeFakeAdapter` modeling
+  #2850's "search goes silently empty past a threshold" shape; `ScaleEvictsOldFakeAdapter`
+  modeling #1275's "oldest content silently falls out of the search window" shape) prove the
+  *eval's own classification logic* correctly tells scale-invariant recall apart from both
+  degradation shapes -- they do not, and cannot, prove that OpenViking's or Graphiti's real
+  production systems currently exhibit either bug.
+- **Extending this eval:** pointing a real run at the scale the motivating bugs need means passing
+  a much larger `--scale-stress-n-records` to `memtrust run` (e.g. `10000`) against a real,
+  credentialed backend -- the harness itself places no cap beyond
+  `scale_fixtures.generate_scale_corpus`'s 999,999-record limit (a fixed-width marker format, not
+  a scale judgment). See CONTRIBUTING.md.
+
 ## Resource-Sync-Safety scoring logic
 
 Implemented in `src/memtrust/evals/resource_sync_safety.py`, function `classify_resource_sync_file()`,
@@ -402,6 +453,48 @@ a live palace's write path, not a black-box query-response inference -- and this
 query-response-only view would, on its own, only ever justify the weaker claim above. A
 `MISSING_ORDERING_KEY` result is a strong prompt to go verify the stronger claim by inspecting the
 backend's actual ingest/write path (as #1733 did), not proof of it by itself.
+
+## Scale/volume stress scoring logic
+
+Implemented in `src/memtrust/evals/scale_stress.py`, function `classify_scale_result()`, called
+from `run_scale_stress_eval()`. For a run of `n_records`:
+
+1. Generate `n_records` deterministic synthetic records via `scale_fixtures.generate_scale_corpus()`.
+2. Store them one at a time via `adapter.store()`, tracking which indices actually succeeded
+   (a `BackendAPIError` on an individual `store()` call is counted, not fatal to the run).
+3. At each checkpoint size (default `[5, n//10, n//2, n]`), re-query for the anchor record
+   (index 0) plus a fixed-size sample (`SAMPLE_SIZE_PER_CHECKPOINT=5`) of everything stored so
+   far, by each record's unique marker token, and check whether the marker is actually present
+   in the joined text of the returned records -- never trusts "`query()` didn't raise" as proof a
+   record came back, the same rule every other eval in this package applies.
+4. Compute `recall_rate` per checkpoint, `recall_degradation_pct` (first scoreable checkpoint's
+   recall minus the last, in percentage points), and `anchor_lost_at_n` (the smallest checkpoint
+   at which a previously-recoverable anchor stopped being recoverable).
+
+Classification (first matching rule wins):
+
+| Condition | Signal |
+|---|---|
+| Fewer than 2 checkpoints produced a scoreable recall rate | **NOT_APPLICABLE** -- nothing to compare "small scale" against "large scale" with |
+| Anchor record recoverable at an earlier checkpoint, unrecoverable at a later one | **SILENTLY_DEGRADED_AT_SCALE** -- the getzep/graphiti#1275 shape: old content silently evicted as volume grows |
+| Sample recall dropped by >= `DEGRADATION_THRESHOLD_PP` (15pp) between the first and last scoreable checkpoint | **SILENTLY_DEGRADED_AT_SCALE** -- the volcengine/OpenViking#2850 shape: search itself degrades at volume |
+| Final-checkpoint recall below `MIN_ACCEPTABLE_FINAL_RECALL` (0.9), but not via a scale-correlated drop | **PARTIAL_DEGRADATION** -- recall is genuinely incomplete, but not distinguishably volume-triggered (could be an ordinary indexing miss present at every scale) |
+| Otherwise | **WORKED_AT_SCALE** |
+
+Every `store()`/`query()` call that raises `BackendAPIError` is caught and counted rather than
+crashing the run; if every single `store()` call fails, the run is classified `ERROR` (a distinct,
+more informative outcome than the generic `NOT_APPLICABLE` "not enough data" bucket -- see
+`ScaleSignal.ERROR`'s docstring).
+
+**Honest limitation -- read this before trusting a `SILENTLY_DEGRADED_AT_SCALE` (or
+`WORKED_AT_SCALE`) result.** As stated above and in `scale_stress.py`'s own module docstring, this
+eval has only ever been exercised in this build against fake, in-memory adapters purpose-built to
+either degrade at a hard-coded threshold or scale cleanly. It proves the *classification logic*
+correctly separates those two shapes given real recall measurements. It does not, on its own, say
+anything about whether a live OpenViking or Graphiti deployment currently exhibits #2850 or #1275
+-- that requires an actual `memtrust run --backends openviking --eval scale_stress
+--scale-stress-n-records 10000` (or the Graphiti equivalent, driven through real episode
+ingestion) against a real, credentialed instance, which this build did not do.
 
 ## LLM-judge prompt template
 
@@ -900,3 +993,19 @@ unrelated `ValueError`/`TypeError` and a generic `RuntimeError` all correctly fa
 capability: distinguishing these two specific known bug classes from an opaque generic failure.
 It is not, and should not be read as, evidence that this adapter reproduces either crash against
 a live deployment -- that remains exactly the unverified gap the paragraph above describes.
+
+The same objection, in its strongest form yet, applies to the Scale/Volume-Stress eval added for
+volcengine/OpenViking#2850 and getzep/graphiti#1275. What this change actually built and verified:
+a deterministic synthetic-corpus generator that can produce an arbitrarily large, realistic-shaped
+record set; an eval that stores that corpus incrementally and measures recall as a function of
+corpus size at a series of checkpoints; and a classifier, unit-tested against three purpose-built
+fake adapters, that correctly tells "recall stayed scale-invariant" apart from both "anchor record
+silently evicted as volume grew" (#1275's shape) and "search collapsed to empty past a volume
+threshold" (#2850's shape). What it did not do: run against a live OpenViking or Graphiti instance
+at any scale, let alone the 10K+ records or 300+ real episodes the two cited issues describe.
+`DEFAULT_N_RECORDS=500` is a CI-speed default, not a claim about the scale where either bug
+manifests -- reaching that scale for real requires `--scale-stress-n-records 10000` (or larger)
+against a credentialed backend, which this build pass did not run. Nobody should read a
+`SILENTLY_DEGRADED_AT_SCALE` or `WORKED_AT_SCALE` result in a report generated by this repo as
+confirmation of either vendor's current live behavior -- it confirms only that memtrust's harness
+is now structurally capable of detecting that shape of bug *if* a live backend exhibits it.
