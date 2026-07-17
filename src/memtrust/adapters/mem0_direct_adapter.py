@@ -228,6 +228,36 @@ defaults to a hardcoded `1536` in the installed package -- see the Qdrant
 support section above), so they never silently disagree. `query()` also
 accepts an optional `threshold` keyword argument, forwarded straight
 through to the real `Memory.search()`.
+
+## Custom fact-extraction prompt passthrough
+
+`Mem0DirectAdapter.__init__` accepts an optional `custom_instructions`
+constructor argument, threaded straight into the top-level
+`custom_instructions` key of the config dict passed to
+`mem0.Memory.from_config()`. Confirmed by reading the installed
+`mem0ai==2.0.12` source directly (`mem0/configs/base.py`'s `MemoryConfig`):
+there is no `custom_fact_extraction_prompt` field on the installed
+`MemoryConfig` at all -- mem0 renamed that field to `custom_instructions`
+(mem0ai/mem0#4740, documented in the installed package's own
+`docs/changelog/sdk.mdx` and `docs/migration/oss-v2-to-v3.mdx`), and
+`Memory.from_config()` (`mem0/memory/main.py`) does a plain
+`MemoryConfig(**config_dict)`, so `custom_instructions` is the real,
+current top-level key this adapter must set, not the older, since-renamed
+name.
+
+This closes the gap mem0ai/mem0#4573 (jamebobob's 32-day production audit
+-- the founding rationale for `evals/extraction_quality.py` and its
+`ExtractionQualitySignal`) and a follow-up production report from GitHub
+user farrrr documented: farrrr reported that rewriting mem0's default
+fact-extraction prompt measurably reduced the junk-retention rate the
+audit found, but `Mem0DirectAdapter` had no constructor argument to set
+one, so that specific mitigation was unreachable through this adapter.
+With `custom_instructions` now threaded through, a caller can construct
+two adapters -- one with the default prompt, one with a rewritten
+`custom_instructions` -- and compare their junk-retention rate via
+`extraction_quality.py`'s existing `ExtractionQualitySignal` classification
+(building an automated A/B-comparison mode for that eval is a separate,
+larger item, out of scope here).
 """
 
 from __future__ import annotations
@@ -339,6 +369,7 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         vector_store_provider: str | None = None,
         vector_store_config: dict[str, object] | None = None,
         graph_store_provider: str | None = None,
+        custom_instructions: str | None = None,
         memory: _MemoryProtocol | None = None,
     ) -> None:
         if memory is not None:
@@ -349,6 +380,7 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
             self._construction_error: str | None = None
             self._embedder_provider = embedder_provider or "injected"
             self._vector_store_provider = vector_store_provider or "redis"
+            self._custom_instructions = custom_instructions
             return
 
         resolved_embedder_provider = embedder_provider or os.environ.get(self.env_var)
@@ -410,12 +442,24 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
 
         self._embedder_provider = resolved_embedder_provider
         self._vector_store_provider = resolved_vector_store_provider
+        self._custom_instructions = custom_instructions
         self._config_dict: dict[str, object] = {
             "embedder": {"provider": resolved_embedder_provider, "config": built_embedder_config},
             "vector_store": {
                 "provider": resolved_vector_store_provider,
                 "config": built_vector_store_config,
             },
+            # `MemoryConfig.custom_instructions` (mem0/configs/base.py) is
+            # the real, current top-level key -- mem0 renamed the field
+            # from `custom_fact_extraction_prompt` to `custom_instructions`
+            # in mem0ai/mem0#4740. See module docstring's "Custom
+            # fact-extraction prompt passthrough" section. Set
+            # unconditionally, same convention `_build_embedder_config`
+            # uses for `embedding_dims`: `None` here is what mem0's own
+            # `MemoryConfig.custom_instructions` field already defaults to,
+            # so passing it explicitly changes nothing when the caller
+            # didn't set one.
+            "custom_instructions": custom_instructions,
         }
         self._memory = None
         self._construction_error = None

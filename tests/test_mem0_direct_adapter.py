@@ -728,6 +728,74 @@ def test_qdrant_vector_store_url_env_var_is_provider_specific(
 
 
 # ---------------------------------------------------------------------------
+# Custom fact-extraction prompt passthrough: mem0ai/mem0#4573 (jamebobob's
+# production audit) + a follow-up production report from GitHub user
+# farrrr, who reported that rewriting mem0's default fact-extraction prompt
+# reduced the junk-retention rate the audit documented. Confirms
+# Mem0DirectAdapter's `custom_instructions` constructor argument -- the
+# real, current mem0.configs.base.MemoryConfig field (mem0 renamed
+# `custom_fact_extraction_prompt` to `custom_instructions` in
+# mem0ai/mem0#4740, per the installed package's own changelog/migration
+# docs) -- is actually threaded through to the config dict passed to
+# `mem0.Memory.from_config()`, mirroring how the qdrant tests above verify
+# other config-passthrough parameters.
+# ---------------------------------------------------------------------------
+
+
+def test_custom_instructions_is_threaded_into_the_config_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors test_qdrant_vector_store_config_threads_embedder_dims_into_
+    embedding_model_dims above: constructs a real (non-injected)
+    Mem0DirectAdapter and inspects `_config_dict` -- the exact dict
+    `_get_memory()` passes to `mem0.Memory.from_config()` -- without
+    triggering real mem0.Memory construction.
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "redis://localhost:6379")
+
+    custom_prompt = "Extract only explicit user preferences; ignore small talk and pleasantries."
+    adapter = Mem0DirectAdapter(custom_instructions=custom_prompt)
+
+    assert adapter._config_dict["custom_instructions"] == custom_prompt  # type: ignore[comparison-overlap]
+
+
+def test_custom_instructions_defaults_to_none_when_not_provided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "redis://localhost:6379")
+
+    adapter = Mem0DirectAdapter()
+
+    assert adapter._config_dict["custom_instructions"] is None
+
+
+def test_real_memory_config_accepts_and_stores_custom_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real-package regression: exercises the actual installed
+    `mem0.configs.base.MemoryConfig` directly (the same class
+    `Memory.from_config()` builds via `MemoryConfig(**config_dict)`,
+    confirmed by reading `mem0/memory/main.py`) with exactly the shape
+    `Mem0DirectAdapter._config_dict` produces, and confirms the real,
+    installed pydantic model accepts and round-trips `custom_instructions`
+    -- proving this adapter's config dict is not just internally
+    consistent but genuinely valid against the installed mem0ai schema.
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "redis://localhost:6379")
+
+    custom_prompt = "Focus on durable facts (names, relationships, preferences), not one-off events"
+    adapter = Mem0DirectAdapter(custom_instructions=custom_prompt)
+
+    from mem0.configs.base import MemoryConfig
+
+    config = MemoryConfig(**adapter._config_dict)  # type: ignore[arg-type]
+    assert config.custom_instructions == custom_prompt
+
+
+# ---------------------------------------------------------------------------
 # Real-package regression: mem0ai/mem0#4297 (embedding-dimension mismatch).
 # Exercises the actual installed mem0.vector_stores.qdrant.Qdrant and
 # mem0.configs.vector_stores.qdrant.QdrantConfig classes directly (mocking
