@@ -2494,6 +2494,52 @@ class _PipeSlashSanitizationErrorGraphitiClient:
         pass
 
 
+class _NulByteQueryParameterErrorGraphitiClient:
+    """`add_episode()` raises the exact `redis.exceptions.ResponseError`
+    shape/message getzep/graphiti#1525's own filed reproduction reports
+    (`gh issue view 1525 --repo getzep/graphiti`): a NUL byte embedded in
+    episode content survives FalkorDB's client-side query-parameter
+    serialization and makes FalkorDB's parser reject the entire bulk
+    episode-save query. Same "plain Exception, not a real redis import"
+    reasoning as the RediSearch-syntax-error fakes above -- the real
+    exception is a `redis`-client `ResponseError`, this test double
+    carries the real message text instead."""
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        raise Exception("Failed to parse query parameter 'episodes' value")
+
+    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise NotImplementedError
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
+class _EmbeddingBatchCountMismatchGraphitiClient:
+    """`add_episode()` raises the exact `ValueError` shape/message
+    getzep/graphiti#1467's own filed reproduction reports (`gh issue view
+    1467 --repo getzep/graphiti`): `GeminiEmbedder.create_batch()`
+    silently returning fewer vectors than inputs for the
+    gemini-embedding-2* model family eventually trips a
+    `zip(..., strict=True)` count-mismatch several frames away in
+    graphiti-core's own dedup pipeline, reached from `add_episode()`."""
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        raise ValueError("zip() argument 2 is shorter than argument 1")
+
+    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise NotImplementedError
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
 def test_graphiti_selfhosted_configured_via_falkordb_url_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2503,6 +2549,64 @@ def test_graphiti_selfhosted_configured_via_falkordb_url_alone(
     # alone satisfies configuration, the same "one env var, or SKIPPED"
     # contract GRAPHITI_NEO4J_URI satisfies on its own.
     ZepGraphitiSelfHostedAdapter()
+
+
+# ---------------------------------------------------------------------------
+# GeminiEmbedder support (getzep/graphiti#1467, elimydlarz) -- embedder
+# selection is a genuinely new capability this adapter had no code path for
+# at all before this build. `_build_embedder()` is unit-tested directly
+# (it needs no live graphiti_core/Neo4j/FalkorDB connection); the actual
+# `Graphiti(embedder=...)` construction call it feeds is confirmed by
+# reading the real graphiti_core source only, same convention this file's
+# module docstring already applies to neo4j_user/falkordb host/port
+# threading -- graphiti-core is not installed in this test environment
+# (see FakeGraphitiClient's own section header above), so _get_client()'s
+# real Graphiti(...) construction is never exercised end-to-end here.
+# ---------------------------------------------------------------------------
+
+
+def test_graphiti_selfhosted_gemini_provider_without_api_key_raises_not_configured() -> None:
+    with pytest.raises(BackendNotConfiguredError):
+        ZepGraphitiSelfHostedAdapter(neo4j_uri="bolt://localhost:7687", embedder_provider="gemini")
+
+
+def test_graphiti_selfhosted_gemini_provider_with_injected_client_does_not_require_api_key() -> (
+    None
+):
+    # Test-injection path (graphiti_client=) bypasses real construction
+    # entirely, same convention every other constructor guard in this
+    # adapter follows -- a caller supplying a fake/real client directly
+    # should never be blocked by a credential check that only matters for
+    # real construction.
+    ZepGraphitiSelfHostedAdapter(graphiti_client=FakeGraphitiClient(), embedder_provider="gemini")
+
+
+def test_graphiti_selfhosted_build_embedder_returns_none_by_default() -> None:
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=FakeGraphitiClient())
+    assert adapter._build_embedder() is None
+
+
+def test_graphiti_selfhosted_build_embedder_unsupported_provider_raises() -> None:
+    adapter = ZepGraphitiSelfHostedAdapter(
+        graphiti_client=FakeGraphitiClient(), embedder_provider="cohere"
+    )
+    with pytest.raises(BackendAPIError, match="unsupported embedder_provider"):
+        adapter._build_embedder()
+
+
+def test_graphiti_selfhosted_build_embedder_gemini_raises_clear_error_when_package_missing() -> (
+    None
+):
+    # graphiti-core is not installed in this test environment (confirmed
+    # elsewhere in this file) -- this exercises the real ImportError path
+    # for the Gemini embedder wiring, not a simulated one, same convention
+    # test_graphiti_selfhosted_get_client_raises_clear_error_when_package_missing
+    # already establishes for _get_client() itself.
+    adapter = ZepGraphitiSelfHostedAdapter(
+        graphiti_client=FakeGraphitiClient(), embedder_provider="gemini", gemini_api_key="key-123"
+    )
+    with pytest.raises(BackendAPIError):
+        adapter._build_embedder()
 
 
 def test_graphiti_selfhosted_store_query_update_with_fake_client() -> None:
@@ -2731,6 +2835,79 @@ def test_classify_crash_redisearch_message_requires_both_substrings() -> None:
     # never fires on an unrelated syntax error from a different source.
     assert _classify_crash(Exception("Syntax error near token")) == CrashSignal.UNKNOWN
     assert _classify_crash(Exception("RediSearch: connection refused")) == CrashSignal.UNKNOWN
+
+
+def test_classify_crash_embedding_batch_count_mismatch_matches_1467_shape() -> None:
+    # getzep/graphiti#1467's exact filed reproduction message: a strict-zip
+    # count mismatch several frames away from GeminiEmbedder.create_batch()
+    # silently returning too few vectors.
+    assert (
+        _classify_crash(ValueError("zip() argument 2 is shorter than argument 1"))
+        == CrashSignal.EMBEDDING_BATCH_COUNT_MISMATCH
+    )
+    # The reverse-argument-order phrasing (whichever list came up short)
+    # must classify the same way.
+    assert (
+        _classify_crash(ValueError("zip() argument 1 is shorter than argument 2"))
+        == CrashSignal.EMBEDDING_BATCH_COUNT_MISMATCH
+    )
+
+
+def test_classify_crash_zip_message_requires_both_substrings() -> None:
+    # A ValueError that only mentions "zip()" or only "shorter than" (not
+    # both) must NOT be miscategorized as EMBEDDING_BATCH_COUNT_MISMATCH.
+    assert _classify_crash(ValueError("zip() takes no keyword arguments")) == CrashSignal.UNKNOWN
+    assert _classify_crash(ValueError("list is shorter than expected")) == CrashSignal.UNKNOWN
+
+
+def test_graphiti_selfhosted_store_classifies_1467_embedding_batch_count_mismatch() -> None:
+    """A fake client raising getzep/graphiti#1467's exact ValueError shape
+    is classified as CrashSignal.EMBEDDING_BATCH_COUNT_MISMATCH on the
+    raised BackendAPIError, not the generic default."""
+    adapter = ZepGraphitiSelfHostedAdapter(
+        graphiti_client=_EmbeddingBatchCountMismatchGraphitiClient()
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content extracting 2+ entities")
+    assert exc_info.value.crash_signal == CrashSignal.EMBEDDING_BATCH_COUNT_MISMATCH
+
+
+def test_classify_crash_nul_byte_query_parameter_error_matches_1525_shape() -> None:
+    # getzep/graphiti#1525's exact filed reproduction message: a NUL byte
+    # embedded in episode content makes FalkorDB reject the entire bulk
+    # episode-save query with this message shape.
+    assert (
+        _classify_crash(Exception("Failed to parse query parameter 'episodes' value"))
+        == CrashSignal.QUERY_PARAMETER_PARSE_ERROR
+    )
+    # Case-insensitive, and matches regardless of which parameter name is
+    # embedded in the message.
+    assert (
+        _classify_crash(Exception("failed to parse query parameter 'content' value"))
+        == CrashSignal.QUERY_PARAMETER_PARSE_ERROR
+    )
+
+
+def test_classify_crash_query_parameter_message_requires_both_substrings() -> None:
+    # A message that only contains one of the two required substrings must
+    # NOT be miscategorized as QUERY_PARAMETER_PARSE_ERROR.
+    assert _classify_crash(Exception("Failed to parse query parameter")) == CrashSignal.UNKNOWN
+    assert _classify_crash(Exception("invalid value for parameter")) == CrashSignal.UNKNOWN
+
+
+def test_graphiti_selfhosted_store_classifies_1525_nul_byte_query_parameter_error() -> None:
+    """A fake client raising getzep/graphiti#1525's exact ResponseError
+    shape is classified as CrashSignal.QUERY_PARAMETER_PARSE_ERROR on the
+    raised BackendAPIError, not the generic default -- store() classifies
+    this via its existing generic `except Exception` fallback (the real
+    exception is neither ValueError nor TypeError, so it never hits the
+    (ValueError, TypeError) pre-filter #836/#920 use)."""
+    adapter = ZepGraphitiSelfHostedAdapter(
+        graphiti_client=_NulByteQueryParameterErrorGraphitiClient()
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content with a \x00 nul byte")
+    assert exc_info.value.crash_signal == CrashSignal.QUERY_PARAMETER_PARSE_ERROR
 
 
 def test_graphiti_selfhosted_store_classifies_836_unpack_error() -> None:
