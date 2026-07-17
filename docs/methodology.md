@@ -526,6 +526,68 @@ On the second line, give a one-sentence reason.
   (the CLI, the README, any downstream consumer) must treat `None` as "not measured," never as a
   failing score.
 
+### Retrieval-graded accuracy vs. generated-answer accuracy
+
+**This is the same category of conflation the "Why this exists" section of the README calls out
+in MemPalace's own numbers (mempalace/mempalace#27) -- and it applies to memtrust's own
+`accuracy` metric too, undisclosed until this section was added.** Raised independently by
+rohitg00 (mempalace/mempalace#367), a maintainer of a competing memory-benchmark project who
+found the identical ambiguity while auditing MemPalace's benchmark claims.
+
+Look at what `actual_answer` actually is in both eval runners:
+
+```python
+# src/memtrust/evals/longmemeval.py, run_longmemeval()
+actual_answer = " ".join(r.content for r in query_result.records)
+judge_result = judge.judge_answer(example["question"], example["answer"], actual_answer)
+```
+
+```python
+# src/memtrust/evals/locomo.py, run_locomo()
+actual_answer = " ".join(r.content for r in query_result.records)
+judge_result = judge.judge_answer(qa["question"], qa["answer"], actual_answer)
+```
+
+`actual_answer` is the raw, concatenated text of whatever records `adapter.query()` returned --
+the backend's retrieved content, verbatim. There is no answer-generation step anywhere in either
+runner: memtrust never takes that retrieved content, feeds it plus the question to a model, and
+asks the model to compose an answer. The LLM judge in `src/memtrust/scoring/llm_judge.py` is
+handed the raw retrieved text directly as `{actual}` in the prompt template above and asked
+whether *that* is factually equivalent to the expected answer.
+
+**Why this matters.** The official LongMemEval and LoCoMo leaderboards score a full
+retrieve-then-generate-then-judge pipeline: a model reads the retrieved context and composes an
+answer in its own words, and that generated answer is what gets judged against the expected
+answer. memtrust's `accuracy` skips the generation step entirely and judges the raw retrieved
+records instead. These are not the same measurement:
+
+- A backend that retrieves noisy or redundant records but happens to bury the correct fact
+  somewhere in the joined text can still score CORRECT here, even though a real generation step
+  might fail to extract that fact from the noise -- or might extract it easily, since generation
+  models are often good at exactly that. Either direction of divergence from a leaderboard number
+  is possible, and memtrust cannot currently tell you which.
+- A backend that retrieves the correct fact but phrases it awkwardly, or splits it across several
+  records whose *concatenation* reads as contradictory or incomplete even though each record is
+  individually correct, can score worse here than a generation step would have produced, since
+  there's no synthesis step to clean that up before judging.
+
+**This is a deliberate architectural choice, not an oversight being papered over.** memtrust's
+declared purpose (see `docs/methodology.md`'s opening paragraph and the README's "Why this
+exists" section) is to test memory-backend *retrieval* quality specifically -- what a backend's
+`store()`/`query()` surface actually returns -- not to benchmark a generation model bolted on
+top of it. Grading raw retrieved content directly is a reasonable way to isolate that question.
+But it means the resulting number answers a narrower question than "would an agent built on this
+backend answer this question correctly," which is what the official leaderboard figures measure.
+
+**The rule this section exists to state plainly:** any accuracy number memtrust reports for
+LongMemEval or LoCoMo must be labeled **"retrieval-graded accuracy"**, not bare "accuracy," in
+any place it's published (README, leaderboard, JSON report, CLI output), and must never be
+directly compared to the official LongMemEval/LoCoMo leaderboards' generate+judge QA-accuracy
+figures without that caveat attached. As of this writing memtrust has not published any live
+`accuracy` figures for either eval (see the "Benchmarks" section of the README and the
+credentials table at the top of this document) -- this label requirement applies from the first
+real number onward, not retroactively to a fabricated one.
+
 ## Adapter confidence levels
 
 Every adapter in `src/memtrust/adapters/` is built against real, cited vendor documentation, but

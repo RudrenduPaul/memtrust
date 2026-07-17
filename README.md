@@ -227,6 +227,14 @@ concepts rather than a confirmed API reference -- see the confidence table in
 `docs/methodology.md` before treating their output as authoritative, and consider that table's
 gaps a standing invitation to contribute a fix.
 
+**Labeling requirement for any future `accuracy` figure published here.** LongMemEval and LoCoMo
+`accuracy` grades the LLM judge's verdict on raw retrieved-record content directly -- there is no
+answer-generation step in either eval runner. This is not the same measurement as the official
+LongMemEval/LoCoMo leaderboards' generate-then-judge QA-accuracy scores. Any `accuracy` number
+this project publishes for those two evals must be labeled "retrieval-graded accuracy," not bare
+"accuracy," and must not be directly compared to leaderboard figures without that caveat. See
+`docs/methodology.md`'s "Retrieval-graded accuracy vs. generated-answer accuracy" section.
+
 ## GitHub Actions usage
 
 Run the suite on a schedule and publish results to the leaderboard:
