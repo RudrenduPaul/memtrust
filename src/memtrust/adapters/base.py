@@ -116,6 +116,33 @@ class CrashSignal(StrEnum):
     does not import the optional `redis`/`falkordb` packages directly) and
     docs/methodology.md for the honesty caveat."""
 
+    LEGACY_CORRUPT_RECORD_UNDELETABLE = "legacy_corrupt_record_undeletable"
+    """A `json.JSONDecodeError` raised while a write-path call (`store()`'s
+    overwrite/upsert path, `update()`, or `delete()`) attempted to parse a
+    response body, matching the shape of volcengine/OpenViking#2966
+    (contributor lRoccoon): a legacy uint16-length-truncated record
+    (written by a pre-#2171 OpenViking image whose buffer-size wraparound
+    bug silently truncated an oversized `fields` blob) can never be
+    deleted or overwritten through normal APIs, because
+    `LocalIndex.delete_data()`/`upsert_data()` both run
+    `_convert_delta_list_for_index()` ->
+    `FieldTypeConverter.convert_fields_for_index()`, which calls a bare
+    `json.loads(fields_json)` on the corrupt record's `fields`/`old_fields`
+    with no error handling -- `json.decoder.JSONDecodeError` propagates on
+    every call, so the record becomes a permanent "ghost" (visible to
+    search/startup-recovery mitigations that already tolerate it, but
+    structurally undeletable). This adapter has no access to OpenViking's
+    internal traceback once the vendor's own HTTP layer has already
+    responded -- it can only classify this shape from a malformed/
+    non-JSON response body its own `resp.json()` call fails to parse,
+    which is the observable symptom on the client side of the same
+    underlying bug. See openviking_adapter.py's `store()`/`update()`/
+    `delete()` and `docs/methodology.md` for the honesty caveat: this
+    classifies the shape by pattern-matching the client-visible exception,
+    it does not reproduce OpenViking's internal RocksDB/CandsTable state
+    or prove this specific call hit a legacy-truncated record versus some
+    other cause of a malformed response body."""
+
     UNKNOWN = "unknown"
     """The caught exception's type/message did not match any known crash
     shape this enum classifies. This is the honest, expected outcome for
@@ -290,6 +317,38 @@ class RankingSignal(StrEnum):
     to evaluate ordering at all. Recorded explicitly, never silently
     dropped from the results table -- same convention as
     ConflictSignal.NOT_APPLICABLE."""
+
+    RERANK_FALLBACK = "rerank_fallback"
+    """This response's own candidate set carries the same input shape two
+    independent, real OpenViking bug reports document as silently
+    degrading a reranker-backed query to raw vector-similarity scores with
+    no caller-visible signal: an empty-string document
+    (volcengine/OpenViking#1737, contributor wychosenone --
+    `RerankClient.rerank_batch` given an empty-string document makes the
+    VikingDB rerank API return a null response, which a swallowed
+    `TypeError` silently falls back from) or a candidate batch whose total
+    estimated token count exceeds the reranker's real input budget
+    (volcengine/OpenViking#2739/#2880, contributor hhspiny -- the
+    hierarchical retriever sends unbounded L2 abstracts, some 10k+ tokens,
+    into a single rerank batch, blowing past a typical local reranker's
+    ~4096-token limit; hhspiny's own production logs showed 280 failed
+    requests in this exact shape).
+
+    Both cited bugs are already fixed upstream (#1737 via merged #1933;
+    #2739/#2880 via merged PR#3289) by the time this signal was built, so
+    this adapter cannot reproduce either against a live current-version
+    OpenViking instance -- this signal exists so memtrust can *detect* the
+    same failure shape if it ever reproduces against an older/self-hosted/
+    pinned OpenViking version, the same honesty convention
+    ConflictSignal.EDGE_INTEGRITY_VIOLATION and
+    CorruptionSignal.CONFIG_REJECTED already establish above for
+    already-fixed-upstream bug classes. See openviking_adapter.py's
+    `_rerank_fallback_risk()` for the exact heuristic (empty-content
+    check, then an approximate ~4-chars/token budget estimate) and its own
+    honesty caveat: this flags the SHAPE a response's candidate set
+    carries, it does not confirm this specific live call actually fell
+    back to vector scores server-side, since this adapter has no way to
+    observe OpenViking's internal rerank-provider call at all."""
 
 
 class CorruptionSignal(StrEnum):
@@ -576,6 +635,122 @@ class ExtractionQualitySignal(StrEnum):
     enum's NOT_APPLICABLE above."""
 
 
+class VectorIntegritySignal(StrEnum):
+    """Whether a delete_prefix() call actually removed every vector-index
+    entry it addressed, or left child entries permanently orphaned while
+    reporting the prefix as gone.
+
+    This is the opposite polarity of ResourceSyncSignal (evals/
+    resource_sync_safety.py), which classifies files a resync wrongly
+    DELETED. This taxonomy classifies the reverse failure: entries a
+    delete wrongly KEPT. Distinct from CorruptionSignal above, which
+    classifies a single write call's own construction/write-path failure,
+    not a multi-entry recursive-delete's completeness.
+
+    Motivating case: volcengine/OpenViking#3064 (contributor AcTiveXXX).
+    `viking_fs.rm()`'s orphan-cleanup path, reached when a target path no
+    longer exists in AGFS (e.g. files were deleted directly from the
+    filesystem, bypassing OpenViking's own API), tries to discover child
+    URIs to delete via `_collect_uris()` -- which walks AGFS directory
+    listings and wraps that walk in a bare `except Exception: pass`. When
+    the directory itself is already gone, the listing call raises, the
+    bare except silently swallows it, and `_collect_uris()` returns an
+    empty list. Only the root URI then reaches `delete_uris()`, whose
+    filter is an exact-match `Eq("uri", ...)` with no prefix/recursive
+    semantics -- so every child vector-index entry beneath the root
+    survives, permanently orphaned (AcTiveXXX measured ~9% orphan rate in
+    a real deployment: ~100 orphans out of ~1,000 total entries). The
+    listing-based discovery this adapter's own `delete_prefix()` uses (see
+    openviking_adapter.py) is subject to the identical AGFS-listing
+    limitation when pointed at a live OpenViking server exhibiting this
+    bug -- this taxonomy exists so that shape is at least visible to a
+    caller instead of silently reported as a clean delete.
+    """
+
+    ORPHANED_VECTOR_ENTRY = "orphaned_vector_entry"
+    """After delete_prefix(), list_resource_paths() confirms every path
+    under the deleted prefix is gone (an AGFS-listing-level "deleted"
+    verdict), but a subsequent query() for content seeded under that
+    prefix still returns a matching record -- the vector index kept an
+    entry the filesystem-level listing already reports as removed. The
+    exact volcengine/OpenViking#3064 shape: `delete_uris()`'s exact-match
+    filter only ever removed the root URI, so child vector entries survive
+    the delete undetected by anything that only checks AGFS listings."""
+
+    CLEAN = "clean"
+    """After delete_prefix(), neither list_resource_paths() nor query()
+    surfaces any trace of content seeded under the deleted prefix -- the
+    delete was actually complete, not just reported complete."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """Either the adapter has no prefix-delete primitive to exercise at
+    all (MemoryBackendAdapter.supports_prefix_delete is False), or a
+    case's before/after state could not be established (e.g. seeding
+    itself failed). Recorded explicitly, same convention as every other
+    NOT_APPLICABLE member in this module."""
+
+
+class ConsistencySignal(StrEnum):
+    """Whether an identical query, repeated against unchanged stored data,
+    returns the same result set every time.
+
+    Every other taxonomy in this module classifies a SINGLE query()
+    response in isolation (correctness after a contradiction, ordering,
+    write-path corruption, extraction). None of them can see a backend
+    that is internally non-deterministic: each individual response can
+    look perfectly well-formed -- real records, real content, no error --
+    while the *set* of records returned for the exact same query changes
+    from call to call with nothing in the fixture data ever having
+    changed. This taxonomy exists specifically to classify that
+    consistency question, which requires issuing the same query() call
+    multiple times and comparing result sets against each other, not
+    against any ground truth a single response could carry.
+
+    Motivating case: volcengine/OpenViking#204 (contributor ponsde, a
+    repeat contributor to this project). `search()`/`find()` returned
+    non-deterministic result sets for identical repeated queries -- 5 runs
+    of the same query returned an average pairwise Jaccard similarity of
+    0.11 over the returned memory/resource URIs, and in ponsde's own
+    later, more rigorous 3-query x 5-run test, some query/method
+    combinations shared ZERO common URIs across all 5 runs. ponsde
+    self-diagnosed two candidate root causes through extensive follow-up
+    (source-tracing `viking_fs.py`'s no-session code path, and a clean-vs-
+    production A/B test): a production vector collection created at
+    `Dimension:3072` while the active embedding config specified `1024`
+    (an embedding-dimension mismatch corrupting the underlying ANN index),
+    and/or non-deterministic graph traversal in the HNSW ANN search
+    implementation itself, amplified by `HierarchicalRetriever`'s
+    recursive search mechanism. Neither root cause is something this
+    adapter can fix or directly observe (both live inside OpenViking's own
+    C++ engine layer) -- this taxonomy exists so memtrust can at least
+    *detect* the same non-deterministic-repeated-query shape ponsde
+    documented, using the identical Jaccard-similarity methodology his own
+    hand-built repro script already used. See
+    evals/result_consistency.py for the eval this taxonomy is scored by.
+    """
+
+    CONSISTENT = "consistent"
+    """N repeated, identical query() calls against unchanged fixture data
+    produced an average pairwise (consecutive-run) Jaccard similarity at
+    or above this eval's configured threshold -- the backend's result set
+    for this query is stable run to run, within the tolerance the
+    threshold allows for a genuinely ranked-and-truncated top_k result
+    that could reasonably reorder near a score tie."""
+
+    INCONSISTENT = "inconsistent"
+    """N repeated, identical query() calls against unchanged fixture data
+    produced an average pairwise Jaccard similarity below the configured
+    threshold -- the exact volcengine/OpenViking#204 shape: the same
+    query, against data that never changed between calls, returns a
+    meaningfully different result set from one call to the next."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """Fewer than 2 of the N repeated query() calls completed without
+    raising BackendAPIError, so there is no valid pair of result sets to
+    compare -- recorded explicitly rather than guessed at either way, same
+    convention as every other NOT_APPLICABLE member in this module."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
@@ -820,6 +995,56 @@ class DeleteResult:
     memory_id: str
     latency_ms: float
     raw: dict[str, object] = field(default_factory=dict)
+    corruption_signal: CorruptionSignal = CorruptionSignal.NOT_APPLICABLE
+    """See CorruptionSignal above and StoreResult.corruption_signal/
+    UpdateResult.corruption_signal -- same default-NOT_APPLICABLE
+    backward-compatibility reasoning, added here so DeleteResult mirrors
+    every other write-path result type rather than being the one write
+    primitive with no corruption-inspection surface at all. On this
+    adapter's real HTTP backends, a delete() call that hits a write-path
+    corruption shape (e.g. volcengine/OpenViking#2966's legacy uint16-
+    truncated records, see CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE)
+    raises BackendAPIError instead of returning a DeleteResult at all --
+    per this dataclass's own docstring above, adapters raise on failure
+    rather than returning success=False -- so this field stays at its
+    default for every adapter in this repo today. It exists for the same
+    forward-compatibility reason StoreResult/UpdateResult's fields do:
+    only a future adapter with a genuine direct-handle inspection surface
+    (see Mem0DirectAdapter's precedent for those two fields) could ever
+    set this to something other than NOT_APPLICABLE."""
+
+
+@dataclass
+class DeletePrefixResult:
+    """Result of MemoryBackendAdapter.delete_prefix() -- a recursive
+    directory/prefix delete, distinct from delete()/delete_many()'s
+    single-`memory_id`-at-a-time model. This is the primitive
+    evals/orphan_cleanup.py needs to reproduce the volcengine/
+    OpenViking#3064 shape: a prefix delete that reports success while
+    leaving child vector-index entries orphaned -- something delete() and
+    delete_many() cannot construct at all, since both require the caller
+    to already know every individual memory_id up front, while a real
+    orphan-cleanup delete targets a whole subtree by prefix without
+    necessarily knowing every leaf id in advance (exactly the scenario
+    #3064 describes: files removed directly from the backing filesystem,
+    so their ids/paths are unknown to the caller issuing the cleanup
+    delete).
+    """
+
+    prefix: str
+    deleted_paths: list[str]
+    """Every path (leaf files discovered via list_resource_paths(), plus
+    the prefix root itself) this call successfully deleted, in the order
+    delete() was called on them. Does NOT include paths this call never
+    discovered in the first place (e.g. a child the underlying listing
+    call silently omitted) -- see VectorIntegritySignal.ORPHANED_VECTOR_ENTRY
+    for the classification of exactly that gap."""
+    failed_paths: list[str]
+    """Every path this call discovered but whose delete() call either
+    raised BackendAPIError or returned success=False. Never silently
+    dropped -- same one-result-per-discovered-path accounting principle
+    delete_many() already establishes for delete()."""
+    latency_ms: float
 
 
 @dataclass
@@ -997,6 +1222,19 @@ class MemoryBackendAdapter(ABC):
     #: openviking_adapter.py's get_stats() for the one adapter that
     #: currently sets this True (volcengine/OpenViking#1255).
     supports_stats: bool = False
+
+    #: Whether this adapter exposes a recursive prefix/directory delete
+    #: primitive via delete_prefix() below, distinct from the single-
+    #: memory_id delete()/delete_many() every adapter must implement.
+    #: Defaults to False -- most adapters have no directory/resource-mirror
+    #: concept at all (the same store/query/update model that gates
+    #: supports_resource_sync above). Only an adapter with a real
+    #: directory-listing primitive to discover child paths by prefix (see
+    #: OpenVikingAdapter.list_resource_paths()) can implement this
+    #: meaningfully -- see evals/orphan_cleanup.py, the eval this gates,
+    #: and VectorIntegritySignal in this module for the failure shape
+    #: (volcengine/OpenViking#3064) it exists to detect.
+    supports_prefix_delete: bool = False
 
     @abstractmethod
     def store(
@@ -1331,6 +1569,44 @@ class MemoryBackendAdapter(ABC):
         """
         raise NotImplementedError(
             f"{self.name} does not implement get_stats() (supports_stats={self.supports_stats})"
+        )
+
+    def delete_prefix(self, prefix: str, recursive: bool = True) -> DeletePrefixResult:
+        """Recursively delete every resource path under `prefix`, distinct
+        from delete()/delete_many()'s single-known-memory_id model -- the
+        primitive an eval needs to reproduce the volcengine/OpenViking#3064
+        orphan-cleanup bug class: a prefix delete that discovers child
+        paths via a directory-listing call and can therefore miss entries
+        the listing call itself fails to enumerate (e.g. because the
+        parent directory no longer exists in the backing filesystem),
+        leaving those entries as permanently orphaned vector-index records
+        even though the delete reported success.
+
+        Optional capability, same convention as list_resource_paths()/
+        trigger_resync()/probe_raw_filter() above -- default raises
+        NotImplementedError, only adapters with supports_prefix_delete =
+        True are expected to override it. See evals/orphan_cleanup.py and
+        VectorIntegritySignal in this module for the eval and signal this
+        gates.
+
+        Args:
+            prefix: the resource-path prefix to delete everything under.
+            recursive: when True (the default), discover and delete every
+                nested child path under `prefix`, not just paths directly
+                at the top level. Implementers that cannot distinguish
+                depth at all may treat this as always-recursive.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_prefix_delete is False).
+            BackendAPIError: on any network/vendor-side failure that
+                prevents the delete from being attempted at all (a
+                per-child delete() failure is instead recorded in the
+                returned DeletePrefixResult.failed_paths, not raised).
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement delete_prefix() "
+            f"(supports_prefix_delete={self.supports_prefix_delete})"
         )
 
     @staticmethod
