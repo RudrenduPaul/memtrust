@@ -34,6 +34,15 @@ from memtrust.evals.contradiction import (
 from memtrust.evals.contradiction import (
     load_dataset as load_contradiction_dataset,
 )
+from memtrust.evals.crash_recovery import (
+    CrashRecoveryCase,
+    CrashRecoverySignal,
+    classify_crash_recovery_case,
+    run_crash_recovery_eval,
+)
+from memtrust.evals.crash_recovery import (
+    load_dataset as load_crash_recovery_dataset,
+)
 from memtrust.evals.locomo import load_dataset as load_locomo_dataset
 from memtrust.evals.locomo import load_exclude_question_ids as load_locomo_exclude_question_ids
 from memtrust.evals.locomo import run_locomo
@@ -254,6 +263,98 @@ class RankingReversedFakeAdapter(RankingInsertionOrderFakeAdapter):
         return QueryResult(
             records=records[:top_k], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
         )
+
+
+class CrashRecoveryFakeAdapter(MemoryBackendAdapter):
+    """Models the exact volcengine/OpenViking#2644 shape (contributor
+    yeyitech): a local vectordb's `_recover()` silently skips rebuilding
+    the search index on server-process restart when index files are
+    missing but store data exists, so queries silently return nothing
+    for data that was never actually lost.
+
+    Maintains two separate in-memory structures on purpose: `_store` (the
+    underlying persisted data, what raw_store_contains() reads) and
+    `_index` (what query() reads from). `simulate_crash_restart()` here
+    drops `_index` and leaves `_store` untouched -- the bug itself."""
+
+    name = "fake-crash-recovery-index-loss"
+    env_var = "FAKE_API_KEY"
+    supports_crash_recovery_simulation = True
+
+    def __init__(self) -> None:
+        self._store: dict[str, dict[str, str]] = {}
+        self._index: dict[str, dict[str, str]] = {}
+        self._counter = 0
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        self._counter += 1
+        memory_id = f"m{self._counter}"
+        self._store.setdefault(session_id, {})[memory_id] = content
+        self._index.setdefault(session_id, {})[memory_id] = content
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        matches = [
+            MemoryRecord(memory_id=mid, content=c)
+            for mid, c in self._index.get(session_id, {}).items()
+            if query.lower() in c.lower()
+        ][:top_k]
+        return QueryResult(
+            records=matches, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+    def simulate_crash_restart(self) -> None:
+        # The bug: index files are treated as missing/unrecoverable, and
+        # _recover() never rebuilds them from the store that survived.
+        self._index = {}
+
+    def raw_store_contains(self, session_id: str, memory_id: str) -> bool:
+        return memory_id in self._store.get(session_id, {})
+
+
+class CrashRecoveryCleanFakeAdapter(CrashRecoveryFakeAdapter):
+    """Models a backend whose `_recover()` correctly rebuilds the index
+    from surviving store data on restart -- the negative control this
+    eval must NOT flag as INDEX_LOST_DATA_SURVIVED."""
+
+    name = "fake-crash-recovery-clean"
+
+    def simulate_crash_restart(self) -> None:
+        self._index = {sid: dict(records) for sid, records in self._store.items()}
+
+
+class CrashRecoveryDataLostFakeAdapter(CrashRecoveryFakeAdapter):
+    """Models a backend that loses the underlying store data itself on
+    restart, not just the index -- a different, more severe failure than
+    #2644's shape, and this eval must classify it as DATA_LOST rather
+    than conflating it with INDEX_LOST_DATA_SURVIVED."""
+
+    name = "fake-crash-recovery-data-lost"
+
+    def simulate_crash_restart(self) -> None:
+        self._index = {}
+        self._store = {}
+
+
+class CrashRecoveryFailingFakeAdapter(CrashRecoveryFakeAdapter):
+    """A crash-recovery-capable adapter whose store() call itself fails --
+    exercises run_crash_recovery_eval()'s BackendAPIError handling path,
+    distinct from the unsupported-adapter skip path."""
+
+    name = "fake-crash-recovery-failing"
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        raise BackendAPIError(self.name, "simulated network failure")
 
 
 class FailingFakeAdapter(MemoryBackendAdapter):
@@ -1358,3 +1459,122 @@ def test_ranking_quality_registered_in_eval_list() -> None:
     from memtrust.cli import ALL_EVALS
 
     assert "ranking_quality" in ALL_EVALS
+
+
+# ---------------------------------------------------------------------------
+# Crash-Recovery eval -- volcengine/OpenViking#2644 (yeyitech): a local
+# vectordb's `_recover()` silently skips rebuilding the search index on
+# server-process restart when index files are missing but store data
+# exists, so queries silently return nothing after a crash/restart even
+# though the data was never actually lost. memtrust's adapters have zero
+# real process-lifecycle control over any live backend (see
+# evals/crash_recovery.py's module docstring), so this eval targets the
+# STRUCTURAL failure shape against a fake adapter that models it -- it
+# proves the harness's classification logic works, not that any live
+# OpenViking instance currently has this bug.
+# ---------------------------------------------------------------------------
+
+
+def test_crash_recovery_dataset_loads() -> None:
+    cases = load_crash_recovery_dataset()
+    assert len(cases) == 3
+    assert all(isinstance(c, CrashRecoveryCase) for c in cases)
+
+
+def test_crash_recovery_skips_cleanly_for_unsupported_adapter() -> None:
+    adapter = RecallAllFakeAdapter()
+    result = run_crash_recovery_eval(adapter)
+    assert result.skipped is True
+    assert result.skip_reason is not None
+    assert result.case_results == []
+
+
+def test_crash_recovery_detects_index_lost_data_survived_matching_issue_2644() -> None:
+    """The exact bug shape: after the simulated crash/restart, query()
+    returns nothing for every case even though raw_store_contains()
+    independently confirms the data survived. Must fire on every case."""
+    adapter = CrashRecoveryFakeAdapter()
+    result = run_crash_recovery_eval(adapter)
+    assert len(result.case_results) == 3
+    assert all(c.error is None for c in result.case_results)
+    assert all(c.present_before_crash for c in result.case_results)
+    assert all(not c.queryable_after_crash for c in result.case_results)
+    assert all(c.raw_store_contains_after_crash is True for c in result.case_results)
+    assert all(
+        c.signal == CrashRecoverySignal.INDEX_LOST_DATA_SURVIVED for c in result.case_results
+    )
+    assert result.index_lost_data_survived_rate == 1.0
+    assert result.recovered_rate == 0.0
+    assert result.data_lost_rate == 0.0
+
+
+def test_crash_recovery_does_not_false_positive_on_clean_recovery() -> None:
+    """Negative control this eval must get right: a backend that
+    correctly rebuilds its index from surviving store data on restart
+    must NOT be flagged as INDEX_LOST_DATA_SURVIVED."""
+    adapter = CrashRecoveryCleanFakeAdapter()
+    result = run_crash_recovery_eval(adapter)
+    assert len(result.case_results) == 3
+    assert all(c.signal == CrashRecoverySignal.RECOVERED for c in result.case_results)
+    assert result.recovered_rate == 1.0
+    assert result.index_lost_data_survived_rate == 0.0
+
+
+def test_crash_recovery_flags_data_lost_distinct_from_index_lost() -> None:
+    """A backend that loses the underlying data itself, not just the
+    index, is a different and more severe failure -- must be classified
+    DATA_LOST, never conflated with INDEX_LOST_DATA_SURVIVED."""
+    adapter = CrashRecoveryDataLostFakeAdapter()
+    result = run_crash_recovery_eval(adapter)
+    assert all(c.raw_store_contains_after_crash is False for c in result.case_results)
+    assert all(c.signal == CrashRecoverySignal.DATA_LOST for c in result.case_results)
+    assert result.data_lost_rate == 1.0
+    assert result.index_lost_data_survived_rate == 0.0
+
+
+def test_crash_recovery_handles_backend_failure() -> None:
+    adapter = CrashRecoveryFailingFakeAdapter()
+    result = run_crash_recovery_eval(adapter)
+    assert len(result.case_results) == 3
+    assert all(c.error is not None for c in result.case_results)
+    assert all(c.signal == CrashRecoverySignal.NOT_APPLICABLE for c in result.case_results)
+
+
+def test_crash_recovery_eval_result_rates_ignore_errored_cases() -> None:
+    adapter = CrashRecoveryFakeAdapter()
+    result = run_crash_recovery_eval(adapter)
+    assert result.index_lost_data_survived_rate is not None
+    assert 0.0 <= result.index_lost_data_survived_rate <= 1.0
+    assert len(result.scored_cases) == len(result.case_results)
+
+
+def test_classify_crash_recovery_case_recovered() -> None:
+    assert classify_crash_recovery_case(True, True, None) == CrashRecoverySignal.RECOVERED
+
+
+def test_classify_crash_recovery_case_index_lost_data_survived() -> None:
+    signal = classify_crash_recovery_case(True, False, True)
+    assert signal == CrashRecoverySignal.INDEX_LOST_DATA_SURVIVED
+
+
+def test_classify_crash_recovery_case_data_lost() -> None:
+    assert classify_crash_recovery_case(True, False, False) == CrashRecoverySignal.DATA_LOST
+
+
+def test_classify_crash_recovery_case_never_present_before_is_not_applicable() -> None:
+    assert classify_crash_recovery_case(False, False, None) == CrashRecoverySignal.NOT_APPLICABLE
+    assert classify_crash_recovery_case(False, False, True) == CrashRecoverySignal.NOT_APPLICABLE
+
+
+def test_classify_crash_recovery_case_no_raw_store_evidence_is_not_applicable() -> None:
+    """present_before_crash True, queryable_after_crash False, but the
+    eval never got an independent raw_store_contains() read -- not
+    enough evidence to call this either INDEX_LOST_DATA_SURVIVED or
+    DATA_LOST."""
+    assert classify_crash_recovery_case(True, False, None) == CrashRecoverySignal.NOT_APPLICABLE
+
+
+def test_crash_recovery_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "crash_recovery" in ALL_EVALS

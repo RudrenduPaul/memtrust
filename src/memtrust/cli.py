@@ -31,6 +31,7 @@ from memtrust.adapters import ADAPTER_REGISTRY
 from memtrust.adapters.base import BackendNotConfiguredError, MemoryBackendAdapter
 from memtrust.evals.compression import CompressionEvalResult, run_compression_eval
 from memtrust.evals.contradiction import ContradictionEvalResult, run_contradiction_eval
+from memtrust.evals.crash_recovery import CrashRecoveryEvalResult, run_crash_recovery_eval
 from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
 from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
@@ -38,8 +39,8 @@ from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_reso
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 5
-#: evals now registered, the `report` table has 7 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 6
+#: evals now registered, the `report` table has 8 columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
@@ -58,6 +59,7 @@ ALL_EVALS = [
     "resource_sync_safety",
     "compression",
     "ranking_quality",
+    "crash_recovery",
 ]
 
 
@@ -183,6 +185,28 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for c in result.case_results
             ],
         }
+    if isinstance(result, CrashRecoveryEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "recovered_rate": result.recovered_rate,
+            "index_lost_data_survived_rate": result.index_lost_data_survived_rate,
+            "data_lost_rate": result.data_lost_rate,
+            "n_cases": len(result.case_results),
+            "cases": [
+                {
+                    "case_id": c.case.case_id,
+                    "signal": str(c.signal),
+                    "present_before_crash": c.present_before_crash,
+                    "queryable_after_crash": c.queryable_after_crash,
+                    "raw_store_contains_after_crash": c.raw_store_contains_after_crash,
+                    "error": c.error,
+                }
+                for c in result.case_results
+            ],
+        }
     if isinstance(result, CompressionEvalResult):
         return {
             "backend": result.backend_name,
@@ -220,7 +244,7 @@ def main() -> None:
     show_default=True,
     help=(
         "Comma-separated eval list (longmemeval,locomo,contradiction,"
-        "resource_sync_safety,compression,ranking_quality), or 'all'."
+        "resource_sync_safety,compression,ranking_quality,crash_recovery), or 'all'."
     ),
 )
 @click.option(
@@ -402,6 +426,20 @@ def run(
             else:
                 console.print("    N/A (no scoreable cases)")
 
+        if "crash_recovery" in eval_names:
+            console.print(f"  Running Crash-Recovery against {backend_name}...")
+            crash_result = run_crash_recovery_eval(adapter)
+            backend_report["evals"]["crash_recovery"] = _serialize_eval_result(crash_result)
+            if crash_result.skipped:
+                console.print(f"    SKIPPED: {crash_result.skip_reason}")
+            else:
+                ilds = crash_result.index_lost_data_survived_rate
+                rec = crash_result.recovered_rate
+                if ilds is not None:
+                    console.print(f"    index-lost-data-survived: {ilds:.1%}  recovered: {rec:.1%}")
+                else:
+                    console.print("    N/A (no scoreable cases)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -445,10 +483,11 @@ def report(report_path: Path) -> None:
     table.add_column("Resource-Sync (user-file deletion / nested-content-unindexed)")
     table.add_column("Compression fidelity by mode")
     table.add_column("Ranking Quality (missing-ordering-key rate)")
+    table.add_column("Crash-Recovery (index-lost-data-survived rate)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
-            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-", "-")
+            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-", "-", "-")
             continue
 
         evals = backend_data.get("evals", {})
@@ -458,6 +497,7 @@ def report(report_path: Path) -> None:
         rss = evals.get("resource_sync_safety", {})
         compression = evals.get("compression", {})
         ranking = evals.get("ranking_quality", {})
+        crash_recovery = evals.get("crash_recovery", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -491,6 +531,12 @@ def report(report_path: Path) -> None:
         locomo_non_adv_str = _fmt_pct(locomo.get("non_adversarial_accuracy"))
         locomo_str = f"{locomo_acc_str} / {locomo_non_adv_str}" if locomo else "-"
         ranking_str = _fmt_pct(ranking.get("missing_ordering_key_rate")) if ranking else "-"
+        if crash_recovery.get("skipped"):
+            crash_recovery_str = "SKIPPED (unsupported)"
+        elif crash_recovery:
+            crash_recovery_str = _fmt_pct(crash_recovery.get("index_lost_data_survived_rate"))
+        else:
+            crash_recovery_str = "-"
         table.add_row(
             backend_name,
             "configured",
@@ -500,6 +546,7 @@ def report(report_path: Path) -> None:
             rss_str,
             compression_str or "-",
             ranking_str,
+            crash_recovery_str,
         )
 
     console.print(table)

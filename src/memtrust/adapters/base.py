@@ -425,6 +425,21 @@ class MemoryBackendAdapter(ABC):
     #: and the honesty caveat attached to its mode names.
     supported_modes: tuple[str, ...] = ()
 
+    #: Whether this adapter can simulate a "server process crashed and
+    #: restarted, losing its in-memory search index while the underlying
+    #: store data survives" event via simulate_crash_restart() /
+    #: raw_store_contains() below. Defaults to False -- every real,
+    #: HTTP-only adapter in this repo talks to a backend over the network
+    #: with zero ability to start, kill, or restart the vendor's own
+    #: server process, and has no API surface that bypasses the vendor's
+    #: search index to inspect raw stored data directly. Only a
+    #: purpose-built in-memory fake adapter (see
+    #: tests/test_evals.py::CrashRecoveryFakeAdapter) can genuinely model
+    #: both halves of this -- see evals/crash_recovery.py for the eval
+    #: this gates, and docs/methodology.md for why that eval cannot prove
+    #: anything about a real backend's process-lifecycle behavior.
+    supports_crash_recovery_simulation: bool = False
+
     @abstractmethod
     def store(
         self,
@@ -596,6 +611,63 @@ class MemoryBackendAdapter(ABC):
         raise NotImplementedError(
             f"{self.name} does not implement trigger_resync() "
             f"(supports_resource_sync={self.supports_resource_sync})"
+        )
+
+    def simulate_crash_restart(self) -> None:
+        """Simulate a "server process crashed and restarted" event: the
+        in-memory search index is lost, but whatever the backend's
+        underlying store actually persisted survives.
+
+        This is deliberately NOT a real process kill/restart -- no
+        adapter in this repo holds a handle to a live vendor server
+        process it could actually terminate and relaunch (every real
+        adapter here is a pure HTTP client; see the module docstring at
+        the top of this file). It is an explicit, named simulation
+        primitive an in-memory fake adapter implements to model the
+        specific failure shape volcengine/OpenViking#2644 (contributor
+        yeyitech) reports: a local vectordb's `_recover()` silently skips
+        rebuilding the index on process restart when index files are
+        missing but store data exists, so post-restart queries silently
+        return nothing even though the data was never actually lost.
+
+        Optional capability, same convention as list_resource_paths()/
+        trigger_resync() above -- default raises NotImplementedError,
+        only adapters with supports_crash_recovery_simulation = True are
+        expected to override it. See evals/crash_recovery.py.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_crash_recovery_simulation is False).
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement simulate_crash_restart() "
+            f"(supports_crash_recovery_simulation={self.supports_crash_recovery_simulation})"
+        )
+
+    def raw_store_contains(self, session_id: str, memory_id: str) -> bool:
+        """Check whether the underlying store still holds `memory_id`,
+        bypassing whatever search/index layer query() goes through.
+
+        This is the primitive that lets evals/crash_recovery.py tell
+        "the index is gone but the data survived" (the volcengine/
+        OpenViking#2644 bug shape) apart from "the data itself is gone
+        too" -- query() alone cannot distinguish these, since a lost
+        index and lost data both make query() return nothing.
+
+        Optional capability, same convention as list_resource_paths()/
+        trigger_resync() above -- most real adapters have no vendor API
+        that reads underlying stored data independently of the vendor's
+        own search index, so the default raises NotImplementedError.
+        Only adapters with supports_crash_recovery_simulation = True are
+        expected to override it.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_crash_recovery_simulation is False).
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement raw_store_contains() "
+            f"(supports_crash_recovery_simulation={self.supports_crash_recovery_simulation})"
         )
 
     @staticmethod
