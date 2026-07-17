@@ -20,6 +20,7 @@ from memtrust.adapters.base import (
     MemoryBackendAdapter,
     QueryResult,
     RankingSignal,
+    RetrievalWarning,
     StoreResult,
     UpdateResult,
 )
@@ -1061,6 +1062,148 @@ def test_mempalace_query_ranking_signal_not_applicable_with_fewer_than_two_recor
 
     query_result = adapter.query("room-1", "wake me up with important memories")
     assert query_result.ranking_signal == RankingSignal.NOT_APPLICABLE
+
+
+# ---------------------------------------------------------------------------
+# MemPalaceAdapter.query() -- degraded-retrieval detection
+# (MemPalace/mempalace#1005, contributor jphein, also cited in #1769)
+#
+# Confirmed against the real, merged PR diff: when MemPalace's vector
+# index (HNSW/Chroma) errors or drifts, search_memories() no longer
+# hard-fails -- it returns a dict shaped
+# {"results": [...], "warnings": [...], "available_in_scope": N} instead
+# of the bare list of record dicts this adapter originally assumed. This
+# is a distinct failure mode from ConflictSignal.EMPTY_OR_LOST, which only
+# fires on zero records: a backend can return some records, non-empty,
+# and still be silently under-delivering the rest.
+# ---------------------------------------------------------------------------
+
+
+class DegradedRetrievalPalace:
+    """Fake Palace whose recall() returns MemPalace/mempalace#1005's
+    confirmed search_memories() response shape directly, instead of the
+    older bare-list-of-records shape FakePalace above uses. Lets tests
+    exercise both shapes _PalaceProtocol.recall() now accepts."""
+
+    def __init__(self, response: dict[str, Any]) -> None:
+        self._response = response
+
+    def remember(
+        self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
+    ) -> str:
+        raise NotImplementedError
+
+    def recall(self, room: str, query: str, top_k: int, mode: str | None = None) -> dict[str, Any]:
+        return self._response
+
+    def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+def test_mempalace_query_sets_degraded_retrieval_when_backend_warns() -> None:
+    """The exact #1005 shape: vector search underdelivered but the backend
+    still returned some records plus a warning and a scope count -- not
+    zero records, so ConflictSignal.EMPTY_OR_LOST would never catch this."""
+    palace = DegradedRetrievalPalace(
+        {
+            "results": [
+                {"id": "d1", "content": "kiyo xhci fix notes", "metadata": {}},
+            ],
+            "warnings": ["hnsw drift detected"],
+            "available_in_scope": 50,
+        }
+    )
+    adapter = MemPalaceAdapter(palace=palace)
+
+    query_result = adapter.query("room-1", "kiyo xhci")
+
+    assert len(query_result.records) == 1
+    assert query_result.degraded_retrieval == RetrievalWarning(
+        warnings=["hnsw drift detected"], available_in_scope=50
+    )
+
+
+def test_mempalace_query_degraded_retrieval_unset_on_clean_response() -> None:
+    """A clean response (no warnings) must leave degraded_retrieval unset
+    (None), even though the response uses the new dict shape -- an empty
+    `warnings` list is not itself a degradation signal."""
+    palace = DegradedRetrievalPalace(
+        {
+            "results": [
+                {"id": "d1", "content": "unrelated content", "metadata": {}},
+            ],
+            "warnings": [],
+            "available_in_scope": 1,
+        }
+    )
+    adapter = MemPalaceAdapter(palace=palace)
+
+    query_result = adapter.query("room-1", "query")
+
+    assert query_result.degraded_retrieval is None
+
+
+def test_mempalace_query_degraded_retrieval_unset_for_bare_list_response() -> None:
+    """The original, still-supported bare-list shape (FakePalace's
+    convention) never sets degraded_retrieval -- there is no `warnings`
+    field to read at all on that shape."""
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    adapter.store("room-1", "My dog is named Baxter.")
+
+    query_result = adapter.query("room-1", "what is my dog's name?")
+
+    assert query_result.degraded_retrieval is None
+
+
+def test_mempalace_query_available_in_scope_none_when_backend_omits_it() -> None:
+    """available_in_scope is optional per the #1005 contract (None when
+    the backend couldn't compute a scope count, e.g. a filter-planner
+    error) -- the adapter must not fabricate a number when it's absent."""
+    palace = DegradedRetrievalPalace(
+        {
+            "results": [],
+            "warnings": ["vector search unavailable: filter planner error"],
+        }
+    )
+    adapter = MemPalaceAdapter(palace=palace)
+
+    query_result = adapter.query("room-1", "query")
+
+    assert query_result.degraded_retrieval == RetrievalWarning(
+        warnings=["vector search unavailable: filter planner error"],
+        available_in_scope=None,
+    )
+
+
+def test_mempalace_query_available_in_scope_ignores_non_int_value() -> None:
+    """A malformed/mocked available_in_scope (not a real int) must not be
+    trusted as a number -- treated the same as absent, never coerced."""
+    palace = DegradedRetrievalPalace(
+        {
+            "results": [],
+            "warnings": ["vector search unavailable: boom"],
+            "available_in_scope": "not-a-number",
+        }
+    )
+    adapter = MemPalaceAdapter(palace=palace)
+
+    query_result = adapter.query("room-1", "query")
+
+    assert query_result.degraded_retrieval is not None
+    assert query_result.degraded_retrieval.available_in_scope is None
+
+
+def test_mempalace_query_raises_backend_api_error_when_dict_missing_results_key() -> None:
+    """A dict-shaped response that doesn't carry the confirmed #1005
+    `results` key is a wrong guess about the vendor's response shape --
+    that must fail loudly as BackendAPIError, not a confusing KeyError or
+    a silent empty-records response."""
+    palace = DegradedRetrievalPalace({"warnings": [], "available_in_scope": 0})
+    adapter = MemPalaceAdapter(palace=palace)
+
+    with pytest.raises(BackendAPIError, match="results"):
+        adapter.query("room-1", "query")
 
 
 # ---------------------------------------------------------------------------

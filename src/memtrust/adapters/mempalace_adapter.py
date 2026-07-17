@@ -59,6 +59,7 @@ from memtrust.adapters.base import (
     MemoryRecord,
     QueryResult,
     RankingSignal,
+    RetrievalWarning,
     StoreResult,
     UpdateResult,
 )
@@ -136,7 +137,25 @@ class _PalaceProtocol(Protocol):
 
     def recall(
         self, room: str, query: str, top_k: int, mode: str | None = None
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[dict[str, Any]] | dict[str, Any]:
+        """Return either a bare list of record dicts (this adapter's
+        original, still-unconfirmed guess at `Palace.recall()`'s shape),
+        or a dict shaped like MemPalace/mempalace#1005's confirmed,
+        merged `search_memories()` response:
+        `{"results": [...], "warnings": [...], "available_in_scope": N}`.
+
+        Both are unconfirmed guesses about what a real `Palace.recall()`
+        method (if one exists under that name at all) actually returns --
+        see the module docstring's confidence caveat. The dict shape is
+        the one piece of *this* response body confirmed against real,
+        merged vendor source (the #1005 diff), so `query()` below checks
+        for it and parses `warnings`/`available_in_scope` when present,
+        while still accepting the older bare-list shape unchanged so a
+        wrong guess about which shape the real method uses doesn't break
+        every existing caller -- see `query()` for the parsing and the
+        loud `BackendAPIError` a dict missing a `results` key raises.
+        """
+        ...
 
     def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]: ...
 
@@ -222,9 +241,55 @@ class MemPalaceAdapter(MemoryBackendAdapter):
         timer = self._timed()
         palace = self._get_palace()
         try:
-            results = palace.recall(room=session_id, query=query, top_k=top_k, mode=mode)
+            response = palace.recall(room=session_id, query=query, top_k=top_k, mode=mode)
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
+
+        degraded_retrieval: RetrievalWarning | None = None
+        if isinstance(response, dict):
+            # MemPalace/mempalace#1005's confirmed search_memories() shape:
+            # {"results": [...], "warnings": [...], "available_in_scope": N}.
+            # A vector-query failure (HNSW/Chroma index drift) degrades into
+            # this response instead of raising -- the backend still returns
+            # whatever it could rank, plus warnings explaining the shortfall.
+            # See _PalaceProtocol.recall()'s docstring for why both this
+            # shape and the older bare-list shape are accepted.
+            raw_results = response.get("results")
+            if raw_results is None:
+                raise BackendAPIError(
+                    self.name,
+                    "recall() returned a dict without a 'results' key -- "
+                    "expected either a bare list of record dicts, or "
+                    "MemPalace/mempalace#1005's confirmed search_memories() "
+                    "shape ({'results': [...], 'warnings': [...], "
+                    f"'available_in_scope': ...}}). Got keys: {sorted(response.keys())}.",
+                )
+            results = raw_results
+            raw_warnings = response.get("warnings") or []
+            if not isinstance(raw_warnings, list):
+                raise BackendAPIError(
+                    self.name,
+                    "recall() response's 'warnings' field must be a list, "
+                    f"got {type(raw_warnings).__name__}.",
+                )
+            warnings = [str(w) for w in raw_warnings]
+            available_in_scope = response.get("available_in_scope")
+            if not isinstance(available_in_scope, int) or isinstance(available_in_scope, bool):
+                # Per mempalace/mempalace#1005, available_in_scope is None
+                # when the backend couldn't compute a scope count (e.g. a
+                # filter-planner error) -- treat anything else that isn't a
+                # real int (a MagicMock test stub, a float, a string) the
+                # same way: "unknown," never coerced into a misleading
+                # number. `bool` is excluded explicitly since `bool` is a
+                # subclass of `int` in Python and a stray True/False here
+                # would silently pass isinstance(..., int).
+                available_in_scope = None
+            if warnings:
+                degraded_retrieval = RetrievalWarning(
+                    warnings=warnings, available_in_scope=available_in_scope
+                )
+        else:
+            results = response
 
         records = [
             MemoryRecord(
@@ -250,6 +315,7 @@ class MemPalaceAdapter(MemoryBackendAdapter):
             conflict_signal=conflict_signal,
             latency_ms=timer.elapsed_ms(),
             ranking_signal=ranking_signal,
+            degraded_retrieval=degraded_retrieval,
         )
 
     def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:

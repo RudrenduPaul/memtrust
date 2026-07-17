@@ -57,6 +57,18 @@ class LongMemEvalCaseResult:
     failure the underlying vendor call may share across many questions.
     See adapters/base.py's ConflictSignal.EMPTY_OR_LOST for the analogous
     signal in the contradiction eval."""
+    degraded_retrieval: bool = False
+    """True when adapter.query() completed without error and returned at
+    least one record, but the backend's own response signaled it
+    under-delivered anyway (see adapters/base.py's RetrievalWarning,
+    confirmed against the real, merged MemPalace/mempalace#1005 PR diff).
+    This is distinct from records_empty above: a case can have
+    records_empty=False and degraded_retrieval=True at the same time --
+    the backend returned *something* to grade, but warned it wasn't the
+    full picture. Separating the two lets a report distinguish "backend
+    warned us, we surfaced it" from "backend silently returned wrong or
+    incomplete facts with no signal at all," which the judge's verdict on
+    its own cannot tell apart."""
     error: str | None = None
 
 
@@ -89,6 +101,13 @@ class LongMemEvalResult:
         """Count of cases where the backend call succeeded but returned
         zero records -- see LongMemEvalCaseResult.records_empty."""
         return sum(1 for c in self.case_results if c.records_empty)
+
+    @property
+    def n_degraded_retrieval(self) -> int:
+        """Count of cases where the backend's own response signaled
+        under-delivered (but non-empty) retrieval -- see
+        LongMemEvalCaseResult.degraded_retrieval."""
+        return sum(1 for c in self.case_results if c.degraded_retrieval)
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[dict[str, Any]]:
@@ -140,6 +159,7 @@ def run_longmemeval(
                 verdict=judge_result.verdict,
                 reasoning=judge_result.reasoning,
                 records_empty=not query_result.records,
+                degraded_retrieval=query_result.degraded_retrieval is not None,
             )
         )
 

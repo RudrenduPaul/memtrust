@@ -283,6 +283,45 @@ class MemoryRecord:
 
 
 @dataclass
+class RetrievalWarning:
+    """A backend's own signal that a query() response under-delivered
+    without treating that as a hard failure -- confirmed against the real,
+    merged MemPalace/mempalace#1005 PR diff (`feat(searcher): warnings +
+    sqlite BM25 top-up when vector underdelivers`): when its vector index
+    (HNSW/Chroma) drifts or a query raises, `search_memories()` no longer
+    hard-fails -- it returns whatever it *could* rank, plus a `warnings`
+    list explaining why, plus `available_in_scope` (a sqlite-authoritative
+    count of how many records actually match the query's scope,
+    independent of how many the vector path could rank).
+
+    This is a distinct failure mode from ConflictSignal.EMPTY_OR_LOST,
+    which only fires when a query response comes back with zero records.
+    A backend can return, say, 3 of 50 available records -- non-empty,
+    so EMPTY_OR_LOST never fires -- while still silently shortchanging the
+    caller on the other 47. Before this field existed, that shape was
+    indistinguishable from "the backend genuinely only found 3 relevant
+    records," which misattributes a backend retrieval bug to content
+    relevance. See mempalace_adapter.py's query() for where this is
+    populated (the one adapter that currently sets it) and
+    docs/methodology.md's adapter-confidence table for the confirmed-
+    against-diff-but-not-run-against-a-live-instance caveat that applies
+    here the same way it applies to the rest of that adapter."""
+
+    warnings: list[str]
+    """Verbatim warning strings the backend attached to this response
+    (e.g. "vector search unavailable: ...", "5243 drawers match this
+    scope in sqlite; vector ranked 1 ..."). Kept exactly as the vendor
+    returned them, never rewritten or summarized, so a report reader can
+    see the backend's own explanation."""
+    available_in_scope: int | None
+    """The backend's own count of how many records exist in the queried
+    scope, independent of how many it was actually able to rank/return
+    for this call. None when the backend didn't report a count, or
+    reported a value that wasn't a real int (see mempalace_adapter.py's
+    parsing -- a non-int value is treated as "unknown," never coerced)."""
+
+
+@dataclass
 class QueryResult:
     """Result of MemoryBackendAdapter.query()."""
 
@@ -300,6 +339,20 @@ class QueryResult:
     do not inspect their own response for a ranking-relevant field default
     to NOT_APPLICABLE, same convention as conflict_signal defaulting to
     NOT_APPLICABLE for adapters that skip contradiction detection."""
+    degraded_retrieval: RetrievalWarning | None = None
+    """Set when the backend's own response signaled it under-delivered on
+    this query without treating it as a hard failure -- see
+    RetrievalWarning's docstring for the confirmed MemPalace/mempalace#1005
+    provenance. `None` (the default) means either the backend reported no
+    such signal, or the adapter doesn't inspect its response for one --
+    the same backward-compatible-default convention `ranking_signal` and
+    `conflict_signal` already establish, so every existing adapter's
+    QueryResult construction keeps working unchanged. Distinct from
+    `conflict_signal == ConflictSignal.EMPTY_OR_LOST`: that only fires on
+    zero records, this fires whenever the backend itself says "I
+    under-delivered," including when it still returned some records --
+    see RetrievalWarning's docstring for exactly why that distinction
+    matters."""
     raw: dict[str, object] = field(default_factory=dict)
 
 
