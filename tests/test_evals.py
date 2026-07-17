@@ -2736,3 +2736,15 @@ def test_filter_injection_registered_in_eval_list() -> None:
     from memtrust.cli import ALL_EVALS
 
     assert "filter_injection" in ALL_EVALS
+
+
+def test_lock_contention_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "lock_contention" in ALL_EVALS
+
+
+def test_stats_accuracy_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "stats_accuracy" in ALL_EVALS
