@@ -23,6 +23,7 @@ from memtrust.adapters.base import (
     MemoryRecord,
     QueryResult,
     RankingSignal,
+    RetrievalWarning,
     StoreResult,
     UpdateResult,
 )
@@ -438,6 +439,29 @@ class EmptyButCapableFakeAdapter(RecallAllFakeAdapter):
     def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
         return QueryResult(
             records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+
+class DegradedRetrievalFakeAdapter(RecallAllFakeAdapter):
+    """Simulates the MemPalace/mempalace#1005 shape at the eval layer:
+    store()/query() both succeed, and query() returns real, non-empty
+    records -- but the response also carries a RetrievalWarning, the
+    "backend warned me it under-delivered, but returned SOME records"
+    failure mode that ConflictSignal.EMPTY_OR_LOST structurally cannot
+    see (it only fires on zero records)."""
+
+    name = "fake-degraded-retrieval"
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        contents = self._store.get(session_id, [])[-top_k:]
+        records = [MemoryRecord(memory_id=f"m{i}", content=c) for i, c in enumerate(contents)]
+        return QueryResult(
+            records=records,
+            conflict_signal=ConflictSignal.NOT_APPLICABLE,
+            latency_ms=0.1,
+            degraded_retrieval=RetrievalWarning(
+                warnings=["hnsw drift detected"], available_in_scope=50
+            ),
         )
 
 
@@ -973,6 +997,31 @@ def test_longmemeval_records_empty_false_when_records_returned() -> None:
     assert result.n_records_empty == 0
 
 
+def test_longmemeval_sets_degraded_retrieval_when_backend_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backend that returns real, non-empty records but also signals it
+    under-delivered (MemPalace/mempalace#1005's shape) must be tagged
+    degraded_retrieval=True and records_empty=False at the same time --
+    proving this is tracked separately from the empty-response case."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    adapter = DegradedRetrievalFakeAdapter()
+    judge = LLMJudge()
+    result = run_longmemeval(adapter, judge)
+    assert len(result.case_results) == 3
+    assert all(c.degraded_retrieval for c in result.case_results)
+    assert all(not c.records_empty for c in result.case_results)
+    assert result.n_degraded_retrieval == 3
+
+
+def test_longmemeval_degraded_retrieval_false_when_backend_clean() -> None:
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_longmemeval(adapter, judge)
+    assert all(not c.degraded_retrieval for c in result.case_results)
+    assert result.n_degraded_retrieval == 0
+
+
 def test_longmemeval_handles_backend_failure() -> None:
     adapter = FailingFakeAdapter()
     judge = LLMJudge()
@@ -1025,6 +1074,30 @@ def test_locomo_records_empty_false_when_records_returned() -> None:
     result = run_locomo(adapter, judge)
     assert all(not c.records_empty for c in result.case_results)
     assert result.n_records_empty == 0
+
+
+def test_locomo_sets_degraded_retrieval_when_backend_warns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same distinction as LongMemEval: a backend that returns real,
+    non-empty records but also signals under-delivered retrieval must be
+    tagged degraded_retrieval=True, tracked separately from records_empty."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    adapter = DegradedRetrievalFakeAdapter()
+    judge = LLMJudge()
+    result = run_locomo(adapter, judge)
+    assert len(result.case_results) == 4
+    assert all(c.degraded_retrieval for c in result.case_results)
+    assert all(not c.records_empty for c in result.case_results)
+    assert result.n_degraded_retrieval == 4
+
+
+def test_locomo_degraded_retrieval_false_when_backend_clean() -> None:
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_locomo(adapter, judge)
+    assert all(not c.degraded_retrieval for c in result.case_results)
+    assert result.n_degraded_retrieval == 0
 
 
 def test_locomo_accuracy_by_category(
