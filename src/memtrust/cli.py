@@ -57,13 +57,13 @@ from memtrust.receipt import (
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 6
-#: evals now registered, the `report` table has 8 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 10
+#: evals now registered, the `report` table has 12 columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
 #: rendering deterministic in both contexts.
-console = Console(width=220)
+console = Console(width=400)
 
 #: The 4 canonical, non-aliased backend names v0.1 tracks at full eval
 #: depth. "zep" and "graphiti" both resolve to the same adapter in
