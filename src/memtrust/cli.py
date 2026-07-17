@@ -35,6 +35,11 @@ from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_l
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
 from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
 from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_resource_sync_eval
+from memtrust.evals.scale_stress import (
+    DEFAULT_N_RECORDS,
+    ScaleTestResult,
+    run_scale_stress_eval,
+)
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
@@ -58,6 +63,7 @@ ALL_EVALS = [
     "resource_sync_safety",
     "compression",
     "ranking_quality",
+    "scale_stress",
 ]
 
 
@@ -200,6 +206,33 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for mode, mode_result in result.mode_results.items()
             },
         }
+    if isinstance(result, ScaleTestResult):
+        return {
+            "backend": result.backend_name,
+            "n_records_requested": result.n_records_requested,
+            "seed": result.seed,
+            "signal": str(result.signal),
+            "records_stored": result.records_stored,
+            "records_store_errors": result.records_store_errors,
+            "records_checked": result.records_checked,
+            "records_recoverable": result.records_recoverable,
+            "recall_degradation_pct": result.recall_degradation_pct,
+            "anchor_lost_at_n": result.anchor_lost_at_n,
+            "latency_p99_ms": result.latency_p99_ms,
+            "error": result.error,
+            "checkpoints": [
+                {
+                    "checkpoint_n": c.checkpoint_n,
+                    "records_stored_so_far": c.records_stored_so_far,
+                    "recall_rate": c.recall_rate,
+                    "anchor_recall": c.anchor_recall,
+                    "latency_p50_ms": c.latency_p50_ms,
+                    "latency_p99_ms": c.latency_p99_ms,
+                    "n_needle_queries": len(c.needle_queries),
+                }
+                for c in result.checkpoints
+            ],
+        }
     raise TypeError(f"no serializer for {type(result)!r}")
 
 
@@ -220,7 +253,7 @@ def main() -> None:
     show_default=True,
     help=(
         "Comma-separated eval list (longmemeval,locomo,contradiction,"
-        "resource_sync_safety,compression,ranking_quality), or 'all'."
+        "resource_sync_safety,compression,ranking_quality,scale_stress), or 'all'."
     ),
 )
 @click.option(
@@ -243,11 +276,26 @@ def main() -> None:
         "No such list ships with memtrust by default."
     ),
 )
+@click.option(
+    "--scale-stress-n-records",
+    "scale_stress_n_records",
+    default=DEFAULT_N_RECORDS,
+    show_default=True,
+    type=int,
+    help=(
+        "How many synthetic records the scale_stress eval stores and re-queries. "
+        "Kept small by default so `memtrust run` stays fast in CI -- pass a much larger "
+        "value (e.g. 10000) to actually reach the corpus size volcengine/OpenViking#2850 "
+        "and getzep/graphiti#1275 manifest at, against a real configured backend. "
+        "See evals/scale_stress.py and docs/methodology.md."
+    ),
+)
 def run(
     backends: str,
     eval_arg: str,
     output_path: Path | None,
     locomo_exclude_ids_path: Path | None,
+    scale_stress_n_records: int,
 ) -> None:
     """Run the eval suite against the requested backends.
 
@@ -402,6 +450,30 @@ def run(
             else:
                 console.print("    N/A (no scoreable cases)")
 
+        if "scale_stress" in eval_names:
+            console.print(
+                f"  Running Scale/Volume Stress ({scale_stress_n_records} records) "
+                f"against {backend_name}..."
+            )
+            scale_result = run_scale_stress_eval(adapter, n_records=scale_stress_n_records)
+            backend_report["evals"]["scale_stress"] = _serialize_eval_result(scale_result)
+            console.print(f"    signal: {scale_result.signal}")
+            console.print(
+                f"    records_stored: {scale_result.records_stored}/"
+                f"{scale_result.n_records_requested}"
+                f"  records_recoverable: {scale_result.records_recoverable}/"
+                f"{scale_result.records_checked}"
+            )
+            if scale_result.recall_degradation_pct is not None:
+                console.print(
+                    f"    recall_degradation: {scale_result.recall_degradation_pct:.1f}pp"
+                )
+            if scale_result.anchor_lost_at_n is not None:
+                console.print(
+                    f"    [yellow]anchor record lost at n={scale_result.anchor_lost_at_n}"
+                    "[/yellow] (earliest-stored content became unrecoverable as volume grew)"
+                )
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -445,10 +517,11 @@ def report(report_path: Path) -> None:
     table.add_column("Resource-Sync (user-file deletion / nested-content-unindexed)")
     table.add_column("Compression fidelity by mode")
     table.add_column("Ranking Quality (missing-ordering-key rate)")
+    table.add_column("Scale/Volume Stress (signal, recall degradation)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
-            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-", "-")
+            table.add_row(backend_name, "SKIPPED", "-", "-", "-", "-", "-", "-", "-")
             continue
 
         evals = backend_data.get("evals", {})
@@ -458,6 +531,7 @@ def report(report_path: Path) -> None:
         rss = evals.get("resource_sync_safety", {})
         compression = evals.get("compression", {})
         ranking = evals.get("ranking_quality", {})
+        scale_stress = evals.get("scale_stress", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -491,6 +565,12 @@ def report(report_path: Path) -> None:
         locomo_non_adv_str = _fmt_pct(locomo.get("non_adversarial_accuracy"))
         locomo_str = f"{locomo_acc_str} / {locomo_non_adv_str}" if locomo else "-"
         ranking_str = _fmt_pct(ranking.get("missing_ordering_key_rate")) if ranking else "-"
+        if scale_stress:
+            degradation = scale_stress.get("recall_degradation_pct")
+            degradation_str = f"{degradation:.1f}pp" if degradation is not None else "N/A"
+            scale_stress_str = f"{scale_stress.get('signal', 'unknown')} ({degradation_str})"
+        else:
+            scale_stress_str = "-"
         table.add_row(
             backend_name,
             "configured",
@@ -500,6 +580,7 @@ def report(report_path: Path) -> None:
             rss_str,
             compression_str or "-",
             ranking_str,
+            scale_stress_str,
         )
 
     console.print(table)
