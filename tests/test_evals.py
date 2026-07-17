@@ -1395,6 +1395,88 @@ def test_longmemeval_handles_backend_failure() -> None:
     assert all(c.error is not None for c in result.case_results)
 
 
+def _write_longmemeval_dataset(tmp_path: Path, n_user_turns: int, name: str) -> Path:
+    """Build a minimal LongMemEval-schema dataset file with a single
+    example whose haystack has exactly `n_user_turns` user turns (one
+    turn per session), for exercising the top_k_exceeds_corpus guard at
+    a specific corpus size."""
+    dataset_path = tmp_path / name
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "examples": [
+                    {
+                        "question_id": f"{name}-1",
+                        "question_type": "single-session-user",
+                        "question": "What is my dog's name?",
+                        "answer": "Baxter",
+                        "haystack_sessions": [
+                            [{"role": "user", "content": f"filler fact {i}: Baxter is a dog."}]
+                            for i in range(n_user_turns)
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    return dataset_path
+
+
+def test_longmemeval_flags_top_k_exceeds_corpus_on_small_corpus(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A case whose haystack has fewer user turns than DEFAULT_TOP_K (5)
+    must be flagged top_k_exceeds_corpus=True: retrieving everything out
+    of a 2-record corpus with top_k=5 is not evidence of real ranking
+    quality -- see longmemeval.py's "top_k vs. corpus size" module
+    docstring section (the jtatum/MemPalace-benchmark-scripts gaming
+    shape this guards against)."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    dataset_path = _write_longmemeval_dataset(tmp_path, n_user_turns=2, name="small_corpus.json")
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_longmemeval(adapter, judge, dataset_path=dataset_path)
+    assert len(result.case_results) == 1
+    case = result.case_results[0]
+    assert case.corpus_size == 2
+    assert case.top_k_exceeds_corpus is True
+    assert result.n_top_k_exceeds_corpus == 1
+
+
+def test_longmemeval_flags_top_k_exceeds_corpus_at_exact_boundary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """corpus_size == top_k is still a flagged case (the check is <=, not
+    strictly <): a corpus exactly as big as top_k also returns "the whole
+    corpus," not a genuine top-k subset of it."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    dataset_path = _write_longmemeval_dataset(tmp_path, n_user_turns=5, name="boundary.json")
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_longmemeval(adapter, judge, dataset_path=dataset_path)
+    case = result.case_results[0]
+    assert case.corpus_size == 5
+    assert case.top_k_exceeds_corpus is True
+
+
+def test_longmemeval_does_not_flag_top_k_exceeds_corpus_on_normal_corpus(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A case whose haystack has more user turns than DEFAULT_TOP_K must
+    NOT be flagged -- here top_k is a genuine subset of a larger corpus,
+    so a high recall result on this case is not automatically suspect."""
+    monkeypatch.delenv("MEMTRUST_JUDGE_API_KEY", raising=False)
+    dataset_path = _write_longmemeval_dataset(tmp_path, n_user_turns=8, name="normal_corpus.json")
+    adapter = RecallAllFakeAdapter()
+    judge = LLMJudge()
+    result = run_longmemeval(adapter, judge, dataset_path=dataset_path)
+    assert len(result.case_results) == 1
+    case = result.case_results[0]
+    assert case.corpus_size == 8
+    assert case.top_k_exceeds_corpus is False
+    assert result.n_top_k_exceeds_corpus == 0
+
+
 # ---------------------------------------------------------------------------
 # LoCoMo
 # ---------------------------------------------------------------------------
