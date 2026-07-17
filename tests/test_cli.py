@@ -217,6 +217,9 @@ def test_run_against_configured_backend_full_flow(
     assert "locomo" in data["results"]["mem0"]["evals"]
     assert "contradiction" in data["results"]["mem0"]["evals"]
     assert "compression" in data["results"]["mem0"]["evals"]
+    assert "orphan_cleanup" in data["results"]["mem0"]["evals"]
+    assert data["results"]["mem0"]["evals"]["orphan_cleanup"]["skipped"] is True
+    assert "result_consistency" in data["results"]["mem0"]["evals"]
 
     report_result = runner.invoke(main, ["report", str(out_path)])
     assert report_result.exit_code == 0

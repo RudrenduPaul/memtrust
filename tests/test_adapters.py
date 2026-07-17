@@ -17,9 +17,11 @@ from memtrust.adapters.base import (
     BackendNotConfiguredError,
     ConflictSignal,
     CrashSignal,
+    DeletePrefixResult,
     DeleteResult,
     ExtractionSignal,
     MemoryBackendAdapter,
+    MemoryRecord,
     QueryResult,
     RankingSignal,
     RetrievalWarning,
@@ -966,6 +968,476 @@ def test_openviking_list_resource_paths_respects_max_depth(
 
     assert paths == ["viking://memory/session-1/entities/skills.md"]
     adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# OpenVikingAdapter -- CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE
+# (volcengine/OpenViking#2966, lRoccoon)
+#
+# A legacy uint16-length-truncated record's `fields` JSON crashes
+# LocalIndex's internal delta-list conversion with a bare
+# json.decoder.JSONDecodeError on the delete()/upsert (store()/update())
+# write paths. This adapter's own resp.json() calls would otherwise let
+# that raw exception escape unclassified -- these tests prove it is caught
+# and classified instead.
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_store_raises_crash_signal_on_malformed_json_response(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        status_code=200,
+        content=b'{"path": "viking://memory/session-1/abc", "corrupted": tru',
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content")
+    assert exc_info.value.crash_signal == CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE
+    adapter.close()
+
+
+def test_openviking_update_raises_crash_signal_on_malformed_json_response(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        status_code=200,
+        content=b"not json at all",
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.update("session-1", "viking://memory/session-1/abc", "new content")
+    assert exc_info.value.crash_signal == CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE
+    adapter.close()
+
+
+def test_openviking_delete_raises_crash_signal_on_malformed_json_response(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/delete",
+        status_code=200,
+        content=b'{"unterminated": "strin',
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.delete("viking://memory/session-1/abc")
+    assert exc_info.value.crash_signal == CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE
+    adapter.close()
+
+
+def test_delete_result_corruption_signal_defaults_to_not_applicable() -> None:
+    """DeleteResult now mirrors StoreResult/UpdateResult's corruption_signal
+    field -- confirms the default without needing a live adapter."""
+    from memtrust.adapters.base import CorruptionSignal
+
+    result = DeleteResult(success=True, memory_id="m1", latency_ms=1.0)
+    assert result.corruption_signal == CorruptionSignal.NOT_APPLICABLE
+
+
+class LegacyCorruptRecordFakeAdapter(MemoryBackendAdapter):
+    """In-memory fake modeling volcengine/OpenViking#2966's exact shape:
+    delete() raises BackendAPIError with
+    CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE for ids the fake treats
+    as legacy-corrupt, and succeeds normally for every other id. Same
+    precedent as evals/crash_recovery.py's CrashRecoveryFakeAdapter (see
+    test_evals.py) -- a purpose-built fake proving the taxonomy classifies
+    correctly, independent of any live OpenViking instance."""
+
+    name = "fake-legacy-corrupt"
+    env_var = "FAKE_API_KEY"
+
+    def __init__(self, corrupt_ids: set[str]) -> None:
+        self._corrupt_ids = corrupt_ids
+        self._store: dict[str, str] = {}
+
+    def store(
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
+    ) -> StoreResult:
+        memory_id = f"{session_id}-{len(self._store)}"
+        self._store[memory_id] = content
+        return StoreResult(memory_id=memory_id, latency_ms=0.1)
+
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
+        return QueryResult(
+            records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        if memory_id in self._corrupt_ids:
+            raise BackendAPIError(
+                self.name,
+                "legacy-corrupt record",
+                crash_signal=CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE,
+            )
+        self._store[memory_id] = content
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        if memory_id in self._corrupt_ids:
+            raise BackendAPIError(
+                self.name,
+                "legacy-corrupt record: JSONDecodeError during delete_data()",
+                crash_signal=CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE,
+            )
+        self._store.pop(memory_id, None)
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+
+def test_legacy_corrupt_record_delete_raises_classified_crash_signal() -> None:
+    adapter = LegacyCorruptRecordFakeAdapter(corrupt_ids={"corrupt-1"})
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.delete("corrupt-1")
+    assert exc_info.value.crash_signal == CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE
+
+
+def test_legacy_corrupt_record_delete_many_records_failure_per_id_without_crashing() -> None:
+    """delete_many()'s existing per-id aggregation (base.py) must not let
+    one legacy-corrupt record's exception truncate or crash the batch --
+    it should record that id as a failure and keep processing the rest."""
+    adapter = LegacyCorruptRecordFakeAdapter(corrupt_ids={"corrupt-1"})
+    store_1 = adapter.store("s1", "clean content one")
+    store_2 = adapter.store("s1", "clean content two")
+
+    results = adapter.delete_many([store_1.memory_id, "corrupt-1", store_2.memory_id])
+
+    assert len(results) == 3
+    assert results[0].success is True
+    assert results[1].success is False
+    assert "legacy-corrupt" in str(results[1].raw.get("error", ""))
+    assert results[2].success is True
+
+
+# ---------------------------------------------------------------------------
+# OpenVikingAdapter.store() -- ExtractionSignal (volcengine/OpenViking#2751,
+# gleydson115-code)
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_store_sets_facts_extracted_when_total_memories_absent(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        json={"path": "viking://memory/session-1/abc"},
+    )
+    result = adapter.store("session-1", "I prefer dark mode.")
+    assert result.extraction_signal == ExtractionSignal.FACTS_EXTRACTED
+    adapter.close()
+
+
+def test_openviking_store_sets_empty_extraction_when_total_memories_is_zero(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """volcengine/OpenViking#2751: the OpenAI VLM backend's hardcoded
+    max_tokens=32768 exceeds gpt-4o-mini's real 16384 cap; the resulting
+    API 400 gets swallowed inside compressor_v2, and the write commit
+    still returns 200/accepted with total_memories staying 0, silent."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        json={"path": "viking://memory/session-1/abc", "total_memories": 0},
+    )
+    result = adapter.store("session-1", "some chit-chat with no facts")
+    assert result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
+    adapter.close()
+
+
+def test_openviking_store_sets_facts_extracted_when_total_memories_nonzero(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        json={"path": "viking://memory/session-1/abc", "total_memories": 3},
+    )
+    result = adapter.store("session-1", "I prefer dark mode.")
+    assert result.extraction_signal == ExtractionSignal.FACTS_EXTRACTED
+    adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# OpenVikingAdapter.query() -- RankingSignal.RERANK_FALLBACK
+# (volcengine/OpenViking#1737 wychosenone, #2739/#2880 hhspiny)
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_query_flags_rerank_fallback_on_empty_document(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/search",
+        json={
+            "results": [
+                {"path": "viking://memory/session-1/a", "content": ""},
+                {"path": "viking://memory/session-1/b", "content": "some real content"},
+            ]
+        },
+    )
+    result = adapter.query("session-1", "anything")
+    assert result.ranking_signal == RankingSignal.RERANK_FALLBACK
+    adapter.close()
+
+
+def test_openviking_query_flags_rerank_fallback_on_oversized_batch(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """hhspiny's #2880 shape: L2 abstracts collectively exceed the
+    reranker's real token budget (~4096 tokens, MAX_RERANK_TOKENS)."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    oversized_content = "x" * 20000  # ~5000 estimated tokens, over budget alone
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/search",
+        json={
+            "results": [
+                {"path": "viking://memory/session-1/a", "content": oversized_content},
+                {"path": "viking://memory/session-1/b", "content": "short"},
+            ]
+        },
+    )
+    result = adapter.query("session-1", "anything")
+    assert result.ranking_signal == RankingSignal.RERANK_FALLBACK
+    adapter.close()
+
+
+def test_openviking_query_does_not_flag_rerank_fallback_under_budget(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/search",
+        json={
+            "results": [
+                {"path": "viking://memory/session-1/a", "content": "a normal short memory"},
+                {"path": "viking://memory/session-1/b", "content": "another normal memory"},
+            ]
+        },
+    )
+    result = adapter.query("session-1", "anything")
+    assert result.ranking_signal == RankingSignal.NOT_APPLICABLE
+    adapter.close()
+
+
+def test_openviking_query_single_record_never_flags_rerank_fallback(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """A single-candidate response has nothing rerank would meaningfully
+    reorder -- must not be flagged even if that one record is empty."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/search",
+        json={"results": [{"path": "viking://memory/session-1/a", "content": ""}]},
+    )
+    result = adapter.query("session-1", "anything")
+    assert result.ranking_signal == RankingSignal.NOT_APPLICABLE
+    adapter.close()
+
+
+# ---------------------------------------------------------------------------
+# OpenVikingAdapter.delete_prefix() (volcengine/OpenViking#3064, AcTiveXXX)
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_delete_prefix_deletes_discovered_children_and_root(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        match_json={"path_prefix": "viking://orphan-test"},
+        json={
+            "entries": [
+                {"path": "viking://orphan-test/child1.md", "type": "file"},
+                {"path": "viking://orphan-test/child2.md", "type": "file"},
+            ]
+        },
+    )
+    for _ in range(3):  # 2 discovered children + the prefix root itself
+        httpx_mock.add_response(
+            method="POST",
+            url="http://localhost:1933/v1/fs/delete",
+            json={"deleted": True},
+        )
+    result = adapter.delete_prefix("orphan-test", recursive=True)
+
+    assert set(result.deleted_paths) == {
+        "viking://orphan-test/child1.md",
+        "viking://orphan-test/child2.md",
+        "viking://orphan-test",
+    }
+    assert result.failed_paths == []
+    adapter.close()
+
+
+def test_openviking_delete_prefix_only_deletes_root_when_listing_finds_nothing(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Reproduces the client-visible shape of volcengine/OpenViking#3064:
+    when the underlying listing call reports zero children (the exact
+    consequence of the server's own bare `except: pass` on a directory
+    that no longer exists in AGFS), this adapter can only discover and
+    delete the root URI -- it has no way to independently discover the
+    orphaned children through this endpoint alone. This is exactly why
+    evals/orphan_cleanup.py's classification re-queries for seeded content
+    afterward instead of trusting an empty listing as proof of a clean
+    delete -- see VectorIntegritySignal.ORPHANED_VECTOR_ENTRY."""
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        json={"entries": []},
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/delete",
+        json={"deleted": True},
+    )
+    result = adapter.delete_prefix("orphan-test", recursive=True)
+
+    assert result.deleted_paths == ["viking://orphan-test"]
+    adapter.close()
+
+
+def test_openviking_delete_prefix_records_failed_child_deletes(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/list",
+        json={"entries": [{"path": "viking://orphan-test/child1.md", "type": "file"}]},
+    )
+    httpx_mock.add_response(
+        method="POST", url="http://localhost:1933/v1/fs/delete", status_code=500
+    )
+    httpx_mock.add_response(
+        method="POST", url="http://localhost:1933/v1/fs/delete", json={"deleted": True}
+    )
+    result = adapter.delete_prefix("orphan-test", recursive=True)
+
+    assert "viking://orphan-test/child1.md" in result.failed_paths
+    adapter.close()
+
+
+class OrphanedChildFakeAdapter(MemoryBackendAdapter):
+    """In-memory fake modeling volcengine/OpenViking#3064's exact shape at
+    the harness level: delete_prefix() only ever removes the root URI from
+    the backing store (mirroring the bug's "only the root URI gets
+    deleted" outcome), list_resource_paths() correctly reports the
+    directory as empty afterward (the AGFS-listing-level view says
+    "gone"), but query() still surfaces the orphaned children (the vector
+    index disagrees). Same precedent as test_evals.py's
+    CrashRecoveryFakeAdapter/MigrationRollbackFakeAdapter -- a
+    purpose-built fake proving the classifier tells CLEAN and
+    ORPHANED_VECTOR_ENTRY apart correctly."""
+
+    name = "fake-orphaned-child"
+    env_var = "FAKE_API_KEY"
+    supports_resource_sync = True
+    supports_prefix_delete = True
+
+    def __init__(self) -> None:
+        self._store: dict[str, str] = {}
+
+    def store(
+        self,
+        session_id: str,
+        content: str,
+        metadata: dict[str, str] | None = None,
+        mode: str | None = None,
+    ) -> StoreResult:
+        path = (metadata or {}).get("resource_path", f"{session_id}-{len(self._store)}")
+        self._store[path] = content
+        return StoreResult(memory_id=path, latency_ms=0.1)
+
+    def query(
+        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+    ) -> QueryResult:
+        records = [
+            MemoryRecord(memory_id=path, content=content)
+            for path, content in self._store.items()
+            if query.lower() in content.lower()
+        ]
+        return QueryResult(
+            records=records, conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        self._store[memory_id] = content
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        existed = self._store.pop(memory_id, None) is not None
+        return DeleteResult(success=existed, memory_id=memory_id, latency_ms=0.1)
+
+    def list_resource_paths(self, prefix: str) -> list[str]:
+        # The buggy AGFS-listing view: unconditionally reports nothing --
+        # this models #3064's bare `except: pass` swallowing a listing
+        # failure against a parent directory already gone from AGFS, the
+        # same failure that made _collect_uris() return an empty list
+        # regardless of how many child vector-index entries actually
+        # still exist.
+        return []
+
+    def delete_prefix(self, prefix: str, recursive: bool = True) -> DeletePrefixResult:
+        # Models the #3064 bug directly: only the root URI is ever
+        # removed from the backing store, regardless of how many children
+        # exist beneath it.
+        existed = self._store.pop(prefix, None) is not None
+        deleted = [prefix] if existed else []
+        return DeletePrefixResult(
+            prefix=prefix, deleted_paths=deleted, failed_paths=[], latency_ms=0.1
+        )
+
+
+def test_orphaned_child_fake_adapter_leaves_query_matches_after_delete_prefix() -> None:
+    adapter = OrphanedChildFakeAdapter()
+    adapter.store("s1", "root marker", metadata={"resource_path": "parent"})
+    adapter.store("s1", "child alpha content", metadata={"resource_path": "parent/child-alpha.md"})
+    adapter.store("s1", "child beta content", metadata={"resource_path": "parent/child-beta.md"})
+
+    adapter.delete_prefix("parent", recursive=True)
+
+    # The buggy listing view reports the prefix as fully gone...
+    assert adapter.list_resource_paths("parent") == []
+    # ...but the children are still there and still searchable.
+    query_result = adapter.query("s1", "child alpha")
+    assert len(query_result.records) == 1
+    assert query_result.records[0].content == "child alpha content"
 
 
 # ---------------------------------------------------------------------------
