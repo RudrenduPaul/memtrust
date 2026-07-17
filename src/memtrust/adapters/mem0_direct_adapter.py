@@ -336,6 +336,35 @@ two adapters -- one with the default prompt, one with a rewritten
 `extraction_quality.py`'s existing `ExtractionQualitySignal` classification
 (building an automated A/B-comparison mode for that eval is a separate,
 larger item, out of scope here).
+
+## Vendor embedder-call counting and cost attribution
+
+An optional `cost_tracker` constructor argument (a `scoring.cost_tracker
+.CostTracker`) enables `store()`'s `_CountingEmbedder`, which wraps
+`memory.embedding_model`'s real `embed()`/`embed_batch()` for the
+duration of a single `store()` call and reports vendor-side embedder-
+call count/estimated-cost via `CostTracker.record_embed_calls()` --
+closing an instrumentation gap this adapter previously had entirely
+(`cost_tracker.py` tracked only memtrust's own judge-LLM spend). Closes
+the gap that kept spike-spiegel-21's merged mem0ai/mem0#1900 fix
+unobservable through this adapter -- see `evals/embedder_cost.py`'s
+module docstring for the honest scope of what this measures against the
+currently installed package (that PR's own targeted code path no longer
+exists in `mem0ai==2.0.12`; this build measures the bug *class* against
+the pipeline that exists today instead, the same honest-substitution
+shape already established above for mem0ai/mem0#3558/Kuzu).
+
+## Language-degradation detection (non-Latin-script i18n)
+
+`query()`'s new `explain` keyword argument (forwarded straight through
+to the real, installed `Memory.search(explain=...)`) surfaces each
+result's `score_details` breakdown, letting `QueryResult
+.language_degradation_signal` report whether the hybrid retrieval
+pipeline's BM25/entity-boost signals genuinely fired for a query, or
+silently degraded to semantic-only retrieval -- see
+`LanguageDegradationSignal` in `base.py` for the full mem0ai/mem0#4884
+(wangjiawei-vegetable) provenance and `evals/language_degradation.py` for
+the eval built on top of this.
 """
 
 from __future__ import annotations
@@ -353,6 +382,7 @@ from memtrust.adapters.base import (
     CorruptionSignal,
     DeleteResult,
     ExtractionSignal,
+    LanguageDegradationSignal,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -448,6 +478,7 @@ class _MemoryProtocol(Protocol):
         filters: Mapping[str, object] | None = None,
         top_k: int = ...,
         threshold: float | None = ...,
+        explain: bool = ...,
     ) -> dict[str, object]: ...
 
     def update(
@@ -785,6 +816,7 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         top_k: int = 5,
         mode: str | None = None,
         threshold: float | None = None,
+        explain: bool = False,
     ) -> QueryResult:
         """Retrieve memories relevant to `query` within `session_id`.
 
@@ -804,6 +836,21 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         them, per `VectorStoreBase.search()`'s documented contract and
         `tests/test_mem0_direct_adapter.py`'s real-package regression
         tests against `mem0.utils.scoring.score_and_rank`).
+
+        `explain` is forwarded to the real, installed `Memory.search()`'s
+        own `explain` parameter (confirmed by reading `mem0/memory/main.py`
+        during this build: `explain (bool, optional): Whether to include
+        score_details for each result. Defaults to False.`). When `True`,
+        each returned result's `score_details` dict (`bm25_score`,
+        `entity_boost`, `semantic_score`, ... -- confirmed by reading
+        `mem0/utils/scoring.py::score_and_rank()` directly) is what this
+        method inspects to set `QueryResult.language_degradation_signal`
+        -- see `LanguageDegradationSignal` in base.py and
+        `evals/language_degradation.py` for the mem0ai/mem0#4884
+        motivation (wangjiawei-vegetable). `explain=False` (the default)
+        leaves `language_degradation_signal` at its own default
+        `NOT_APPLICABLE`, same backward-compatible-default convention
+        `threshold=None` already establishes for this method.
         """
         del mode  # no-op, see store() above
         timer = self._timed()
@@ -813,7 +860,11 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
             raise BackendAPIError(self.name, f"config rejected: {exc}") from exc
         try:
             data = memory.search(
-                query, filters={"user_id": session_id}, top_k=top_k, threshold=threshold
+                query,
+                filters={"user_id": session_id},
+                top_k=top_k,
+                threshold=threshold,
+                explain=explain,
             )
         except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
@@ -848,6 +899,7 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
             records=records,
             conflict_signal=ConflictSignal.NOT_APPLICABLE,
             latency_ms=timer.elapsed_ms(),
+            language_degradation_signal=_classify_language_degradation(raw_results, explain),
             raw=data if isinstance(data, dict) else {"results": data},
         )
 
@@ -1112,3 +1164,54 @@ def _extract_memory_id(data: object) -> str:
         if "id" in data:
             return str(data["id"])
     return ""
+
+
+def _classify_language_degradation(
+    raw_results: list[dict[str, object]], explain: bool
+) -> LanguageDegradationSignal:
+    """Classify whether the hybrid retrieval pipeline's BM25/entity-boost
+    signals fired for this query, from each result's real, installed
+    `score_details` breakdown -- see `LanguageDegradationSignal`'s
+    docstring in base.py and `query()`'s own docstring above for exactly
+    where `score_details` comes from.
+
+    Never trusts a single result's `score_details` in isolation: a query
+    is only classified `SEMANTIC_ONLY_DEGRADED` when at least one result
+    actually carries a `score_details` breakdown to inspect AND every such
+    result shows zero contribution from both signals -- one result with a
+    nonzero `bm25_score`/`entity_boost` is concrete evidence the hybrid
+    pipeline genuinely engaged for this query, even if most results didn't
+    individually benefit from it (mirrors `evals/contradiction.py::
+    classify_case()`'s "never a blind pass-through of an adapter's bare
+    self-report" design principle: this reads the same real per-result
+    evidence every result set carries, not a single top-level flag mem0's
+    response never exposes in the first place). If NO result carries a
+    `score_details` field at all (an older mem0 version, or `explain`
+    wasn't actually honored by whatever handled the call), that is a
+    "nothing was observed" case -- NOT_APPLICABLE, never guessed as
+    degradation just because the diagnostic field itself was absent.
+    """
+    if not explain or not raw_results:
+        return LanguageDegradationSignal.NOT_APPLICABLE
+
+    any_score_details_observed = False
+    any_bm25_or_entity = False
+    for item in raw_results:
+        details = item.get("score_details")
+        if not isinstance(details, dict):
+            continue
+        any_score_details_observed = True
+        bm25_score = details.get("bm25_score") or 0.0
+        entity_boost = details.get("entity_boost") or 0.0
+        try:
+            if float(bm25_score) > 0.0 or float(entity_boost) > 0.0:
+                any_bm25_or_entity = True
+                break
+        except (TypeError, ValueError):
+            continue
+
+    if not any_score_details_observed:
+        return LanguageDegradationSignal.NOT_APPLICABLE
+    if any_bm25_or_entity:
+        return LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+    return LanguageDegradationSignal.SEMANTIC_ONLY_DEGRADED
