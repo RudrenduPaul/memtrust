@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "case_id": "rc-001-repeated-identical-query",
+      "session_id": "consistency-session-1",
+      "query": "what does V prefer for coding style?",
+      "n_repeats": 5,
+      "threshold": 0.9,
+      "records": [
+        {"content": "V prefers tabs over spaces for indentation."},
+        {"content": "V likes descriptive variable names over abbreviations."},
+        {"content": "V runs a linter before every commit."}
+      ]
+    },
+    {
+      "case_id": "rc-002-larger-candidate-set",
+      "session_id": "consistency-session-2",
+      "query": "how do I check docker container logs?",
+      "n_repeats": 5,
+      "threshold": 0.9,
+      "records": [
+        {"content": "Use `docker logs -f <container>` to tail container logs."},
+        {"content": "Use `docker compose logs -f <service>` for compose-managed services."},
+        {"content": "Container logs rotate at 10MB by default in this environment."},
+        {"content": "Set the log driver to json-file for local debugging."}
+      ]
+    }
+  ]
+}

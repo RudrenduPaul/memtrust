@@ -1,0 +1,36 @@
+{
+  "cases": [
+    {
+      "case_id": "oc-001-nested-siblings",
+      "prefix": "orphan-cleanup/case-1",
+      "seed_files": [
+        {
+          "path_suffix": "orphan-cleanup/case-1/entities/team-alpha.md",
+          "content": "Team Alpha owns the ingestion pipeline and rotates on-call weekly."
+        },
+        {
+          "path_suffix": "orphan-cleanup/case-1/entities/team-beta.md",
+          "content": "Team Beta owns the search-ranking service and ships biweekly."
+        }
+      ]
+    },
+    {
+      "case_id": "oc-002-deeply-nested",
+      "prefix": "orphan-cleanup/case-2",
+      "seed_files": [
+        {
+          "path_suffix": "orphan-cleanup/case-2/projects/atlas/overview.md",
+          "content": "Project Atlas migrates the legacy billing system to the new ledger service."
+        },
+        {
+          "path_suffix": "orphan-cleanup/case-2/projects/atlas/notes/kickoff.md",
+          "content": "Atlas kickoff: scope frozen, target date confirmed for next quarter."
+        },
+        {
+          "path_suffix": "orphan-cleanup/case-2/projects/atlas/notes/risks.md",
+          "content": "Atlas risk log: ledger reconciliation job has an untested edge case."
+        }
+      ]
+    }
+  ]
+}
