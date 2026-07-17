@@ -982,6 +982,65 @@ class RawFilterProbeResult:
 
 
 @dataclass
+class MetadataOverviewResult:
+    """Result of MemoryBackendAdapter.metadata_overview() -- the
+    library-level equivalent of a vendor's MCP metadata/overview tool
+    (MemPalace's `mempalace_status`, see mempalace_adapter.py). Optional
+    capability, same convention as RawFilterProbeResult above -- only
+    meaningful for a backend whose native surface exposes an aggregate
+    record-count-plus-grouping overview; see supports_metadata_overview.
+
+    MemPalace/mempalace#1871 (contributor alionar) found that this exact
+    class of tool -- `mempalace_status`, `mempalace_list_wings`,
+    `mempalace_list_rooms` -- did a full-collection scan on every call,
+    O(N^2) against repeated calls, hanging the MCP server at 158K+
+    records. memtrust had zero coverage of this code path before this
+    type existed: evals/scale_stress.py only measures store()/query()
+    latency, never a metadata/histogram-listing call.
+    """
+
+    total_records: int | None
+    """Total record count the backend reports, or None if the response
+    didn't include one (see `partial`/`error`)."""
+    categories: dict[str, int]
+    """Top-level grouping breakdown (MemPalace: wing name -> drawer
+    count). Named generically, not `wings`, so this type stays usable by
+    a future adapter whose native grouping concept isn't wings/rooms at
+    all -- see list_metadata_categories()/list_metadata_subcategories()
+    below for the same naming choice."""
+    subcategories: dict[str, int]
+    """Second-level grouping breakdown (MemPalace: room name -> drawer
+    count), unscoped (across every category) when this came from
+    metadata_overview() rather than list_metadata_subcategories()."""
+    latency_ms: float
+    partial: bool = False
+    """True when the backend itself reported a partial/degraded result
+    (e.g. a metadata fetch that errored partway through) -- see `error`.
+    Never inferred from "the call didn't raise"; only set when the
+    backend's own response says so, the same rule every other *Result
+    type in this module follows."""
+    error: str | None = None
+    """The backend's own reported error string when `partial` is True,
+    else None."""
+
+
+@dataclass
+class MetadataCategoryCountsResult:
+    """Result of MemoryBackendAdapter.list_metadata_categories() /
+    list_metadata_subcategories() -- see MetadataOverviewResult above for
+    the motivating bug and the generic category/subcategory naming."""
+
+    counts: dict[str, int]
+    scope: str | None
+    """The category this subcategory listing was scoped to (MemPalace:
+    the `wing` argument), or None for an unscoped listing / a top-level
+    category listing that has no scope concept at all."""
+    latency_ms: float
+    partial: bool = False
+    error: str | None = None
+
+
+@dataclass
 class DeleteResult:
     """Result of MemoryBackendAdapter.delete().
 
@@ -1235,6 +1294,23 @@ class MemoryBackendAdapter(ABC):
     #: and VectorIntegritySignal in this module for the failure shape
     #: (volcengine/OpenViking#3064) it exists to detect.
     supports_prefix_delete: bool = False
+
+    #: Whether this adapter exposes a library-level equivalent of a
+    #: vendor's MCP metadata/overview tool surface (MemPalace's
+    #: `mempalace_status`/`mempalace_list_wings`/`mempalace_list_rooms`)
+    #: via metadata_overview()/list_metadata_categories()/
+    #: list_metadata_subcategories() below. Defaults to False -- most
+    #: adapters in this repo have no such surface at all (store/query/
+    #: update/delete is the entire interface). Only MemPalaceAdapter,
+    #: which holds a direct in-process handle to the real
+    #: `mempalace.mcp_server` module's `tool_status`/`tool_list_wings`/
+    #: `tool_list_rooms` functions (confirmed real and callable without
+    #: spinning up the actual MCP stdio/HTTP transport -- see
+    #: mempalace_adapter.py's module docstring), can genuinely exercise
+    #: this. See evals/mempalace_metadata_scale.py, the eval this gates,
+    #: for the motivating MemPalace/mempalace#1871 O(N^2) full-collection-
+    #: scan bug this closes coverage for.
+    supports_metadata_overview: bool = False
 
     @abstractmethod
     def store(
@@ -1607,6 +1683,73 @@ class MemoryBackendAdapter(ABC):
         raise NotImplementedError(
             f"{self.name} does not implement delete_prefix() "
             f"(supports_prefix_delete={self.supports_prefix_delete})"
+        )
+
+    def metadata_overview(self) -> MetadataOverviewResult:
+        """Fetch this backend's aggregate record-count-plus-grouping
+        overview -- the library-level equivalent of MemPalace's
+        `mempalace_status` MCP tool.
+
+        Optional capability, same convention as list_resource_paths()/
+        probe_raw_filter() above -- default raises NotImplementedError,
+        only adapters with supports_metadata_overview = True are expected
+        to override it.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_metadata_overview is False).
+            BackendAPIError: on any network or vendor-side failure.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement metadata_overview() "
+            f"(supports_metadata_overview={self.supports_metadata_overview})"
+        )
+
+    def list_metadata_categories(self) -> MetadataCategoryCountsResult:
+        """List every top-level group this backend's records are
+        organized under, with a record count per group -- the
+        library-level equivalent of MemPalace's `mempalace_list_wings`
+        MCP tool.
+
+        Optional capability, same convention as metadata_overview()
+        above -- default raises NotImplementedError, only adapters with
+        supports_metadata_overview = True are expected to override it.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_metadata_overview is False).
+            BackendAPIError: on any network or vendor-side failure.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement list_metadata_categories() "
+            f"(supports_metadata_overview={self.supports_metadata_overview})"
+        )
+
+    def list_metadata_subcategories(
+        self, category: str | None = None
+    ) -> MetadataCategoryCountsResult:
+        """List every second-level group this backend's records are
+        organized under, optionally scoped to one top-level `category` --
+        the library-level equivalent of MemPalace's `mempalace_list_rooms`
+        MCP tool.
+
+        Optional capability, same convention as metadata_overview()
+        above -- default raises NotImplementedError, only adapters with
+        supports_metadata_overview = True are expected to override it.
+
+        Args:
+            category: restrict the listing to this top-level group
+                (MemPalace: a wing name), or None to list across every
+                category.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_metadata_overview is False).
+            BackendAPIError: on any network or vendor-side failure.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement list_metadata_subcategories() "
+            f"(supports_metadata_overview={self.supports_metadata_overview})"
         )
 
     @staticmethod
