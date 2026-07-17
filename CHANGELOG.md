@@ -3,6 +3,36 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-07-17
+
+### Changed
+
+- `MemPalaceAdapter` (`adapters/mempalace_adapter.py`) rewritten against the real,
+  live-verified `mempalace.mcp_server` API. Every previous version called a fictional
+  `mempalace.Palace` class that does not exist in the real installed package (confirmed:
+  `hasattr(mempalace, 'Palace')` is `False`) -- `store()`/`query()`/`update()` never
+  worked against the real vendor package in this project's history. `delete()`, which
+  previously always raised (no primitive existed), now genuinely works via
+  `tool_delete_drawer`. New additive `kg_add()`/`kg_invalidate()`/`kg_query()` methods
+  wrap the real KG API, including a new `TemporalBoundarySignal` (`CLEAN`/
+  `DOUBLE_COUNT`/`NOT_APPLICABLE`) detecting the exact boundary-instant double-counting
+  shape MemPalace/mempalace#1913/PR#1914 fixed. `RankingSignal` classification
+  re-pointed from fictional `importance`/`emotional_weight`/`weight` fields to the real
+  `similarity`/`authored_at` fields `tool_search` actually returns.
+- `--locomo-dataset-path` CLI flag added to `memtrust run` -- `run_locomo()` already
+  accepted a `dataset_path` parameter and `docs/methodology.md` already documented it,
+  but the CLI never exposed a way to actually pass one in. `load_dataset()` now raises
+  actionable errors (missing file / invalid JSON / missing `conversations` key) naming
+  the download URL and expected schema, instead of a bare `FileNotFoundError`/
+  `KeyError`/`JSONDecodeError`.
+
+### Fixed
+
+- `cryptography` dependency ceiling raised from `<47.0` to `<49.0` (floor raised to
+  `>=48.0.1`) -- the prior ceiling actively prevented installing the fix for
+  GHSA-537c-gmf6-5ccf (vulnerable OpenSSL bundled in the `cryptography` wheel, HIGH,
+  CVSS 7.5), found via `pip-audit` during a routine security sweep.
+
 ## [0.2.0] - 2026-07-17
 
 ### Added
