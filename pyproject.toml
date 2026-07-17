@@ -62,35 +62,36 @@ mem0-direct = [
     "valkey>=6.0.0,<7.0",
     "elasticsearch>=8.0.0,<9.0",
 ]
-# MemPalaceAdapter.metadata_overview()/list_metadata_categories()/
-# list_metadata_subcategories() hold a direct, in-process handle to the
-# real `mempalace.mcp_server` module's tool_status/tool_list_wings/
-# tool_list_rooms functions (see mempalace_adapter.py's "MCP metadata-tool
-# coverage" module docstring section and MemPalace/mempalace#1871).
+# MemPalaceAdapter holds a direct, in-process handle to the real
+# `mempalace.mcp_server` module's tool_status/tool_list_wings/
+# tool_list_rooms/tool_add_drawer/tool_search/tool_update_drawer/
+# tool_delete_drawer/tool_kg_add/tool_kg_invalidate/tool_kg_query
+# functions (see mempalace_adapter.py's module docstring -- as of the
+# store()/query()/update()/delete()/kg_* rewrite, every one of these is a
+# live-verified, confirmed-real call, not the unconfirmed `mempalace.
+# Palace` guess earlier versions of this adapter shipped). Both
 # tests/test_mempalace_metadata_scale.py's real-seeder integration test
-# uses `pytest.importorskip("mempalace")` so it degrades to a clean,
-# explained skip rather than a collection error when this group isn't
-# installed -- confirmed working locally against the real installed
-# mempalace/chromadb (3.5.0): seeding 20,000 synthetic drawers and
-# re-querying tool_status()/tool_list_wings() against them returned
-# correct ground-truth counts in well under 100ms.
+# and tests/test_adapters.py's real-drawer/real-KG integration tests use
+# `pytest.importorskip("mempalace")` so they degrade to a clean, explained
+# skip rather than a collection error when this group isn't installed --
+# confirmed working locally against the real installed mempalace/chromadb
+# (3.5.0): seeding 20,000 synthetic drawers and re-querying
+# tool_status()/tool_list_wings() against them returned correct
+# ground-truth counts in well under 100ms; store()/query()/update()/
+# delete()/kg_add()/kg_invalidate()/kg_query() were each live-verified
+# end-to-end against a real local chromadb-backed palace.
 #
 # Unlike mem0-direct above, this group is deliberately NOT installed by
-# any CI job. mempalace's real installed surface has no `Palace` class at
-# all -- store()/query()/update() above are written against an
-# unconfirmed guess that does not match it (see mempalace_adapter.py's
-# module docstring), a separate, pre-existing gap this change does not
-# fix. This repo's existing ImportError-path tests
-# (test_mempalace_get_palace_raises_clear_error_when_package_missing and
-# this change's test_mempalace_get_mcp_metadata_tools_raises_clear_error_
-# when_package_missing) rely on `mempalace` being genuinely absent from
-# the test environment, the same convention
-# test_graphiti_selfhosted_get_client_raises_clear_error_when_package_
-# missing already establishes for graphiti-core -- installing this group
-# in a shared CI job would silently break both. A contributor can install
-# it locally (`pip install -e ".[dev,mempalace-direct]"`) to run the real
-# integration test; CI intentionally exercises only the fake-backed
-# tests, the same boundary this repo already draws around graphiti-core.
+# any CI job. This repo's existing ImportError-path test
+# (test_mempalace_get_mcp_tools_raises_clear_error_when_package_missing)
+# relies on `mempalace` being genuinely absent from the test environment,
+# the same convention test_graphiti_selfhosted_get_client_raises_clear_
+# error_when_package_missing already establishes for graphiti-core --
+# installing this group in a shared CI job would silently break it. A
+# contributor can install it locally
+# (`pip install -e ".[dev,mempalace-direct]"`) to run the real integration
+# tests; CI intentionally exercises only the fake-backed tests, the same
+# boundary this repo already draws around graphiti-core.
 mempalace-direct = [
     "mempalace>=3.0.0,<4.0",
 ]
