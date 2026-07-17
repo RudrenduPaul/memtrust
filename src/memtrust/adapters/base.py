@@ -869,6 +869,78 @@ class LanguageDegradationSignal(StrEnum):
     NOT_APPLICABLE member in this package follows."""
 
 
+class TemporalBoundarySignal(StrEnum):
+    """Whether a knowledge-graph `as_of` point-in-time query at the exact
+    instant a fact was invalidated resolved cleanly to one side of the
+    boundary, or returned both the superseded fact and its successor at
+    once -- a structurally distinct failure mode from every signal above.
+    `ConflictSignal` classifies a drawer/edge query's response to a
+    contradiction in general; this taxonomy is narrower and exact: it only
+    concerns the single shared instant where one fact's `valid_to` equals
+    another fact's `valid_from` for the same `(subject, predicate)`, which
+    is precisely the boundary a half-open-vs-closed interval comparison
+    decides.
+
+    Motivating case: MemPalace/mempalace#1913, fixed by merged PR#1914
+    (contributor ggettert, `gh pr view 1914 --repo MemPalace/mempalace`).
+    `_temporal_filter_sql`'s upper bound was a *closed* interval
+    (`t.valid_to >= ?`), so a fact whose `valid_to` equals the query's
+    `as_of` instant still matched -- and if a successor fact's
+    `valid_from` was set to that identical instant (the documented
+    hand-rolled-handover pattern PR#1914's own `PALACE_PROTOCOL` fix
+    explicitly warns against: `kg_invalidate` immediately followed by
+    `kg_add` at the same boundary), an `as_of` query at that exact instant
+    matched BOTH the old and new fact simultaneously, so a single-valued
+    predicate (e.g. `uses_model`) reported two contradictory values at
+    once. PR#1914's real fix switched the comparison to a *half-open*
+    interval (`t.valid_to > ?`, strict): a fact that ended exactly at the
+    query instant no longer matches, so the successor cleanly wins. The
+    PR also added a `supersede()` primitive (`mempalace_kg_supersede`) as
+    the preferred atomic replacement -- not wired into this adapter as of
+    this signal's introduction, since `MemPalaceAdapter.kg_add()`/
+    `kg_invalidate()`/`kg_query()` only cover the three tools
+    (`tool_kg_add`/`tool_kg_invalidate`/`tool_kg_query`) already confirmed
+    real in this adapter's module docstring; adding `kg_supersede` support
+    is a separate, later change, not required to detect the boundary bug
+    this signal exists for.
+
+    Same self-reporting convention `ConflictSignal`/`RankingSignal`
+    establish: the adapter classifies its OWN query response and reports
+    a signal here, but the eval that scores it (see
+    `evals/temporal_kg_boundary.py`) never trusts this as the final
+    answer -- it independently re-derives the same verdict from the raw
+    `KGFact` list the query actually returned (how many distinct objects
+    exist for the queried `(subject, predicate)` at that `as_of`) and
+    only records the adapter's self-report for comparison/transparency,
+    the same "claim, not proof" role `RankingSignal.SIGNAL_DRIVEN`'s
+    docstring already documents for that enum.
+    """
+
+    CLEAN = "clean"
+    """The `as_of` query at the boundary instant returned exactly one
+    object for the queried `(subject, predicate)` -- the fixed, half-open
+    PR#1914 contract: a fact whose `valid_to` equals the query instant is
+    correctly excluded, so only its successor (or only the original fact,
+    if no successor was ever added) is returned."""
+
+    DOUBLE_COUNT = "double_count"
+    """The `as_of` query at the boundary instant returned two (or more)
+    distinct objects for the same `(subject, predicate)` -- the exact
+    MemPalace/mempalace#1913 shape: a fact ending exactly at the query
+    instant and a successor starting at that same instant were both
+    matched, so a single-valued predicate reported contradictory values
+    simultaneously with no error or warning."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """No `as_of` was supplied, the query returned zero facts for the
+    probed `(subject, predicate)`, or the `kg_add`/`kg_invalidate`/
+    `kg_query` call sequence itself failed (`BackendAPIError` or a
+    vendor-reported `success: False`) before a boundary comparison could
+    even be attempted. Recorded explicitly rather than silently
+    defaulting to CLEAN, same convention every other signal enum's
+    NOT_APPLICABLE member in this package follows."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
