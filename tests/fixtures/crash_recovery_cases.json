@@ -1,0 +1,21 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case is a single piece of content stored once, queried to confirm it is present, then re-queried after adapter.simulate_crash_restart() (a named simulation primitive, never a real process kill/restart -- see MemoryBackendAdapter.supports_crash_recovery_simulation and evals/crash_recovery.py). Modeled on volcengine/OpenViking#2644 (contributor yeyitech): a local vectordb's _recover() silently skips rebuilding the search index on process restart when index files are missing but store data exists, so queries silently return nothing for data that was never actually lost. No live OpenViking instance was run against this fixture as of its creation; see docs/methodology.md for the honest scope of what this eval closes.",
+  "cases": [
+    {
+      "case_id": "mt-crash-001",
+      "session_id": "crash-recovery-session-1",
+      "content": "The production database credentials rotate every 90 days."
+    },
+    {
+      "case_id": "mt-crash-002",
+      "session_id": "crash-recovery-session-2",
+      "content": "Priya's flight to Tokyo departs at 6:45am from gate B12."
+    },
+    {
+      "case_id": "mt-crash-003",
+      "session_id": "crash-recovery-session-3",
+      "content": "The Q3 budget review is scheduled for the second Tuesday of next month."
+    }
+  ]
+}

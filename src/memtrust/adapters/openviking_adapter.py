@@ -62,6 +62,22 @@ OpenViking's real server-side reindex bug without a live instance.
 Gated on OPENVIKING_API_KEY, matching the project's hosted "OpenViking
 Studio" offering; OPENVIKING_BASE_URL may override the default host to
 point at a self-hosted server instead.
+
+`supports_crash_recovery_simulation` is NOT set on this adapter (stays at
+the base class default, False). volcengine/OpenViking#2644 (contributor
+yeyitech) reports a local vectordb backend's `_recover()` silently
+skipping index rebuild on server-process restart when index files are
+missing but store data exists -- a real, cited bug this project's
+crash-recovery eval (evals/crash_recovery.py) exists to catch. This
+adapter is a pure HTTP client with no ability to start, kill, or restart
+a live OpenViking server process, and no confirmed endpoint that reads
+raw stored data bypassing the search/index layer `query()` above goes
+through -- both are required for that eval to run against a real
+backend. Until this adapter (or a future one) gains real
+process-lifecycle control, the crash-recovery eval only ever runs
+against a purpose-built fake adapter that models #2644's shape; see
+evals/crash_recovery.py's module docstring and docs/methodology.md for
+exactly what that does and does not prove.
 """
 
 from __future__ import annotations

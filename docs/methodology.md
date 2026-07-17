@@ -18,6 +18,7 @@ This matters because it changes what a number *means*.
 | Contradiction-detection eval | Yes, one vendor API key | No LLM judge involved -- classification is done by direct substring comparison against the known fixture values (see below), which is cheaper and more auditable than an LLM judge for this specific eval. |
 | Compression/round-trip-fidelity eval | Yes, one vendor API key (more if the backend declares more than one `supported_modes` entry) | No LLM judge involved -- fidelity is scored by a direct, deterministic text-similarity ratio against the literal stored content (see below). **Has not been run against any live backend as of this writing.** |
 | Ranking-Quality eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct comparison of returned record order against per-record metadata values and known insertion order (see below). **Has not been run against any live backend as of this writing.** |
+| Crash-Recovery eval | **No -- cannot run against any live backend at all, by design.** | This eval requires `MemoryBackendAdapter.supports_crash_recovery_simulation = True`, and no adapter in this repo sets it to `True` -- every real adapter is a pure HTTP client with zero ability to start, kill, or restart a live vendor server process. It only ever runs against a purpose-built in-memory fake adapter and reports SKIPPED for every real backend (`mempalace`, `mem0`, `zep`, `openviking`). See below and CONTRIBUTING.md for what would be required to close this gap for real. |
 | Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
@@ -267,6 +268,67 @@ To use it:
   this change, since `supports_resource_sync` is currently only `True` on `OpenVikingAdapter`. See
   CONTRIBUTING.md.
 
+### MemTrust Crash-Recovery Eval (original)
+
+- **Not derived from any published dataset.** Built specifically to close a gap none of the other
+  evals in this repo can see at all: what happens to a backend's data across a server-process
+  crash and restart. Every other eval exercises a single, continuously-running adapter instance --
+  none of them ever stop and restart anything.
+- **Origin: volcengine/OpenViking#2644** (contributor yeyitech). A local vectordb backend's
+  `_recover()` routine, run on server-process startup, silently skips rebuilding the search index
+  when the on-disk index files are missing but the underlying store data is still present. No
+  exception is raised anywhere: the process starts up cleanly, accepts queries normally, and
+  simply returns nothing for data that is still sitting in the store, unindexed. A caller has no
+  way to tell this apart from "the data was genuinely never stored" without a way to inspect the
+  store directly, independent of the search index.
+- **This is the one eval in this repo that is structurally incapable of running against any real
+  backend, and that is stated plainly, not hidden.** Every adapter in `src/memtrust/adapters/` is
+  a pure HTTP client (see `adapters/base.py`'s module docstring) with zero ability to start, kill,
+  or restart a live vendor server process, and no HTTP API surface that reads a vendor's
+  underlying stored data independently of that vendor's own search index. Building real subprocess
+  lifecycle management for a live OpenViking server was out of scope for the environment this eval
+  was built in (no real OpenViking binary was available to manage). So `MemoryBackendAdapter.
+  supports_crash_recovery_simulation` defaults to `False` on every adapter in this repo, including
+  `OpenVikingAdapter` -- this eval reports every real backend as SKIPPED, always, as of this
+  writing.
+- **What this eval does instead: proves the harness's classification logic against a fake
+  adapter built to model the bug's exact shape.** `tests/test_evals.py::CrashRecoveryFakeAdapter`
+  maintains two separate in-memory structures -- `_store` (the underlying persisted data) and
+  `_index` (what `query()` reads from) -- and its `simulate_crash_restart()` drops `_index` while
+  leaving `_store` untouched, reproducing #2644's exact "data intact, index lost" shape. The eval
+  stores a record, confirms it's queryable, calls `adapter.simulate_crash_restart()` (an explicit,
+  named simulation method -- never a real process kill), queries again, and if the record is no
+  longer queryable, calls `adapter.raw_store_contains()` (also new, also optional) to check whether
+  the underlying store still has it. `CrashRecoveryCleanFakeAdapter` (index correctly rebuilt on
+  restart) and `CrashRecoveryDataLostFakeAdapter` (both index and store lost) are the negative
+  controls that prove this eval does not just flag every crash as the #2644 shape.
+- **Fixture:** `tests/fixtures/crash_recovery_cases.json` -- 3 hand-written cases, each just a
+  `case_id`, `session_id`, and `content` string to store, then re-query after the simulated
+  crash/restart.
+- **`simulate_crash_restart()` and `raw_store_contains()` are both new, optional capabilities on
+  `MemoryBackendAdapter`** (`src/memtrust/adapters/base.py`), gated by
+  `supports_crash_recovery_simulation` -- the same convention `list_resource_paths()`/
+  `trigger_resync()` already establish for `supports_resource_sync`: default raises
+  `NotImplementedError`, only adapters that genuinely have the capability are expected to override
+  it, and an adapter without the capability is reported as skipped rather than crashing or being
+  silently dropped from the results table.
+- **Why a new `CrashRecoverySignal` enum (`evals/crash_recovery.py`) rather than a new
+  `ConflictSignal` member.** `ConflictSignal.EMPTY_OR_LOST` (`adapters/base.py`) is a single-query
+  signal: it fires when one query() call succeeds but returns nothing, with no crash/restart
+  context at all. `CrashRecoverySignal.INDEX_LOST_DATA_SURVIVED` is a cross-call signal derived by
+  comparing three separate observations (present before the crash, queryable after the crash, and
+  an independent raw-store check) -- the exact same reason `ResourceSyncSignal` and `RankingSignal`
+  are their own enums rather than new `ConflictSignal` members: a signal computed by comparing
+  multiple calls over time is a structurally different kind of classification than one read off a
+  single `QueryResult`, and folding it into `ConflictSignal` would blur that distinction for every
+  future reader of that enum.
+- **Extending this eval:** adding more cases means adding entries to the fixture file with the
+  same three fields. Making a real adapter capable of running this eval for real (not just against
+  a fake) would require that adapter to gain actual process-lifecycle control over its vendor's
+  server (start/kill/restart) plus a vendor API that reads raw stored data bypassing the search
+  index -- a materially larger scope change than this eval makes, and explicitly out of scope here.
+  See CONTRIBUTING.md.
+
 ## Resource-Sync-Safety scoring logic
 
 Implemented in `src/memtrust/evals/resource_sync_safety.py`, function `classify_resource_sync_file()`,
@@ -402,6 +464,51 @@ a live palace's write path, not a black-box query-response inference -- and this
 query-response-only view would, on its own, only ever justify the weaker claim above. A
 `MISSING_ORDERING_KEY` result is a strong prompt to go verify the stronger claim by inspecting the
 backend's actual ingest/write path (as #1733 did), not proof of it by itself.
+
+## Crash-recovery scoring logic
+
+Implemented in `src/memtrust/evals/crash_recovery.py`, function `classify_crash_recovery_case()`,
+called from `run_crash_recovery_eval()`. If `adapter.supports_crash_recovery_simulation` is
+`False`, the eval is skipped entirely for that adapter -- not run, not guessed. Otherwise, for
+every case:
+
+1. Store the case's `content` via `adapter.store()`.
+2. Query for it via `adapter.query()` and record whether it comes back (`present_before_crash`).
+3. Call `adapter.simulate_crash_restart()` -- an explicit, named simulation primitive, never a
+   real process kill (see `MemoryBackendAdapter.simulate_crash_restart()`'s docstring for why no
+   adapter in this repo could do a real one).
+4. Query again and record whether it still comes back (`queryable_after_crash`).
+5. If it does not, call `adapter.raw_store_contains()` -- an independent check that bypasses
+   whatever search/index layer `query()` goes through -- and record the result.
+
+Classification (first matching rule wins):
+
+| Condition | Signal |
+|---|---|
+| Never confirmed present/queryable before the simulated crash | **NOT_APPLICABLE** -- nothing meaningful to say about "recovery" |
+| Still queryable after the simulated crash | **RECOVERED** |
+| Not queryable after, but `raw_store_contains()` returns `True` | **INDEX_LOST_DATA_SURVIVED** -- the volcengine/OpenViking#2644 shape: index lost, data intact |
+| Not queryable after, and `raw_store_contains()` returns `False` | **DATA_LOST** -- a more severe failure than #2644's shape: the data itself is gone |
+| Not queryable after, and `raw_store_contains()` was never called or returned no evidence | **NOT_APPLICABLE** -- not enough evidence to call this either of the above |
+
+**Why this doesn't just trust a single `query()` call to mean "the data is gone."** That is exactly
+the ambiguity #2644 exploits: a lost index and genuinely lost data both make `query()` return
+nothing, with no error and no distinguishing signal in the response itself. Only
+`raw_store_contains()`, an independent observation of the underlying store, can tell the two
+apart -- the same "never trust one signal in isolation" principle `evals/resource_sync_safety.py`
+applies by cross-checking `list_resource_paths()` (existence) against `query()` (searchability).
+
+**Honest limitation -- read this before trusting an INDEX_LOST_DATA_SURVIVED number.** This eval,
+as shipped, can only ever prove one thing: *the classification logic correctly separates "index
+lost, data survived" from "recovered cleanly" from "data genuinely lost," given three true/false
+observations.* It has been proven against `tests/test_evals.py::CrashRecoveryFakeAdapter` (the
+bug shape), `CrashRecoveryCleanFakeAdapter` (the negative control), and
+`CrashRecoveryDataLostFakeAdapter` (the more-severe-failure negative control) -- all three
+purpose-built in-memory fakes, not a real backend. It does **not**, and as of this writing cannot,
+prove that any real OpenViking instance currently has the #2644 bug, ever had it, or would
+produce this exact signal if actually crashed and restarted. See the "What requires a live vendor
+API key" table at the top of this document and the Vendor-pushback self-check below for the full
+statement of this limitation.
 
 ## LLM-judge prompt template
 
@@ -660,6 +767,27 @@ OpenViking instance is currently affected -- it confirms only that memtrust's st
 scoring logic are now capable of detecting that failure mode *if* a live instance exhibits it.
 Confirming the live bug itself requires running `resource_sync_safety` against a real, running
 OpenViking server with `OPENVIKING_API_KEY` configured, which this build pass did not do.
+
+The crash-recovery eval added for volcengine/OpenViking#2644 deserves the plainest version of
+this objection in the whole repo, and it's stated here without softening: **this eval cannot run
+against any real backend at all, by construction, and does not claim to.** No adapter in this
+repo has real process-lifecycle control over a live vendor server (start/kill/restart), and no
+adapter has a vendor API that reads raw stored data bypassing that vendor's own search index --
+both are required for `supports_crash_recovery_simulation = True`, and no adapter sets it. What
+this change actually verified: `classify_crash_recovery_case()` correctly distinguishes "index
+lost, data survived" (the #2644 shape) from "recovered cleanly" from "data genuinely lost," given
+three true/false observations, against `tests/test_evals.py::CrashRecoveryFakeAdapter` and its two
+negative-control siblings -- all three purpose-built fakes, none of them OpenViking. What it did
+not verify, and could not verify in this environment: whether OpenViking's real, live `_recover()`
+still has the bug yeyitech reported, ever behaves this way against a real crash, or would trigger
+`INDEX_LOST_DATA_SURVIVED` if this eval were somehow pointed at it. Nobody should read an
+`INDEX_LOST_DATA_SURVIVED` result in a report generated by this repo as confirmation that a live
+OpenViking instance is currently affected by #2644 -- there is no code path in this repo that can
+produce that result against anything other than the fake adapter built to model it. Closing this
+gap for real would require building actual subprocess lifecycle management for a live OpenViking
+server (or an equivalent capability for whichever backend is targeted) plus a vendor API that
+reads raw stored data independent of the search index -- both explicitly out of scope for this
+change and left as a documented, contribution-shaped gap, not a claim this repo already makes.
 
 `ZepGraphitiSelfHostedAdapter` deserves the strongest version of this objection of any adapter in
 this repo: it was built and unit-tested entirely against a Protocol double, because the real
