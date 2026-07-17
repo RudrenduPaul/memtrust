@@ -565,6 +565,82 @@ def test_openviking_raises_on_http_error(
     adapter.close()
 
 
+# ---------------------------------------------------------------------------
+# OpenVikingAdapter -- error detail includes real response body
+# (volcengine/OpenViking#1227)
+#
+# `str(exc)` on an httpx.HTTPStatusError is only the status line (e.g.
+# "Client error '400 Bad Request' for url ..."), never the real response
+# body -- a server-side Pydantic validation error like `"id"
+# extra_forbidden` was silently swallowed down to that useless status
+# line before this fix. The raised BackendAPIError's detail must contain
+# the actual response body, not just the generic status line.
+# ---------------------------------------------------------------------------
+
+
+def test_openviking_store_error_detail_includes_response_body(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/fs/write",
+        status_code=400,
+        json={
+            "detail": [
+                {
+                    "type": "extra_forbidden",
+                    "loc": ["body", "id"],
+                    "msg": "Extra inputs are not permitted",
+                }
+            ]
+        },
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content")
+    assert "extra_forbidden" in exc_info.value.detail
+    assert "Extra inputs are not permitted" in exc_info.value.detail
+    # The generic status-line message alone (pre-fix behavior) must not be
+    # all that's captured -- the real body content has to be present too.
+    assert (
+        exc_info.value.detail
+        != "Client error '400 Bad Request' for url 'http://localhost:1933/v1/fs/write'"
+    )
+    adapter.close()
+
+
+def test_openviking_query_error_detail_includes_response_body(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:1933/v1/search",
+        status_code=422,
+        json={"detail": "path_prefix: field required"},
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.query("session-1", "what mode do I prefer?")
+    assert "path_prefix: field required" in exc_info.value.detail
+    adapter.close()
+
+
+def test_openviking_error_detail_falls_back_to_str_exc_when_no_response_body(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    # A 401 with an empty body must not crash trying to append an empty
+    # body -- it falls back to the plain str(exc) status-line message.
+    monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
+    adapter = OpenVikingAdapter()
+    httpx_mock.add_response(status_code=401)
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content")
+    assert "response body" not in exc_info.value.detail
+    adapter.close()
+
+
 def test_openviking_delete_success(monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock) -> None:
     monkeypatch.setenv("OPENVIKING_API_KEY", "test-key")
     adapter = OpenVikingAdapter()
