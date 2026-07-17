@@ -1,12 +1,20 @@
 """Adapter tests. Every HTTP-based adapter is exercised via pytest-httpx
-(no real network calls); MemPalaceAdapter is exercised via a fake
-in-memory Palace injected through its constructor, matching the
-_PalaceProtocol shape defined in mempalace_adapter.py.
+(no real network calls); MemPalaceAdapter is exercised two ways: a fast,
+offline fake (`FakeMCPTools`, injected via the `mcp_tools=` constructor
+kwarg, matching the confirmed-real `_MCPToolsProtocol` shape defined in
+mempalace_adapter.py) for most tests, plus a set of `test_real_mempalace_*`
+integration tests near the end of the MemPalaceAdapter section that run
+against the actual installed `mempalace` package (gated by
+`pytest.importorskip("mempalace")`, requires the optional
+`mempalace-direct` extra) -- see mempalace_adapter.py's module docstring
+for why there is no fictional-API-era `_PalaceProtocol`/`Palace` fake left
+to speak of.
 """
 
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Any
 
 import httpx
@@ -1442,114 +1450,399 @@ def test_orphaned_child_fake_adapter_leaves_query_matches_after_delete_prefix() 
 
 
 # ---------------------------------------------------------------------------
-# MemPalaceAdapter (fake in-memory Palace, no chromadb dependency required)
+# MemPalaceAdapter (fake mempalace.mcp_server module, no chromadb
+# dependency required)
+#
+# FakeMCPTools stands in for the real `mempalace.mcp_server` module.
+# Unlike the removed FakePalace (which stood in for a fictional
+# `mempalace.Palace` class that never existed in the real package -- see
+# mempalace_adapter.py's module docstring), every method here mirrors a
+# function confirmed real and live-verified against the installed
+# `mempalace` package (version 3.5.0). See
+# test_real_mempalace_* below for the actual live-package integration
+# tests these fake-backed tests are a fast, offline complement to.
 # ---------------------------------------------------------------------------
 
 
-class FakePalace:
+class FakeMCPTools:
     def __init__(self) -> None:
-        self._store: dict[str, dict[str, Any]] = {}
+        self._drawers: dict[str, dict[str, Any]] = {}
         self._next_id = 0
-        self.remember_modes: list[str | None] = []
-        self.recall_modes: list[str | None] = []
+        self.status_response: dict[str, Any] = {
+            "total_drawers": 0,
+            "wings": {},
+            "rooms": {},
+            "backend": "chroma",
+        }
+        self.list_wings_response: dict[str, Any] = {"wings": {}}
+        self.list_rooms_response: dict[str, Any] = {"wing": "all", "rooms": {}}
+        self.list_rooms_calls: list[str | None] = []
+        self.add_drawer_calls: list[dict[str, Any]] = []
+        self.search_calls: list[dict[str, Any]] = []
+        self.kg_facts: list[dict[str, Any]] = []
+        self.reconnect_call_count = 0
 
-    def remember(
-        self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
-    ) -> str:
-        self.remember_modes.append(mode)
+    def tool_reconnect(self) -> dict[str, Any]:
+        self.reconnect_call_count += 1
+        return {"success": True, "message": "Reconnected to palace", "drawers": len(self._drawers)}
+
+    def tool_status(self) -> dict[str, Any]:
+        return self.status_response
+
+    def tool_list_wings(self) -> dict[str, Any]:
+        return self.list_wings_response
+
+    def tool_list_rooms(self, wing: str | None = None) -> dict[str, Any]:
+        self.list_rooms_calls.append(wing)
+        return self.list_rooms_response
+
+    def tool_add_drawer(
+        self,
+        wing: str,
+        room: str,
+        content: str,
+        source_file: str | None = None,
+        added_by: str = "mcp",
+    ) -> dict[str, Any]:
+        self.add_drawer_calls.append(
+            {
+                "wing": wing,
+                "room": room,
+                "content": content,
+                "source_file": source_file,
+                "added_by": added_by,
+            }
+        )
+        for drawer_id, d in self._drawers.items():
+            if d["wing"] == wing and d["room"] == room and d["content"] == content:
+                return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
         self._next_id += 1
-        memory_id = f"palace-{self._next_id}"
-        self._store[memory_id] = {"room": room, "content": content, "metadata": metadata}
-        return memory_id
+        drawer_id = f"drawer-{self._next_id}"
+        self._drawers[drawer_id] = {
+            "wing": wing,
+            "room": room,
+            "content": content,
+            "source_file": source_file,
+            "created_at": f"2026-01-{self._next_id:02d}T00:00:00",
+        }
+        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room, "chunks": 1}
 
-    def recall(
-        self, room: str, query: str, top_k: int, mode: str | None = None
-    ) -> list[dict[str, Any]]:
-        self.recall_modes.append(mode)
-        return [
-            {"id": mid, "content": v["content"], "metadata": v["metadata"]}
-            for mid, v in self._store.items()
-            if v["room"] == room
-        ][:top_k]
+    def tool_search(
+        self,
+        query: str,
+        limit: int = 5,
+        wing: str | None = None,
+        room: str | None = None,
+        source_file: str | None = None,
+        max_distance: float = 1.5,
+        min_similarity: float | None = None,
+        context: str | None = None,
+    ) -> dict[str, Any]:
+        self.search_calls.append({"query": query, "limit": limit, "wing": wing, "room": room})
+        matches = [
+            (drawer_id, d)
+            for drawer_id, d in self._drawers.items()
+            if (wing is None or d["wing"] == wing) and (room is None or d["room"] == room)
+        ]
+        results = []
+        for i, (_drawer_id, d) in enumerate(matches[:limit]):
+            similarity = round(0.9 - (i * 0.1), 3)
+            results.append(
+                {
+                    "text": d["content"],
+                    "wing": d["wing"],
+                    "room": d["room"],
+                    "source_file": d.get("source_file") or "",
+                    "source_path": d.get("source_file") or "",
+                    "created_at": d["created_at"],
+                    "similarity": similarity,
+                    "distance": round(1 - similarity, 4),
+                    "effective_distance": round(1 - similarity, 4),
+                    "closet_boost": 0.0,
+                    "matched_via": "drawer",
+                    "bm25_score": 1.0,
+                }
+            )
+        return {
+            "query": query,
+            "filters": {"wing": wing, "room": room, "source_file": source_file},
+            "total_before_filter": len(matches),
+            "results": results,
+        }
 
-    def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
-        new_id = self.remember(room, content, {"invalidated": "false"})
-        if memory_id in self._store:
-            self._store[memory_id]["metadata"]["invalidated"] = "true"
-        return {"id": new_id}
+    def tool_update_drawer(
+        self,
+        drawer_id: str,
+        content: str | None = None,
+        wing: str | None = None,
+        room: str | None = None,
+    ) -> dict[str, Any]:
+        if drawer_id not in self._drawers:
+            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+        if content is not None:
+            self._drawers[drawer_id]["content"] = content
+        if wing is not None:
+            self._drawers[drawer_id]["wing"] = wing
+        if room is not None:
+            self._drawers[drawer_id]["room"] = room
+        return {
+            "success": True,
+            "drawer_id": drawer_id,
+            "wing": self._drawers[drawer_id]["wing"],
+            "room": self._drawers[drawer_id]["room"],
+        }
+
+    def tool_delete_drawer(self, drawer_id: str) -> dict[str, Any]:
+        if drawer_id not in self._drawers:
+            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+        del self._drawers[drawer_id]
+        return {
+            "success": True,
+            "drawer_id": drawer_id,
+            "deleted_ids": [drawer_id],
+            "chunks_deleted": 1,
+        }
+
+    def tool_kg_add(
+        self,
+        subject: str,
+        predicate: str,
+        object: str,  # noqa: A002 - mirrors the real tool_kg_add() parameter name
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        source_closet: str | None = None,
+        source_file: str | None = None,
+        source_drawer_id: str | None = None,
+    ) -> dict[str, Any]:
+        for f in self.kg_facts:
+            if f["subject"] == subject and f["predicate"] == predicate and f["object"] == object:
+                return {
+                    "success": True,
+                    "triple_id": f["triple_id"],
+                    "fact": f"{subject} → {predicate} → {object}",
+                }
+        triple_id = f"t_{subject}_{predicate}_{object}_{len(self.kg_facts)}"
+        self.kg_facts.append(
+            {
+                "triple_id": triple_id,
+                "subject": subject,
+                "predicate": predicate,
+                "object": object,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
+                "confidence": 1.0,
+                "source_closet": source_closet,
+                "current": valid_to is None,
+            }
+        )
+        return {
+            "success": True,
+            "triple_id": triple_id,
+            "fact": f"{subject} → {predicate} → {object}",
+        }
+
+    def tool_kg_invalidate(
+        self,
+        subject: str,
+        predicate: str,
+        object: str,  # noqa: A002 - mirrors the real tool_kg_invalidate() parameter name
+        ended: str | None = None,
+    ) -> dict[str, Any]:
+        resolved = ended or "2026-01-01"
+        for f in self.kg_facts:
+            if f["subject"] == subject and f["predicate"] == predicate and f["object"] == object:
+                f["valid_to"] = resolved
+                f["current"] = False
+        return {
+            "success": True,
+            "fact": f"{subject} → {predicate} → {object}",
+            "ended": resolved,
+        }
+
+    def tool_kg_query(
+        self, entity: str, as_of: str | None = None, direction: str = "both"
+    ) -> dict[str, Any]:
+        facts = []
+        for f in self.kg_facts:
+            if direction in ("outgoing", "both") and f["subject"] == entity:
+                facts.append({**f, "direction": "outgoing"})
+            elif direction in ("incoming", "both") and f["object"] == entity:
+                facts.append({**f, "direction": "incoming"})
+        return {"entity": entity, "as_of": as_of, "facts": facts, "count": len(facts)}
 
 
-def test_mempalace_store_query_update_with_fake_palace() -> None:
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
+def test_mempalace_store_query_update_delete_with_fake_mcp_tools() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     store_result = adapter.store("room-1", "My dog is named Baxter.")
-    assert store_result.memory_id == "palace-1"
+    assert store_result.memory_id == "drawer-1"
 
     query_result = adapter.query("room-1", "what is my dog's name?")
     assert len(query_result.records) == 1
+    assert query_result.records[0].content == "My dog is named Baxter."
+    # See mempalace_adapter.py's module docstring "NO PER-RECORD ID"
+    # section: the real tool_search response never carries an id.
+    assert query_result.records[0].memory_id == ""
     assert query_result.conflict_signal == ConflictSignal.NOT_APPLICABLE
 
-    adapter.update("room-1", store_result.memory_id, "My dog is actually named Max.")
+    update_result = adapter.update(
+        "room-1", store_result.memory_id, "My dog is actually named Max."
+    )
+    assert update_result.acknowledged is True
     query_result_2 = adapter.query("room-1", "what is my dog's name?")
-    invalidated = [r for r in query_result_2.records if r.metadata.get("invalidated") == "true"]
-    assert len(invalidated) == 1
-    assert query_result_2.conflict_signal == ConflictSignal.FLAGGED
+    assert query_result_2.records[0].content == "My dog is actually named Max."
+
+    delete_result = adapter.delete(store_result.memory_id)
+    assert delete_result.success is True
+    query_result_3 = adapter.query("room-1", "what is my dog's name?")
+    assert len(query_result_3.records) == 0
 
 
-def test_mempalace_threads_mode_through_to_palace_calls() -> None:
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
+def test_mempalace_store_reads_room_source_file_added_by_from_metadata() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
+    adapter.store(
+        "room-1",
+        "content",
+        metadata={"room": "custom-room", "source_file": "chat.log", "added_by": "custom-agent"},
+    )
+
+    assert tools.add_drawer_calls == [
+        {
+            "wing": "room-1",
+            "room": "custom-room",
+            "content": "content",
+            "source_file": "chat.log",
+            "added_by": "custom-agent",
+        }
+    ]
+
+
+def test_mempalace_store_defaults_room_and_added_by_when_metadata_omitted() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+
+    adapter.store("room-1", "content")
+
+    assert tools.add_drawer_calls == [
+        {
+            "wing": "room-1",
+            "room": MemPalaceAdapter.DEFAULT_ROOM,
+            "content": "content",
+            "source_file": None,
+            "added_by": "memtrust",
+        }
+    ]
+
+
+def test_mempalace_query_scopes_search_by_session_id_as_wing() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+
+    adapter.query("room-1", "some query", top_k=3)
+
+    assert tools.search_calls == [
+        {"query": "some query", "limit": 3, "wing": "room-1", "room": None}
+    ]
+
+
+def test_mempalace_supported_modes_is_confirmed_empty() -> None:
+    # See mempalace_adapter.py's module docstring "Mode variants" section
+    # -- neither tool_add_drawer nor tool_search accepts a `mode` keyword
+    # in the real, installed package; the old ("raw", "AAAK") guess is
+    # now confirmed absent, not just unconfirmed.
+    assert MemPalaceAdapter.supported_modes == ()
+
+
+def test_mempalace_mode_param_accepted_and_ignored_as_a_noop() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+
+    # Must not raise, and must not change the underlying vendor call shape
+    # -- the real tool_add_drawer/tool_search have no mode parameter to
+    # forward this to.
     adapter.store("room-1", "content", mode="AAAK")
     adapter.query("room-1", "query", mode="AAAK")
-    assert palace.remember_modes == ["AAAK"]
-    assert palace.recall_modes == ["AAAK"]
 
-    # Not passing `mode` at all (the default) must not change the
-    # underlying call shape -- `None` is forwarded, exactly as before this
-    # parameter existed.
-    adapter.store("room-1", "content")
-    adapter.query("room-1", "query")
-    assert palace.remember_modes == ["AAAK", None]
-    assert palace.recall_modes == ["AAAK", None]
+    assert tools.add_drawer_calls[0] == {
+        "wing": "room-1",
+        "room": MemPalaceAdapter.DEFAULT_ROOM,
+        "content": "content",
+        "source_file": None,
+        "added_by": "memtrust",
+    }
+    assert tools.search_calls[0] == {"query": "query", "limit": 5, "wing": "room-1", "room": None}
 
 
-def test_mempalace_supported_modes_reports_raw_and_aaak() -> None:
-    assert MemPalaceAdapter.supported_modes == ("raw", "AAAK")
+def test_mempalace_store_raises_backend_api_error_on_vendor_reported_failure() -> None:
+    class RejectingTools(FakeMCPTools):
+        def tool_add_drawer(
+            self,
+            wing: str,
+            room: str,
+            content: str,
+            source_file: str | None = None,
+            added_by: str = "mcp",
+        ) -> dict[str, Any]:
+            return {"success": False, "error": "room contains invalid characters"}
+
+    adapter = MemPalaceAdapter(mcp_tools=RejectingTools())
+    with pytest.raises(BackendAPIError, match="invalid characters"):
+        adapter.store("room-1", "content")
 
 
 def test_mempalace_wraps_vendor_exceptions_in_backend_api_error() -> None:
-    class BrokenPalace:
-        def remember(
-            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
-        ) -> str:
+    class BrokenTools:
+        def tool_add_drawer(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("vendor exploded")
 
-        def recall(
-            self, room: str, query: str, top_k: int, mode: str | None = None
-        ) -> list[dict[str, Any]]:
+        def tool_search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("vendor exploded")
 
-        def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
+        def tool_update_drawer(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("vendor exploded")
 
-    adapter = MemPalaceAdapter(palace=BrokenPalace())
+        def tool_delete_drawer(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("vendor exploded")
+
+        def tool_kg_add(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("vendor exploded")
+
+        def tool_kg_invalidate(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("vendor exploded")
+
+        def tool_kg_query(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("vendor exploded")
+
+    adapter = MemPalaceAdapter(mcp_tools=BrokenTools())
     with pytest.raises(BackendAPIError):
         adapter.store("room-1", "content")
     with pytest.raises(BackendAPIError):
         adapter.query("room-1", "query")
     with pytest.raises(BackendAPIError):
         adapter.update("room-1", "id", "content")
+    with pytest.raises(BackendAPIError):
+        adapter.delete("id")
+    with pytest.raises(BackendAPIError):
+        adapter.kg_add("s", "p", "o")
+    with pytest.raises(BackendAPIError):
+        adapter.kg_invalidate("s", "p", "o")
+    with pytest.raises(BackendAPIError):
+        adapter.kg_query("s")
 
 
-def test_mempalace_get_palace_raises_clear_error_when_package_missing(
+def test_mempalace_get_mcp_tools_raises_clear_error_when_package_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The real `mempalace` package is not a memtrust dependency (kept
-    # optional per docs/methodology.md), so in this test environment it
-    # is genuinely not installed -- this exercises the real ImportError
-    # path, not a simulated one.
+    # optional -- see pyproject.toml's `mempalace-direct` extra), so in
+    # this test environment it is genuinely not installed -- this
+    # exercises the real ImportError path, not a simulated one. Every
+    # vendor call in this adapter now shares the single `_get_mcp_tools()`
+    # lazy-import point, so one such test covers store()/query()/
+    # update()/delete()/metadata_overview()/kg_*() alike.
     monkeypatch.setenv("MEMPALACE_STORAGE_PATH", "/tmp/fake-palace")
     adapter = MemPalaceAdapter()
     with pytest.raises(BackendAPIError, match="not installed"):
@@ -1562,49 +1855,63 @@ def test_mempalace_get_palace_raises_clear_error_when_package_missing(
 
 
 def test_store_result_defaults_to_verified_none() -> None:
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
     result = adapter.store("room-1", "My dog is named Baxter.")
     assert result.verified is None
 
 
 def test_mempalace_verify_true_confirms_readable_write() -> None:
-    """(a) verify=True with a mock adapter that returns the just-stored
-    content confirms verified=True."""
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
+    """(a) verify=True with a fake that returns the just-stored content
+    (via its content-substring fallback, since the real tool_search
+    response carries no id -- see the module docstring) confirms
+    verified=True."""
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
     result = adapter.store("room-1", "My dog is named Baxter.", verify=True)
     assert result.verified is True
 
 
 def test_mempalace_verify_true_detects_silently_dropped_write() -> None:
-    """(b) verify=True with a mock returning empty/wrong content sets
-    verified=False rather than raising -- this is the exact "store()
-    didn't raise, but the write was silently dropped/corrupted" failure
-    mode (MemPalace issues #1929, #1977) this feature exists to catch.
-    """
+    """(b) verify=True with a fake tool_search that comes back empty sets
+    verified=False rather than raising -- this is the "store() didn't
+    raise, but the write was silently dropped/corrupted" failure mode
+    (MemPalace issues #1929, #1977) this feature exists to catch."""
 
-    class SilentlyDroppingPalace:
-        """remember() returns a normal memory_id and never raises, but
-        the write never actually lands -- recall() always comes back
-        empty, simulating checkpoint corruption or a stale/self-
-        deadlocked lock silently no-oping the write server-side.
-        """
+    class SilentlyDroppingTools(FakeMCPTools):
+        def tool_add_drawer(
+            self,
+            wing: str,
+            room: str,
+            content: str,
+            source_file: str | None = None,
+            added_by: str = "mcp",
+        ) -> dict[str, Any]:
+            return {
+                "success": True,
+                "drawer_id": "drawer-ghost-1",
+                "wing": wing,
+                "room": room,
+                "chunks": 1,
+            }
 
-        def remember(
-            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
-        ) -> str:
-            return "palace-ghost-1"
+        def tool_search(
+            self,
+            query: str,
+            limit: int = 5,
+            wing: str | None = None,
+            room: str | None = None,
+            source_file: str | None = None,
+            max_distance: float = 1.5,
+            min_similarity: float | None = None,
+            context: str | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "query": query,
+                "filters": {"wing": wing, "room": room, "source_file": source_file},
+                "total_before_filter": 0,
+                "results": [],
+            }
 
-        def recall(
-            self, room: str, query: str, top_k: int, mode: str | None = None
-        ) -> list[dict[str, Any]]:
-            return []
-
-        def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
-            raise NotImplementedError
-
-    adapter = MemPalaceAdapter(palace=SilentlyDroppingPalace())
+    adapter = MemPalaceAdapter(mcp_tools=SilentlyDroppingTools())
     result = adapter.store("room-1", "My dog is named Baxter.", verify=True)
     assert result.verified is False
     # Crucially, this must not raise -- a failed verification is a
@@ -1612,55 +1919,89 @@ def test_mempalace_verify_true_detects_silently_dropped_write() -> None:
 
 
 def test_mempalace_verify_true_detects_wrong_content_on_readback() -> None:
-    """Same failure mode as above, but recall() returns *something* --
+    """Same failure mode as above, but tool_search returns *something* --
     just not the content that was actually stored (corruption, not a
     total drop). Still verified=False, still no exception."""
 
-    class CorruptingPalace:
-        def remember(
-            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
-        ) -> str:
-            return "palace-corrupt-1"
+    class CorruptingTools(FakeMCPTools):
+        def tool_add_drawer(
+            self,
+            wing: str,
+            room: str,
+            content: str,
+            source_file: str | None = None,
+            added_by: str = "mcp",
+        ) -> dict[str, Any]:
+            return {
+                "success": True,
+                "drawer_id": "drawer-corrupt-1",
+                "wing": wing,
+                "room": room,
+                "chunks": 1,
+            }
 
-        def recall(
-            self, room: str, query: str, top_k: int, mode: str | None = None
-        ) -> list[dict[str, Any]]:
-            return [{"id": "palace-corrupt-1", "content": "\x00\x00\x00", "metadata": {}}]
+        def tool_search(
+            self,
+            query: str,
+            limit: int = 5,
+            wing: str | None = None,
+            room: str | None = None,
+            source_file: str | None = None,
+            max_distance: float = 1.5,
+            min_similarity: float | None = None,
+            context: str | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "query": query,
+                "filters": {"wing": wing, "room": room, "source_file": source_file},
+                "total_before_filter": 1,
+                "results": [
+                    {
+                        "text": "\x00\x00\x00",
+                        "wing": wing,
+                        "room": room,
+                        "source_file": "",
+                        "source_path": "",
+                        "created_at": "2026-01-01T00:00:00",
+                        "similarity": 0.9,
+                        "distance": 0.1,
+                        "effective_distance": 0.1,
+                        "closet_boost": 0.0,
+                        "matched_via": "drawer",
+                        "bm25_score": 1.0,
+                    }
+                ],
+            }
 
-        def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
-            raise NotImplementedError
-
-    adapter = MemPalaceAdapter(palace=CorruptingPalace())
+    adapter = MemPalaceAdapter(mcp_tools=CorruptingTools())
     result = adapter.store("room-1", "My dog is named Baxter.", verify=True)
     assert result.verified is False
 
 
-def test_mempalace_verify_false_by_default_does_not_call_recall() -> None:
-    """(c) verify=False (default) behavior is unchanged from before this
-    fix -- no query() call happens, verified stays None."""
+def test_mempalace_verify_false_by_default_does_not_call_search() -> None:
+    """(c) verify=False (default) behavior: no query() call happens,
+    verified stays None."""
 
-    class RecallTrackingPalace(FakePalace):
+    class SearchTrackingTools(FakeMCPTools):
         def __init__(self) -> None:
             super().__init__()
-            self.recall_call_count = 0
+            self.search_call_count = 0
 
-        def recall(
-            self, room: str, query: str, top_k: int, mode: str | None = None
-        ) -> list[dict[str, Any]]:
-            self.recall_call_count += 1
-            return super().recall(room, query, top_k, mode)
+        def tool_search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            self.search_call_count += 1
+            return super().tool_search(*args, **kwargs)
 
-    palace = RecallTrackingPalace()
-    adapter = MemPalaceAdapter(palace=palace)
+    tools = SearchTrackingTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     result = adapter.store("room-1", "My dog is named Baxter.")
     assert result.verified is None
-    assert palace.recall_call_count == 0
+    assert tools.search_call_count == 0
 
     # Explicit verify=False must behave identically to the omitted default.
     result_explicit = adapter.store("room-1", "My cat is named Whiskers.", verify=False)
     assert result_explicit.verified is None
-    assert palace.recall_call_count == 0
+    assert tools.search_call_count == 0
 
 
 def test_verify_store_raises_backend_api_error_when_query_itself_fails() -> None:
@@ -1670,258 +2011,191 @@ def test_verify_store_raises_backend_api_error_when_query_itself_fails() -> None
     means "the write was silently dropped," not a query that itself
     errored."""
 
-    class QueryFailsPalace:
-        def remember(
-            self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
-        ) -> str:
-            return "palace-1"
-
-        def recall(
-            self, room: str, query: str, top_k: int, mode: str | None = None
-        ) -> list[dict[str, Any]]:
+    class QueryFailsTools(FakeMCPTools):
+        def tool_search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
             raise RuntimeError("vendor exploded during verification query")
 
-        def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
-            raise NotImplementedError
-
-    adapter = MemPalaceAdapter(palace=QueryFailsPalace())
+    adapter = MemPalaceAdapter(mcp_tools=QueryFailsTools())
     with pytest.raises(BackendAPIError):
         adapter.store("room-1", "content", verify=True)
 
 
-def test_mempalace_delete_raises_clear_not_implemented_backend_api_error() -> None:
-    # MemPalace has no confirmed delete/forget primitive (see module
-    # docstring) -- delete() must still exist and fail with a typed,
-    # documented BackendAPIError rather than an AttributeError or a
-    # silent no-op.
-    adapter = MemPalaceAdapter(palace=FakePalace())
-    with pytest.raises(BackendAPIError, match="not implemented"):
-        adapter.delete("palace-1")
+# ---------------------------------------------------------------------------
+# MemPalaceAdapter.update() / delete() -- now genuinely implemented against
+# the real, confirmed tool_update_drawer/tool_delete_drawer, closing the
+# gap the old, fictional-API adapter left (delete() previously always
+# raised "not implemented" -- see the module docstring).
+# ---------------------------------------------------------------------------
+
+
+def test_mempalace_update_reports_not_acknowledged_without_raising_when_drawer_missing() -> None:
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+    result = adapter.update("room-1", "nonexistent-id", "new content")
+    assert result.acknowledged is False
+    assert result.memory_id == "nonexistent-id"
+
+
+def test_mempalace_delete_now_implemented_against_real_tool_delete_drawer() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    store_result = adapter.store("room-1", "content")
+
+    delete_result = adapter.delete(store_result.memory_id)
+
+    assert delete_result.success is True
+    assert delete_result.memory_id == store_result.memory_id
+
+
+def test_mempalace_delete_reports_unsuccessful_without_raising_when_drawer_missing() -> None:
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+    result = adapter.delete("nonexistent-id")
+    assert result.success is False
+    assert result.memory_id == "nonexistent-id"
 
 
 # ---------------------------------------------------------------------------
 # MemPalaceAdapter.query() -- RankingSignal detection
 #
-# Reproduces the exact mempalace/mempalace#1733 shape (GitHub user
-# Kartalops): `Layer1.generate()` sorts drawers by `importance`/
-# `emotional_weight`/`weight`, but no ingest path ever writes those keys
-# (confirmed 0/45,969 drawers on a real palace), so the field silently
-# defaults to a constant and the sort degenerates to insertion order.
+# Re-pointed at `similarity` -- the real, confirmed field tool_search's own
+# ranking is actually driven by -- rather than the fictional-API-era
+# importance/emotional_weight/weight/authored_at keys, which belong to a
+# different method (`Layer1.generate()`'s "wake-up" sort,
+# mempalace/mempalace#1733) this adapter never calls. See
+# mempalace_adapter.py's module docstring "RANKING SIGNAL" section for the
+# full reasoning.
 # ---------------------------------------------------------------------------
 
 
-def test_mempalace_query_flags_missing_ordering_key_when_importance_is_constant() -> None:
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
-    for content in ["Had coffee with Alex.", "Signed the lease.", "Grandmother's health scare."]:
-        adapter.store("room-1", content, metadata={"importance": "0.5"})
+def test_mempalace_query_flags_missing_ordering_key_when_similarity_constant() -> None:
+    class ConstantSimilarityTools(FakeMCPTools):
+        def tool_search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            raw = super().tool_search(*args, **kwargs)
+            for item in raw["results"]:
+                item["similarity"] = 0.5
+            return raw
 
-    query_result = adapter.query("room-1", "wake me up with important memories")
-    assert query_result.ranking_signal == RankingSignal.MISSING_ORDERING_KEY
-
-
-def test_mempalace_query_flags_missing_ordering_key_when_importance_never_written() -> None:
-    # The exact #1733 shape: no ingest path ever wrote the field at all,
-    # not even a default -- indistinguishable from a constant default from
-    # this adapter's black-box view, and flagged the same way.
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
+    tools = ConstantSimilarityTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
     for content in ["Had coffee with Alex.", "Signed the lease.", "Grandmother's health scare."]:
         adapter.store("room-1", content)
 
-    query_result = adapter.query("room-1", "wake me up with important memories")
+    query_result = adapter.query("room-1", "wake me up with important memories", top_k=10)
     assert query_result.ranking_signal == RankingSignal.MISSING_ORDERING_KEY
 
 
-def test_mempalace_query_reports_signal_driven_when_importance_genuinely_varies() -> None:
-    # Negative control: this must NOT be flagged -- a real per-record
-    # signal exists here.
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
-    adapter.store("room-1", "Renewed car registration.", metadata={"importance": "0.2"})
-    adapter.store("room-1", "Grandmother's health scare.", metadata={"importance": "0.9"})
-    adapter.store("room-1", "Signed the lease.", metadata={"importance": "0.6"})
+def test_mempalace_query_reports_signal_driven_when_similarity_genuinely_varies() -> None:
+    # Negative control: this must NOT be flagged -- FakeMCPTools.tool_search
+    # already assigns a genuinely varying similarity per result (matching
+    # the real tool_search's own effective_distance-driven ranking).
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    adapter.store("room-1", "Renewed car registration.")
+    adapter.store("room-1", "Grandmother's health scare.")
+    adapter.store("room-1", "Signed the lease.")
 
-    query_result = adapter.query("room-1", "wake me up with important memories")
+    query_result = adapter.query("room-1", "wake me up with important memories", top_k=10)
     assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
 
 
 def test_mempalace_query_ranking_signal_not_applicable_with_fewer_than_two_records() -> None:
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
-    adapter.store("room-1", "Had coffee with Alex.", metadata={"importance": "0.5"})
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    adapter.store("room-1", "Had coffee with Alex.")
 
     query_result = adapter.query("room-1", "wake me up with important memories")
     assert query_result.ranking_signal == RankingSignal.NOT_APPLICABLE
 
 
-def test_mempalace_query_reports_signal_driven_when_authored_at_varies_and_importance_absent() -> (
-    None
-):
-    # MemPalace/mempalace PR#1890 added `authored_at` as a `_hybrid_rank`
-    # tie-breaker -- this adapter must recognize it as a ranking-driving
-    # metadata field on its own, not only fall back to insertion order
-    # when `importance`/`emotional_weight`/`weight` are all absent.
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
-    adapter.store("room-1", "Filed the annual tax return.", metadata={"authored_at": "1700000000"})
-    adapter.store("room-1", "Watered the office plants.", metadata={"authored_at": "1650000000"})
-
-    query_result = adapter.query("room-1", "wake me up with important memories")
-    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
-
-
 # ---------------------------------------------------------------------------
-# MemPalaceAdapter.query() -- `authored_at` surfaced from a top-level
-# response field, not only from nested `metadata` (MemPalace/mempalace
-# PR#1890 / issue #1889)
-#
-# MemPalace's own merged PR#1890 added `authored_at` timestamp metadata as
-# a `_hybrid_rank` tie-breaker, but gemini-code-assist's review comment on
-# that same diff flagged that MemPalace's real response-building code can
-# surface it at the TOP LEVEL of a response item instead of nested under
-# `metadata` -- the identical top-level-vs-nested inconsistency, now on
-# this adapter's read side: before this fix, query() only ever read
-# item.get("metadata"), so a top-level authored_at was silently dropped.
+# MemPalaceAdapter.query() -- no per-record id, metadata carries every
+# other real response field (see the module docstring's "NO PER-RECORD ID"
+# section).
 # ---------------------------------------------------------------------------
 
 
-class _NestedAuthoredAtPalace(FakePalace):
-    def recall(
-        self, room: str, query: str, top_k: int, mode: str | None = None
-    ) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": "m1",
-                "content": "Filed the annual tax return.",
-                "metadata": {"authored_at": "1700000000"},
-            },
-            {
-                "id": "m2",
-                "content": "Watered the office plants.",
-                "metadata": {"authored_at": "1650000000"},
-            },
-        ][:top_k]
+def test_mempalace_query_records_always_have_empty_memory_id() -> None:
+    """The real tool_search response never carries an id -- this adapter
+    reports memory_id="" explicitly rather than guessing one (see the
+    module docstring's "NO PER-RECORD ID" section)."""
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    adapter.store("room-1", "content")
+
+    query_result = adapter.query("room-1", "content")
+
+    assert query_result.records[0].memory_id == ""
 
 
-class _TopLevelAuthoredAtPalace(FakePalace):
-    def recall(
-        self, room: str, query: str, top_k: int, mode: str | None = None
-    ) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": "m1",
-                "content": "Filed the annual tax return.",
-                "metadata": {},
-                "authored_at": "1700000000",
-            },
-            {
-                "id": "m2",
-                "content": "Watered the office plants.",
-                "metadata": {},
-                "authored_at": "1650000000",
-            },
-        ][:top_k]
+def test_mempalace_query_metadata_surfaces_real_response_fields() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    adapter.store("room-1", "Filed the annual tax return.", metadata={"source_file": "notes.md"})
+
+    query_result = adapter.query("room-1", "tax return")
+
+    metadata = query_result.records[0].metadata
+    assert metadata["wing"] == "room-1"
+    assert metadata["source_file"] == "notes.md"
+    assert metadata["matched_via"] == "drawer"
+    assert "similarity" in metadata
+    assert "text" not in metadata  # text becomes .content, not a metadata key
 
 
-class _BothLevelsAuthoredAtPalace(FakePalace):
-    def recall(
-        self, room: str, query: str, top_k: int, mode: str | None = None
-    ) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": "m1",
-                "content": "Filed the annual tax return.",
-                "metadata": {"authored_at": "1700000000"},
-                "authored_at": "9999999999",
-            },
-        ][:top_k]
+# ---------------------------------------------------------------------------
+# MemPalaceAdapter.query() -- conflict_signal is now honestly
+# NOT_APPLICABLE for every drawer-backed query (see the module docstring's
+# "CONFLICT SIGNAL" section) -- the real tool_search response has no
+# invalidation marker at all; that concept only exists on the KG side (see
+# the kg_* tests below).
+# ---------------------------------------------------------------------------
 
 
-def test_mempalace_query_surfaces_authored_at_nested_under_metadata() -> None:
-    """The normal, documented shape: authored_at nested under metadata
-    must pass through unmodified."""
-    adapter = MemPalaceAdapter(palace=_NestedAuthoredAtPalace())
-    query_result = adapter.query("room-1", "q")
-    assert [r.metadata.get("authored_at") for r in query_result.records] == [
-        "1700000000",
-        "1650000000",
-    ]
-    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
+def test_mempalace_query_conflict_signal_always_not_applicable() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
+    store_result = adapter.store("room-1", "My dog is named Baxter.")
+    adapter.update("room-1", store_result.memory_id, "My dog is actually named Max.")
 
+    query_result = adapter.query("room-1", "what is my dog's name?")
 
-def test_mempalace_query_surfaces_authored_at_from_top_level_when_not_nested() -> None:
-    """Before this fix, a top-level (not metadata-nested) authored_at was
-    silently dropped -- neither MemoryRecord.metadata nor
-    _classify_ranking_signal ever saw it."""
-    adapter = MemPalaceAdapter(palace=_TopLevelAuthoredAtPalace())
-    query_result = adapter.query("room-1", "q")
-    assert [r.metadata.get("authored_at") for r in query_result.records] == [
-        "1700000000",
-        "1650000000",
-    ]
-    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
-
-
-def test_mempalace_query_nested_authored_at_takes_priority_over_top_level() -> None:
-    """When a response item (incorrectly) carries both a nested and a
-    top-level authored_at, the nested one -- the confirmed, documented
-    shape -- must win rather than being silently overridden."""
-    adapter = MemPalaceAdapter(palace=_BothLevelsAuthoredAtPalace())
-    query_result = adapter.query("room-1", "q")
-    assert query_result.records[0].metadata["authored_at"] == "1700000000"
+    assert query_result.conflict_signal == ConflictSignal.NOT_APPLICABLE
 
 
 # ---------------------------------------------------------------------------
 # MemPalaceAdapter.query() -- degraded-retrieval detection
-# (MemPalace/mempalace#1005, contributor jphein, also cited in #1769)
 #
-# Confirmed against the real, merged PR diff: when MemPalace's vector
-# index (HNSW/Chroma) errors or drifts, search_memories() no longer
-# hard-fails -- it returns a dict shaped
-# {"results": [...], "warnings": [...], "available_in_scope": N} instead
-# of the bare list of record dicts this adapter originally assumed. This
-# is a distinct failure mode from ConflictSignal.EMPTY_OR_LOST, which only
-# fires on zero records: a backend can return some records, non-empty,
-# and still be silently under-delivering the rest.
+# `warnings`/`available_in_scope` parsing is kept for forward-compat, but
+# never observed populated against the real, installed 3.5.0 package (see
+# the module docstring's "DEGRADED-RETRIEVAL WARNINGS" section) -- these
+# tests exercise the parsing logic against a synthetic response shape, not
+# a shape any real, confirmed code path in the installed package produces.
 # ---------------------------------------------------------------------------
 
 
-class DegradedRetrievalPalace:
-    """Fake Palace whose recall() returns MemPalace/mempalace#1005's
-    confirmed search_memories() response shape directly, instead of the
-    older bare-list-of-records shape FakePalace above uses. Lets tests
-    exercise both shapes _PalaceProtocol.recall() now accepts."""
+class DegradedRetrievalTools(FakeMCPTools):
+    """Fake mempalace.mcp_server whose tool_search() returns a
+    caller-supplied raw response directly -- lets tests exercise the
+    warnings/available_in_scope parsing path query() still supports."""
 
     def __init__(self, response: dict[str, Any]) -> None:
+        super().__init__()
         self._response = response
 
-    def remember(
-        self, room: str, content: str, metadata: dict[str, str], mode: str | None = None
-    ) -> str:
-        raise NotImplementedError
-
-    def recall(self, room: str, query: str, top_k: int, mode: str | None = None) -> dict[str, Any]:
+    def tool_search(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
         return self._response
-
-    def invalidate(self, room: str, memory_id: str, content: str) -> dict[str, Any]:
-        raise NotImplementedError
 
 
 def test_mempalace_query_sets_degraded_retrieval_when_backend_warns() -> None:
-    """The exact #1005 shape: vector search underdelivered but the backend
-    still returned some records plus a warning and a scope count -- not
-    zero records, so ConflictSignal.EMPTY_OR_LOST would never catch this."""
-    palace = DegradedRetrievalPalace(
+    tools = DegradedRetrievalTools(
         {
             "results": [
-                {"id": "d1", "content": "kiyo xhci fix notes", "metadata": {}},
+                {"text": "kiyo xhci fix notes", "wing": "room-1", "room": "memtrust"},
             ],
             "warnings": ["hnsw drift detected"],
             "available_in_scope": 50,
         }
     )
-    adapter = MemPalaceAdapter(palace=palace)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     query_result = adapter.query("room-1", "kiyo xhci")
 
@@ -1933,30 +2207,30 @@ def test_mempalace_query_sets_degraded_retrieval_when_backend_warns() -> None:
 
 def test_mempalace_query_degraded_retrieval_unset_on_clean_response() -> None:
     """A clean response (no warnings) must leave degraded_retrieval unset
-    (None), even though the response uses the new dict shape -- an empty
-    `warnings` list is not itself a degradation signal."""
-    palace = DegradedRetrievalPalace(
+    (None) -- an empty `warnings` list is not itself a degradation
+    signal."""
+    tools = DegradedRetrievalTools(
         {
             "results": [
-                {"id": "d1", "content": "unrelated content", "metadata": {}},
+                {"text": "unrelated content", "wing": "room-1", "room": "memtrust"},
             ],
             "warnings": [],
             "available_in_scope": 1,
         }
     )
-    adapter = MemPalaceAdapter(palace=palace)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     query_result = adapter.query("room-1", "query")
 
     assert query_result.degraded_retrieval is None
 
 
-def test_mempalace_query_degraded_retrieval_unset_for_bare_list_response() -> None:
-    """The original, still-supported bare-list shape (FakePalace's
-    convention) never sets degraded_retrieval -- there is no `warnings`
-    field to read at all on that shape."""
-    palace = FakePalace()
-    adapter = MemPalaceAdapter(palace=palace)
+def test_mempalace_query_degraded_retrieval_unset_for_ordinary_response() -> None:
+    """The ordinary, real response shape (FakeMCPTools' default
+    tool_search, matching the confirmed real shape) never sets
+    degraded_retrieval -- there is no `warnings` key on that shape."""
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(mcp_tools=tools)
     adapter.store("room-1", "My dog is named Baxter.")
 
     query_result = adapter.query("room-1", "what is my dog's name?")
@@ -1965,16 +2239,13 @@ def test_mempalace_query_degraded_retrieval_unset_for_bare_list_response() -> No
 
 
 def test_mempalace_query_available_in_scope_none_when_backend_omits_it() -> None:
-    """available_in_scope is optional per the #1005 contract (None when
-    the backend couldn't compute a scope count, e.g. a filter-planner
-    error) -- the adapter must not fabricate a number when it's absent."""
-    palace = DegradedRetrievalPalace(
+    tools = DegradedRetrievalTools(
         {
             "results": [],
             "warnings": ["vector search unavailable: filter planner error"],
         }
     )
-    adapter = MemPalaceAdapter(palace=palace)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     query_result = adapter.query("room-1", "query")
 
@@ -1987,14 +2258,14 @@ def test_mempalace_query_available_in_scope_none_when_backend_omits_it() -> None
 def test_mempalace_query_available_in_scope_ignores_non_int_value() -> None:
     """A malformed/mocked available_in_scope (not a real int) must not be
     trusted as a number -- treated the same as absent, never coerced."""
-    palace = DegradedRetrievalPalace(
+    tools = DegradedRetrievalTools(
         {
             "results": [],
             "warnings": ["vector search unavailable: boom"],
             "available_in_scope": "not-a-number",
         }
     )
-    adapter = MemPalaceAdapter(palace=palace)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     query_result = adapter.query("room-1", "query")
 
@@ -2003,15 +2274,94 @@ def test_mempalace_query_available_in_scope_ignores_non_int_value() -> None:
 
 
 def test_mempalace_query_raises_backend_api_error_when_dict_missing_results_key() -> None:
-    """A dict-shaped response that doesn't carry the confirmed #1005
-    `results` key is a wrong guess about the vendor's response shape --
-    that must fail loudly as BackendAPIError, not a confusing KeyError or
-    a silent empty-records response."""
-    palace = DegradedRetrievalPalace({"warnings": [], "available_in_scope": 0})
-    adapter = MemPalaceAdapter(palace=palace)
+    """A dict-shaped response with no `results` key at all is the real,
+    confirmed shape tool_search returns on a sanitizer rejection --
+    {"error": ...}. That must fail loudly as BackendAPIError, not a
+    confusing KeyError or a silent empty-records response."""
+    tools = DegradedRetrievalTools({"error": "wing contains invalid characters"})
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     with pytest.raises(BackendAPIError, match="results"):
         adapter.query("room-1", "query")
+
+
+# ---------------------------------------------------------------------------
+# MemPalaceAdapter.kg_add() / kg_invalidate() / kg_query() -- the new,
+# additive knowledge-graph capability (see the module docstring's
+# "CONTRADICTION/STALENESS DETECTION MOVED TO THE KG API" section). Not
+# part of the shared MemoryBackendAdapter contract.
+# ---------------------------------------------------------------------------
+
+
+def test_mempalace_kg_add_returns_triple_id_and_fact() -> None:
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+
+    result = adapter.kg_add("user", "favorite_color", "blue")
+
+    assert result.success is True
+    assert result.triple_id is not None
+    assert result.fact == "user → favorite_color → blue"
+
+
+def test_mempalace_kg_add_idempotent_on_repeat() -> None:
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+
+    first = adapter.kg_add("user", "favorite_color", "blue")
+    second = adapter.kg_add("user", "favorite_color", "blue")
+
+    assert first.triple_id == second.triple_id
+
+
+def test_mempalace_kg_invalidate_marks_current_false_and_stamps_ended() -> None:
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+    adapter.kg_add("user", "favorite_color", "blue")
+
+    before = adapter.kg_query("user")
+    assert before.facts[0].current is True
+
+    invalidate_result = adapter.kg_invalidate("user", "favorite_color", "blue", ended="2026-06-01")
+    assert invalidate_result.success is True
+    assert invalidate_result.ended == "2026-06-01"
+
+    after = adapter.kg_query("user")
+    assert after.facts[0].current is False
+    assert after.facts[0].valid_to == "2026-06-01"
+
+
+def test_mempalace_kg_invalidate_succeeds_even_if_fact_never_added() -> None:
+    """Documents a real, live-verified quirk: tool_kg_invalidate does not
+    check prior existence -- it succeeds unconditionally. This adapter
+    does not second-guess that (see kg_invalidate()'s docstring)."""
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+
+    result = adapter.kg_invalidate("nobody", "nonexistent_pred", "nothing")
+
+    assert result.success is True
+
+
+def test_mempalace_kg_query_reports_outgoing_facts_for_entity() -> None:
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+    adapter.kg_add("user", "favorite_color", "blue")
+    adapter.kg_add("user", "favorite_language", "python")
+
+    result = adapter.kg_query("user")
+
+    assert result.entity == "user"
+    assert result.count == 2
+    assert {f.object for f in result.facts} == {"blue", "python"}
+    assert all(f.direction == "outgoing" for f in result.facts)
+
+
+def test_mempalace_kg_query_raises_backend_api_error_when_facts_key_missing() -> None:
+    class NoFactsKeyTools(FakeMCPTools):
+        def tool_kg_query(
+            self, entity: str, as_of: str | None = None, direction: str = "both"
+        ) -> dict[str, Any]:
+            return {"error": "entity name contains invalid characters"}
+
+    adapter = MemPalaceAdapter(mcp_tools=NoFactsKeyTools())
+    with pytest.raises(BackendAPIError, match="facts"):
+        adapter.kg_query("bad entity!!")
 
 
 # ---------------------------------------------------------------------------
@@ -2019,36 +2369,10 @@ def test_mempalace_query_raises_backend_api_error_when_dict_missing_results_key(
 # list_metadata_subcategories() -- the confirmed-real
 # mempalace.mcp_server.tool_status/tool_list_wings/tool_list_rooms wrapper
 # (see mempalace_adapter.py's "MCP metadata-tool coverage" module docstring
-# section and MemPalace/mempalace#1871, contributor alionar).
-#
-# FakeMCPTools below stands in for the real mempalace.mcp_server module --
-# unlike FakePalace (which stands in for an *unconfirmed guess* at
-# mempalace.Palace), this fake's shape mirrors functions confirmed real
-# against the installed package during this build's investigation.
+# section and MemPalace/mempalace#1871, contributor alionar). Unchanged by
+# this rewrite except for sharing `_get_mcp_tools()` with every other
+# method.
 # ---------------------------------------------------------------------------
-
-
-class FakeMCPTools:
-    def __init__(self) -> None:
-        self.status_response: dict[str, Any] = {
-            "total_drawers": 0,
-            "wings": {},
-            "rooms": {},
-            "backend": "chroma",
-        }
-        self.list_wings_response: dict[str, Any] = {"wings": {}}
-        self.list_rooms_response: dict[str, Any] = {"wing": "all", "rooms": {}}
-        self.list_rooms_calls: list[str | None] = []
-
-    def tool_status(self) -> dict[str, Any]:
-        return self.status_response
-
-    def tool_list_wings(self) -> dict[str, Any]:
-        return self.list_wings_response
-
-    def tool_list_rooms(self, wing: str | None = None) -> dict[str, Any]:
-        self.list_rooms_calls.append(wing)
-        return self.list_rooms_response
 
 
 class _RaisingMCPTools:
@@ -2078,7 +2402,7 @@ def test_mempalace_metadata_overview_reports_wing_room_counts() -> None:
         "rooms": {"room_0": 100, "room_1": 400},
         "backend": "chroma",
     }
-    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     overview = adapter.metadata_overview()
 
@@ -2093,7 +2417,7 @@ def test_mempalace_metadata_overview_reports_wing_room_counts() -> None:
 def test_mempalace_list_metadata_categories_wraps_tool_list_wings() -> None:
     tools = FakeMCPTools()
     tools.list_wings_response = {"wings": {"wing_a": 3, "wing_b": 7}}
-    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     result = adapter.list_metadata_categories()
 
@@ -2105,7 +2429,7 @@ def test_mempalace_list_metadata_categories_wraps_tool_list_wings() -> None:
 def test_mempalace_list_metadata_subcategories_scopes_by_category() -> None:
     tools = FakeMCPTools()
     tools.list_rooms_response = {"wing": "wing_a", "rooms": {"room_x": 2, "room_y": 1}}
-    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     result = adapter.list_metadata_subcategories(category="wing_a")
 
@@ -2116,7 +2440,7 @@ def test_mempalace_list_metadata_subcategories_scopes_by_category() -> None:
 
 def test_mempalace_list_metadata_subcategories_unscoped_passes_none_wing() -> None:
     tools = FakeMCPTools()
-    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     adapter.list_metadata_subcategories()
 
@@ -2137,7 +2461,7 @@ def test_mempalace_metadata_overview_flags_partial_on_backend_error() -> None:
         "error": "tool_status metadata fetch failed",
         "partial": True,
     }
-    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+    adapter = MemPalaceAdapter(mcp_tools=tools)
 
     overview = adapter.metadata_overview()
 
@@ -2146,7 +2470,7 @@ def test_mempalace_metadata_overview_flags_partial_on_backend_error() -> None:
 
 
 def test_mempalace_metadata_calls_wrap_vendor_exceptions_in_backend_api_error() -> None:
-    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=_RaisingMCPTools())
+    adapter = MemPalaceAdapter(mcp_tools=_RaisingMCPTools())
 
     with pytest.raises(BackendAPIError, match="sqlite database is locked"):
         adapter.metadata_overview()
@@ -2154,19 +2478,6 @@ def test_mempalace_metadata_calls_wrap_vendor_exceptions_in_backend_api_error() 
         adapter.list_metadata_categories()
     with pytest.raises(BackendAPIError, match="sqlite database is locked"):
         adapter.list_metadata_subcategories()
-
-
-def test_mempalace_get_mcp_metadata_tools_raises_clear_error_when_package_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Same real-ImportError-path reasoning as
-    # test_mempalace_get_palace_raises_clear_error_when_package_missing
-    # above: the real `mempalace` package is genuinely not installed in
-    # this test environment.
-    monkeypatch.setenv("MEMPALACE_STORAGE_PATH", "/tmp/fake-palace")
-    adapter = MemPalaceAdapter()
-    with pytest.raises(BackendAPIError, match="not installed"):
-        adapter.metadata_overview()
 
 
 def test_mempalace_sync_mcp_palace_path_bridges_storage_path_env_var(
@@ -2183,6 +2494,236 @@ def test_mempalace_sync_mcp_palace_path_bridges_storage_path_env_var(
     adapter.metadata_overview()
 
     assert os.environ.get("MEMPALACE_PALACE_PATH") == "/tmp/a-real-palace-path"
+
+
+def test_mempalace_sync_calls_reconnect_only_when_path_actually_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """See mempalace_adapter.py's module docstring "CROSS-PATH RELIABILITY
+    GAP" section: a live-reproduced real vendor bug means switching
+    MEMPALACE_PALACE_PATH to a different value within one process can
+    leave mempalace's own client/vector-disabled cache stale unless
+    tool_reconnect() is called once right after the switch. This adapter
+    now does that automatically, but only when the path actually changes
+    -- never on every call, which would cost a real vendor call per
+    store()/query()/update()/delete() for the common single-path-per-run
+    case."""
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+
+    monkeypatch.setenv("MEMPALACE_STORAGE_PATH", "/tmp/palace-x")
+    tools_x = FakeMCPTools()
+    adapter_x = MemPalaceAdapter(mcp_tools=tools_x)
+    adapter_x.store("room-1", "content")
+    adapter_x.store("room-1", "more content")
+    # First-ever sync in this process: MEMPALACE_PALACE_PATH had no prior
+    # value, so this is not treated as a "change" -- no reconnect call.
+    assert tools_x.reconnect_call_count == 0
+
+    monkeypatch.setenv("MEMPALACE_STORAGE_PATH", "/tmp/palace-y")
+    tools_y = FakeMCPTools()
+    adapter_y = MemPalaceAdapter(mcp_tools=tools_y)
+    adapter_y.store("room-1", "content")
+    # A real path change happened (palace-x -> palace-y) -- exactly one
+    # reconnect call, on the first sync that observes it.
+    assert tools_y.reconnect_call_count == 1
+    adapter_y.store("room-1", "more content")
+    adapter_y.query("room-1", "content")
+    # Subsequent calls against the SAME (now-current) path do not
+    # re-trigger reconnect.
+    assert tools_y.reconnect_call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Real, live integration tests against the actual installed `mempalace`
+# package -- requires the optional `mempalace-direct` dependency group
+# (`pip install -e ".[dev,mempalace-direct]"`). `real_mempalace_adapter`
+# below calls `pytest.importorskip("mempalace")` itself so only these
+# tests skip (not the whole module) when that group isn't installed --
+# matching the convention test_mempalace_metadata_scale.py's
+# test_real_chroma_seeder_reports_correct_counts_at_small_scale already
+# established. These are what actually prove the shapes documented in
+# mempalace_adapter.py's module docstring, not a restatement of them.
+#
+# All drawer tests below share ONE real palace directory and ONE real
+# MemPalaceAdapter instance (module-scoped fixture), using a distinct
+# `session_id`/wing per test for isolation instead of a fresh palace
+# directory per test. This is deliberate, not a shortcut: see the module
+# docstring's "CROSS-PATH RELIABILITY GAP" section -- switching
+# MEMPALACE_PALACE_PATH between distinct real palace directories within
+# one process is a live-reproduced, real vendor reliability gap, and
+# reusing one path throughout matches memtrust's own normal single-run
+# usage pattern (one adapter, one fixed storage path, for a whole eval
+# run) exactly. The KG tests use a per-run-unique subject entity instead
+# -- see the module docstring's "KNOWLEDGE-GRAPH STORAGE IGNORES
+# MEMPALACE_PALACE_PATH" section: the real KG store is one fixed file in
+# the calling user's home directory, shared globally, with no per-path
+# isolation to rely on at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def real_mempalace_adapter() -> Any:
+    pytest.importorskip(
+        "mempalace",
+        reason=(
+            "requires the optional `mempalace-direct` extra: "
+            "pip install -e '.[dev,mempalace-direct]'. See "
+            "mempalace_adapter.py's module docstring."
+        ),
+    )
+    import tempfile
+
+    from memtrust.adapters.mempalace_adapter import MemPalaceAdapter as _RealMemPalaceAdapter
+
+    storage_path = os.path.join(tempfile.mkdtemp(prefix="memtrust-mempalace-real-"), "palace")
+    os.makedirs(storage_path, exist_ok=True)
+    previous_storage = os.environ.get("MEMPALACE_STORAGE_PATH")
+    os.environ["MEMPALACE_STORAGE_PATH"] = storage_path
+    # Deliberately do NOT touch MEMPALACE_PALACE_PATH here -- leave it
+    # exactly as any earlier test/process activity left it, so the
+    # adapter's own _sync_mcp_palace_path() gets an undisturbed view of
+    # whatever the real mempalace.mcp_server module last saw and can
+    # correctly detect a real path change (see the module docstring's
+    # "CROSS-PATH RELIABILITY GAP" section -- clearing this env var here
+    # would defeat that change-detection on the very first real call).
+    adapter = _RealMemPalaceAdapter()
+    yield adapter
+    if previous_storage is None:
+        os.environ.pop("MEMPALACE_STORAGE_PATH", None)
+    else:
+        os.environ["MEMPALACE_STORAGE_PATH"] = previous_storage
+
+
+def test_real_mempalace_store_query_update_delete_round_trip(real_mempalace_adapter: Any) -> None:
+    adapter = real_mempalace_adapter
+
+    store_result = adapter.store("round-trip-session", "My dog is named Baxter.")
+    assert store_result.memory_id  # real drawer_id, non-empty
+
+    query_result = adapter.query("round-trip-session", "what is my dog's name?")
+    assert any("Baxter" in r.content for r in query_result.records)
+    # Confirmed real gap -- see the module docstring's "NO PER-RECORD ID"
+    # section.
+    assert all(r.memory_id == "" for r in query_result.records)
+
+    update_result = adapter.update(
+        "round-trip-session", store_result.memory_id, "My dog is actually named Max."
+    )
+    assert update_result.acknowledged is True
+
+    query_after_update = adapter.query("round-trip-session", "what is my dog's name?")
+    assert any("Max" in r.content for r in query_after_update.records)
+    assert not any("Baxter" in r.content for r in query_after_update.records)
+
+    delete_result = adapter.delete(store_result.memory_id)
+    assert delete_result.success is True
+
+    query_after_delete = adapter.query("round-trip-session", "what is my dog's name?")
+    assert not any("Max" in r.content for r in query_after_delete.records)
+
+
+def test_real_mempalace_query_isolates_by_session_id_as_wing(real_mempalace_adapter: Any) -> None:
+    adapter = real_mempalace_adapter
+
+    adapter.store("isolation-session-a", "session A's secret is the number 42.")
+    adapter.store("isolation-session-b", "session B's secret is the color teal.")
+
+    result_a = adapter.query("isolation-session-a", "secret")
+    result_b = adapter.query("isolation-session-b", "secret")
+
+    assert any("42" in r.content for r in result_a.records)
+    assert not any("42" in r.content for r in result_b.records)
+    assert any("teal" in r.content for r in result_b.records)
+    assert not any("teal" in r.content for r in result_a.records)
+
+
+def test_real_mempalace_store_idempotent_on_identical_content(real_mempalace_adapter: Any) -> None:
+    adapter = real_mempalace_adapter
+
+    first = adapter.store("idempotency-session", "identical content for idempotency check")
+    second = adapter.store("idempotency-session", "identical content for idempotency check")
+
+    assert first.memory_id == second.memory_id
+
+
+def test_real_mempalace_update_delete_report_unsuccessful_for_nonexistent_id(
+    real_mempalace_adapter: Any,
+) -> None:
+    adapter = real_mempalace_adapter
+
+    update_result = adapter.update("notfound-session", "drawer-does-not-exist", "new content")
+    assert update_result.acknowledged is False
+
+    delete_result = adapter.delete("drawer-does-not-exist")
+    assert delete_result.success is False
+
+
+def test_real_mempalace_verify_store_confirms_readable_write(real_mempalace_adapter: Any) -> None:
+    adapter = real_mempalace_adapter
+
+    result = adapter.store("verify-session", "verifiable content marker QRSTUV", verify=True)
+
+    assert result.verified is True
+
+
+def test_real_mempalace_chunked_content_update_delete_round_trip(
+    real_mempalace_adapter: Any,
+) -> None:
+    """Confirms the module docstring's "CHUNKED CONTENT" section live:
+    content over mempalace's real default chunk_size (800 chars) gets
+    split into multiple physical chunk drawers on store(), but
+    update()/delete() against the logical drawer_id store() returns still
+    work correctly -- despite tool_add_drawer's own docstring in the
+    installed package claiming update/delete "report 'not found' on the
+    chunked path," which does not hold up against this version's actual
+    _logical_drawer_record()/_logical_chunk_group() resolution logic."""
+    adapter = real_mempalace_adapter
+
+    long_content = "This is a long memory sentence about the project. " * 40  # well over 800 chars
+    assert len(long_content) > 800
+    store_result = adapter.store("chunked-session", long_content)
+
+    update_result = adapter.update("chunked-session", store_result.memory_id, "replacement content")
+    assert update_result.acknowledged is True
+
+    query_after_update = adapter.query("chunked-session", "replacement content")
+    assert any("replacement content" in r.content for r in query_after_update.records)
+
+    another_long_content = "A separate long memory sentence for delete. " * 40
+    delete_store_result = adapter.store("chunked-session", another_long_content)
+    delete_result = adapter.delete(delete_store_result.memory_id)
+    assert delete_result.success is True
+
+    query_after_delete = adapter.query("chunked-session", "separate long memory sentence")
+    assert not any("separate long memory sentence" in r.content for r in query_after_delete.records)
+
+
+def test_real_mempalace_kg_add_invalidate_query_round_trip(real_mempalace_adapter: Any) -> None:
+    # See the module docstring's "KNOWLEDGE-GRAPH STORAGE IGNORES
+    # MEMPALACE_PALACE_PATH" section: the real KG store is one fixed,
+    # environment-global file with no per-test/per-path isolation at all
+    # -- a randomized subject makes this test's assertions valid
+    # regardless of what any other test run (in this process or a prior
+    # one) already wrote there.
+    adapter = real_mempalace_adapter
+    subject = f"memtrust-kg-test-user-{uuid.uuid4().hex}"
+
+    add_result = adapter.kg_add(subject, "favorite_color", "blue", source_closet="kg-session")
+    assert add_result.success is True
+    assert add_result.triple_id is not None
+
+    before = adapter.kg_query(subject)
+    assert before.count == 1
+    assert before.facts[0].current is True
+    assert before.facts[0].valid_to is None
+
+    invalidate_result = adapter.kg_invalidate(subject, "favorite_color", "blue")
+    assert invalidate_result.success is True
+    assert invalidate_result.ended is not None
+
+    after = adapter.kg_query(subject)
+    assert after.facts[0].current is False
+    assert after.facts[0].valid_to == invalidate_result.ended
 
 
 # ---------------------------------------------------------------------------
