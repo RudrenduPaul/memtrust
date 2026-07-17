@@ -20,7 +20,12 @@ The bundled tests/fixtures/locomo_sample.json is a small, explicitly
 synthetic sample matching the real dataset's schema -- see its top-level
 "_note" field and docs/methodology.md for exactly what is synthetic here
 versus what would run against the real, full public dataset given network
-access to download it.
+access to download it. The real `locomo10.json` (snap-research/locomo) is
+not bundled or auto-fetched here -- it is not memtrust's dataset to
+redistribute -- but once downloaded, `memtrust run --locomo-dataset-path
+<path>` or `run_locomo(..., dataset_path=<path>)` runs against it directly;
+`load_dataset()` below validates the file and raises an actionable error
+if it is missing or does not match the expected schema.
 
 ## Category 5 / adversarial questions, and headline accuracy
 
@@ -196,8 +201,51 @@ class LoCoMoResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[dict[str, Any]]:
-    data = json.loads(Path(path).read_text())
-    conversations: list[dict[str, Any]] = data["conversations"]
+    """Load a LoCoMo-schema dataset file: either the bundled synthetic
+    fixture (the default) or a real `locomo10.json` downloaded from
+    snap-research/locomo -- see docs/methodology.md's "LoCoMo" section
+    for the download link and schema, and `memtrust run
+    --locomo-dataset-path` for the CLI entry point that plugs a real
+    download in without writing custom Python.
+
+    Raises `ValueError` with an actionable message (not a bare
+    `FileNotFoundError`/`JSONDecodeError`/`KeyError`) when the file is
+    missing, is not valid JSON, or does not match the expected
+    top-level `{"conversations": [...]}` shape -- schema mismatches are
+    the most common real-world failure mode when pointing this at a
+    hand-downloaded file, and the previous bare exceptions gave no clue
+    what shape was actually expected."""
+    resolved = Path(path)
+    if not resolved.exists():
+        raise ValueError(
+            f"LoCoMo dataset file not found: {resolved}. Download locomo10.json from "
+            "https://github.com/snap-research/locomo and pass its path via "
+            "`memtrust run --locomo-dataset-path` (CLI) or "
+            "`run_locomo(..., dataset_path=...)` (Python) -- see docs/methodology.md's "
+            '"LoCoMo" section for the download link and expected schema.'
+        )
+    try:
+        data = json.loads(resolved.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"LoCoMo dataset file at {resolved} is not valid JSON ({exc}). Expected the "
+            'real locomo10.json\'s top-level {"conversations": [...]} shape -- see '
+            'docs/methodology.md\'s "LoCoMo" section.'
+        ) from exc
+    if not isinstance(data, dict) or "conversations" not in data:
+        raise ValueError(
+            f"LoCoMo dataset file at {resolved} is missing the expected top-level "
+            '"conversations" key. This loader expects the real locomo10.json shape: '
+            '{"conversations": [{"conversation_id": ..., "session_1": [...], '
+            '"qa": [...]}, ...]} -- see docs/methodology.md\'s "LoCoMo" section for the '
+            "full schema."
+        )
+    conversations = data["conversations"]
+    if not isinstance(conversations, list):
+        raise ValueError(
+            f'LoCoMo dataset file at {resolved}: "conversations" must be a list, got '
+            f"{type(conversations).__name__}."
+        )
     return conversations
 
 
