@@ -1187,6 +1187,123 @@ def test_mempalace_query_ranking_signal_not_applicable_with_fewer_than_two_recor
     assert query_result.ranking_signal == RankingSignal.NOT_APPLICABLE
 
 
+def test_mempalace_query_reports_signal_driven_when_authored_at_varies_and_importance_absent() -> (
+    None
+):
+    # MemPalace/mempalace PR#1890 added `authored_at` as a `_hybrid_rank`
+    # tie-breaker -- this adapter must recognize it as a ranking-driving
+    # metadata field on its own, not only fall back to insertion order
+    # when `importance`/`emotional_weight`/`weight` are all absent.
+    palace = FakePalace()
+    adapter = MemPalaceAdapter(palace=palace)
+    adapter.store("room-1", "Filed the annual tax return.", metadata={"authored_at": "1700000000"})
+    adapter.store("room-1", "Watered the office plants.", metadata={"authored_at": "1650000000"})
+
+    query_result = adapter.query("room-1", "wake me up with important memories")
+    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
+
+
+# ---------------------------------------------------------------------------
+# MemPalaceAdapter.query() -- `authored_at` surfaced from a top-level
+# response field, not only from nested `metadata` (MemPalace/mempalace
+# PR#1890 / issue #1889)
+#
+# MemPalace's own merged PR#1890 added `authored_at` timestamp metadata as
+# a `_hybrid_rank` tie-breaker, but gemini-code-assist's review comment on
+# that same diff flagged that MemPalace's real response-building code can
+# surface it at the TOP LEVEL of a response item instead of nested under
+# `metadata` -- the identical top-level-vs-nested inconsistency, now on
+# this adapter's read side: before this fix, query() only ever read
+# item.get("metadata"), so a top-level authored_at was silently dropped.
+# ---------------------------------------------------------------------------
+
+
+class _NestedAuthoredAtPalace(FakePalace):
+    def recall(
+        self, room: str, query: str, top_k: int, mode: str | None = None
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "m1",
+                "content": "Filed the annual tax return.",
+                "metadata": {"authored_at": "1700000000"},
+            },
+            {
+                "id": "m2",
+                "content": "Watered the office plants.",
+                "metadata": {"authored_at": "1650000000"},
+            },
+        ][:top_k]
+
+
+class _TopLevelAuthoredAtPalace(FakePalace):
+    def recall(
+        self, room: str, query: str, top_k: int, mode: str | None = None
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "m1",
+                "content": "Filed the annual tax return.",
+                "metadata": {},
+                "authored_at": "1700000000",
+            },
+            {
+                "id": "m2",
+                "content": "Watered the office plants.",
+                "metadata": {},
+                "authored_at": "1650000000",
+            },
+        ][:top_k]
+
+
+class _BothLevelsAuthoredAtPalace(FakePalace):
+    def recall(
+        self, room: str, query: str, top_k: int, mode: str | None = None
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "m1",
+                "content": "Filed the annual tax return.",
+                "metadata": {"authored_at": "1700000000"},
+                "authored_at": "9999999999",
+            },
+        ][:top_k]
+
+
+def test_mempalace_query_surfaces_authored_at_nested_under_metadata() -> None:
+    """The normal, documented shape: authored_at nested under metadata
+    must pass through unmodified."""
+    adapter = MemPalaceAdapter(palace=_NestedAuthoredAtPalace())
+    query_result = adapter.query("room-1", "q")
+    assert [r.metadata.get("authored_at") for r in query_result.records] == [
+        "1700000000",
+        "1650000000",
+    ]
+    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
+
+
+def test_mempalace_query_surfaces_authored_at_from_top_level_when_not_nested() -> None:
+    """Before this fix, a top-level (not metadata-nested) authored_at was
+    silently dropped -- neither MemoryRecord.metadata nor
+    _classify_ranking_signal ever saw it."""
+    adapter = MemPalaceAdapter(palace=_TopLevelAuthoredAtPalace())
+    query_result = adapter.query("room-1", "q")
+    assert [r.metadata.get("authored_at") for r in query_result.records] == [
+        "1700000000",
+        "1650000000",
+    ]
+    assert query_result.ranking_signal == RankingSignal.SIGNAL_DRIVEN
+
+
+def test_mempalace_query_nested_authored_at_takes_priority_over_top_level() -> None:
+    """When a response item (incorrectly) carries both a nested and a
+    top-level authored_at, the nested one -- the confirmed, documented
+    shape -- must win rather than being silently overridden."""
+    adapter = MemPalaceAdapter(palace=_BothLevelsAuthoredAtPalace())
+    query_result = adapter.query("room-1", "q")
+    assert query_result.records[0].metadata["authored_at"] == "1700000000"
+
+
 # ---------------------------------------------------------------------------
 # MemPalaceAdapter.query() -- degraded-retrieval detection
 # (MemPalace/mempalace#1005, contributor jphein, also cited in #1769)
