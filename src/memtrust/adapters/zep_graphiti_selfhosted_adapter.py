@@ -13,7 +13,7 @@ a silent branch inside this one."* That is exactly what this file is.
 
 ## Why this adapter exists
 
-Four real, independently-verified graphiti-core bugs live entirely in the
+Five real, independently-verified graphiti-core bugs live entirely in the
 self-hosted library layer that `ZepGraphitiAdapter` (hosted REST) cannot
 reach at all, because Zep Cloud's REST surface never exposes graphiti-core's
 internals to a caller:
@@ -48,6 +48,22 @@ internals to a caller:
     extracts 0, 1, or 3+ entities (the overwhelmingly common case) raises
     `ValueError` from this unpack, not from anything resembling
     documented, expected behavior.
+  * **getzep/graphiti#920** (open as of this build, contributor
+    markwkiehl): `add_episode(..., reference_time=<tz-aware datetime>)`
+    raises `TypeError: can't compare offset-naive and offset-aware
+    datetimes` from `resolve_edge_contradictions()` in
+    `graphiti_core/utils/maintenance/edge_operations.py` (line ~371,
+    `edge.valid_at < resolved_edge.valid_at`), reached via
+    `add_episode()` -> `resolve_extracted_edges()` ->
+    `resolve_extracted_edge()` -> `resolve_edge_contradictions()`.
+    Confirmed via the issue's own filed traceback (`gh issue view 920
+    --repo getzep/graphiti`, fetched 2026-07-16): a caller who passes a
+    timezone-*aware* `reference_time` (e.g. `datetime.now(timezone.utc)`,
+    which is exactly what Python best practice recommends, and exactly
+    what this adapter's own `store()` passes -- see `datetime.now(UTC)`
+    below) can hit a stored edge whose `valid_at` was persisted as
+    timezone-*naive*, and the bare `<` comparison between the two raises
+    instead of normalizing either side first.
   * **getzep/graphiti#1013** (merged/fixed upstream): the Neo4j bulk
     edge-save Cypher query used to build its `SET` clause from an
     enumerated field list that omitted `EntityEdge.attributes` and
@@ -70,7 +86,7 @@ internals to a caller:
     `graphiti_core/driver/falkordb/operations/` module structure that
     post-dates this bug report.
 
-None of the above four confirmations came from running graphiti-core
+None of the above five confirmations came from running graphiti-core
 against a live Neo4j or FalkorDB instance in this environment -- they came
 from fetching the real source files from `getzep/graphiti`'s `main` branch
 on GitHub (`raw.githubusercontent.com/getzep/graphiti/main/...`) during
@@ -162,8 +178,23 @@ FalkorDB instance was started or reached during this build. That means:
     signal -- it exists so the check is *available* if this adapter is
     ever pinned to, or someone's self-hosted deployment happens to run,
     an older graphiti-core version where the bug is still present.
+  * `store()`'s `CrashSignal` classification (`CrashSignal.UNPACK_ERROR`
+    for #836's shape, `CrashSignal.TYPE_COMPARISON_ERROR` for #920's
+    shape -- see `_classify_crash()` below and `CrashSignal` in
+    `base.py`) is unit-tested against fake clients that raise the exact
+    `ValueError`/`TypeError` message strings each real issue's filed
+    traceback reports (confirmed via `gh issue view` for both issues,
+    2026-07-16). That proves this adapter correctly recognizes those two
+    message shapes once graphiti-core has already raised them -- it does
+    NOT prove, and does not attempt to prove, that this adapter's own
+    calls into `add_episode()` actually trigger either crash against a
+    live instance (same limitation as the `update_communities` bullet
+    above), and it does nothing to prevent either crash or fix
+    graphiti-core itself. It is a diagnostic classifier applied after the
+    fact to whatever exception a live instance (if reached) raises, nothing
+    more.
 
-Anyone relying on this adapter to reproduce any of the four issues above
+Anyone relying on this adapter to reproduce any of the five issues above
 against a real deployment should verify against a live Neo4j/FalkorDB
 instance first, exactly the same caveat docs/methodology.md already
 states for `Mem0SelfHostedAdapter`, `MemPalaceAdapter`, and
@@ -182,6 +213,7 @@ from memtrust.adapters.base import (
     BackendAPIError,
     BackendNotConfiguredError,
     ConflictSignal,
+    CrashSignal,
     DeleteResult,
     MemoryBackendAdapter,
     MemoryRecord,
@@ -240,6 +272,39 @@ def _to_plain_dict(obj: object) -> dict[str, object]:
         return {}
 
 
+def _classify_crash(exc: Exception) -> CrashSignal:
+    """Pattern-match a caught vendor exception's type and message against
+    the two known graphiti-core crash shapes `CrashSignal` (base.py)
+    documents, and fall back to `CrashSignal.UNKNOWN` for everything else.
+
+    This is deliberately narrow: it checks the exception's Python type
+    first (ValueError vs. TypeError), then a specific substring within
+    that type's message, so an unrelated ValueError (say, a malformed
+    UUID) or an unrelated TypeError (say, a wrong-argument-count bug) is
+    never miscategorized as getzep/graphiti#836 or #920. Matching a
+    substring of `str(exc)` is the only surface available here -- once a
+    vendor library has already raised, this adapter has no access to the
+    original traceback's source location, only what the exception itself
+    reports. See CrashSignal's docstring in base.py for the full honesty
+    caveat: this recognizes a known crash *shape*, it does not prove (or
+    require) that the crash occurred at the exact upstream line this
+    adapter's module docstring cites.
+    """
+    message = str(exc).lower()
+    if isinstance(exc, ValueError) and "values to unpack" in message:
+        # getzep/graphiti#836: add_episode(update_communities=True)'s
+        # `communities, community_edges = await semaphore_gather(...)`
+        # unpack only succeeds when semaphore_gather returns exactly 2
+        # items -- covers both "too many values to unpack" and "not
+        # enough values to unpack" phrasings of the same shape.
+        return CrashSignal.UNPACK_ERROR
+    if isinstance(exc, TypeError) and "offset-naive and offset-aware" in message:
+        # getzep/graphiti#920: comparing a tz-naive stored timestamp
+        # against a tz-aware datetime in edge-contradiction resolution.
+        return CrashSignal.TYPE_COMPARISON_ERROR
+    return CrashSignal.UNKNOWN
+
+
 def _parse_falkordb_url(url: str) -> tuple[str, int, str | None, str | None]:
     """Parse `GRAPHITI_FALKORDB_URL` into the (host, port, username,
     password) tuple `graphiti_core.driver.falkordb_driver.FalkorDriver`'s
@@ -256,7 +321,7 @@ def _parse_falkordb_url(url: str) -> tuple[str, int, str | None, str | None]:
 class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
     """Adapter for self-hosted `graphiti-core` (Neo4j by default, optional
     FalkorDB). See this module's docstring for the confidence level, the
-    four bug classes this adapter exists to make reachable, and exactly
+    five bug classes this adapter exists to make reachable, and exactly
     what was -- and was not -- confirmed against real source vs. a live
     instance.
     """
@@ -366,8 +431,22 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
                     update_communities=self._update_communities,
                 )
             )
+        except (ValueError, TypeError) as exc:
+            # Caught ahead of the generic Exception handler below so these
+            # two specific graphiti-core crash shapes -- getzep/graphiti
+            # #836 (ValueError from a tuple/list unpack count mismatch) and
+            # #920 (TypeError from a tz-naive/tz-aware datetime comparison)
+            # -- get classified via _classify_crash() instead of collapsing
+            # into the same opaque "some exception happened" error every
+            # other failure produces. Anything that doesn't match either
+            # known shape (including an unrelated ValueError/TypeError)
+            # still raises BackendAPIError, just with
+            # crash_signal=CrashSignal.UNKNOWN instead of None -- see
+            # CrashSignal.UNKNOWN's docstring for why that distinction
+            # matters.
+            raise BackendAPIError(self.name, str(exc), crash_signal=_classify_crash(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, str(exc), crash_signal=CrashSignal.UNKNOWN) from exc
 
         result_dict = _to_plain_dict(result)
         episode = getattr(result, "episode", None) if not isinstance(result, dict) else None
