@@ -68,6 +68,11 @@ from memtrust.adapters.mem0_direct_adapter import (  # noqa: E402
     SUPPORTED_VECTOR_STORE_PROVIDERS,
     Mem0DirectAdapter,
 )
+from memtrust.evals.embedder_cost import (  # noqa: E402
+    EmbedderCostSignal,
+    run_embedder_cost_eval,
+)
+from memtrust.scoring.cost_tracker import CostTracker  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Layer 1: adapter control-flow tests, via a fake in-process Memory double
@@ -107,11 +112,37 @@ class _FakePoint:
         self.payload = payload
 
 
+class _FakeEmbedder:
+    """Matches the `embed()`/`embed_batch()` shape every real, installed
+    mem0 embedder class (`mem0.embeddings.base.EmbeddingBase` subclass)
+    exposes -- stands in for `Memory.embedding_model`. Records every call
+    so tests can assert on exactly what `_CountingEmbedder` counted,
+    independent of whatever `_CountingEmbedder`'s own wrapping logic
+    does."""
+
+    def __init__(self) -> None:
+        self.embed_calls: list[str] = []
+        self.embed_batch_calls: list[list[str]] = []
+
+    def embed(self, text: str, action: str | None = None) -> list[float]:
+        self.embed_calls.append(text)
+        return [0.1, 0.2, 0.3]
+
+    def embed_batch(self, texts: list[str], action: str | None = None) -> list[list[float]]:
+        self.embed_batch_calls.append(list(texts))
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+
 class _FakeMemory:
     """Matches `_MemoryProtocol` in mem0_direct_adapter.py."""
 
-    def __init__(self, vector_store: _FakeVectorStore | None = None) -> None:
+    def __init__(
+        self,
+        vector_store: _FakeVectorStore | None = None,
+        embedding_model: _FakeEmbedder | None = None,
+    ) -> None:
         self.vector_store = vector_store or _FakeVectorStore({"data": "seed"}, b"\xaa\xbb\xcc\xdd")
+        self.embedding_model = embedding_model if embedding_model is not None else _FakeEmbedder()
         self.add_calls: list[dict[str, object]] = []
         self.search_calls: list[dict[str, object]] = []
         self.update_calls: list[dict[str, object]] = []
@@ -132,6 +163,19 @@ class _FakeMemory:
         if self.raise_on_add:
             raise self.raise_on_add
         self.add_calls.append({"messages": messages, "user_id": user_id, "metadata": metadata})
+        # Models the real, installed package's Phase 3 batch-embed step
+        # (mem0/memory/main.py's `_add_to_vector_store()`) closely enough
+        # for _CountingEmbedder tests: one embed_batch() call per add(),
+        # over the single message text -- a real add() may call
+        # embed_batch() with more than one extracted fact, but this fake
+        # never does its own LLM extraction, so one text in, one text
+        # embedded is the honest fake-adapter shape here. Real mem0's
+        # Memory.add() always has a real embedding_model (never None) --
+        # the None case only exists in this fake to test this adapter's
+        # own "no embedder surface" gate, which a real mem0.Memory could
+        # never actually trigger.
+        if self.embedding_model is not None:
+            self.embedding_model.embed_batch([str(messages)], "add")
         if self.add_returns_empty_results:
             return {"results": []}
         return {"results": [{"id": "mem-1", "memory": str(messages), "event": "ADD"}]}
@@ -202,6 +246,127 @@ def test_store_reports_empty_extraction_signal_when_add_returns_no_results() -> 
     assert result.memory_id == ""
     assert result.corruption_signal == CorruptionSignal.CLEAN
     assert result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
+
+
+# ---------------------------------------------------------------------------
+# Vendor embedder-call counting and cost attribution (spike-spiegel-21,
+# rank 104, mem0ai/mem0#1900) -- CostTracker.record_embed_calls() wired
+# through store()'s _CountingEmbedder. See scoring/cost_tracker.py's
+# EmbedCallEntry and evals/embedder_cost.py.
+# ---------------------------------------------------------------------------
+
+
+def test_store_records_embed_call_when_cost_tracker_configured() -> None:
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    adapter.store("session-1", "My dog is named Baxter.")
+
+    assert len(tracker.embed_entries) == 1
+    entry = tracker.embed_entries[0]
+    assert entry.call_count == 1
+    assert entry.provider == "injected"  # memory= injection path's embedder_provider default
+    assert entry.estimated_tokens == len("My dog is named Baxter.") // 4
+    assert fake.embedding_model.embed_batch_calls == [["My dog is named Baxter."]]
+
+
+def test_store_records_real_embedder_provider_when_configured() -> None:
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker, embedder_provider="openai")
+    adapter.store("session-1", "content")
+    assert tracker.embed_entries[0].provider == "openai"
+
+
+def test_store_no_embed_call_recorded_when_cost_tracker_not_configured() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)
+    adapter.store("session-1", "content")
+    # Real embed_batch() still ran (this fake's add() always calls it) --
+    # what's under test is that memtrust records NOTHING when no
+    # cost_tracker was configured, not that the vendor call didn't happen.
+    assert fake.embedding_model.embed_batch_calls == [["content"]]
+
+
+def test_store_no_embed_call_recorded_when_memory_has_no_embedding_model() -> None:
+    fake = _FakeMemory()
+    fake.embedding_model = None  # type: ignore[assignment]
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    # Must not raise even though embedding_model is absent -- this adapter
+    # gates counting on embedder being present, same "optional
+    # instrumentation, never a hard requirement" convention every other
+    # opt-in signal in this codebase follows.
+    result = adapter.store("session-1", "content")
+    assert result.memory_id == "mem-1"
+    assert tracker.embed_entries == []
+
+
+def test_counting_embedder_restores_original_methods_after_store() -> None:
+    """_CountingEmbedder must not leave the real embedder's methods
+    monkeypatched after store() returns -- a second, uninstrumented caller
+    sharing the same underlying mem0.Memory must see the original,
+    unwrapped embed()/embed_batch()."""
+    fake = _FakeMemory()
+    original_embed_batch = fake.embedding_model.embed_batch
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    adapter.store("session-1", "content")
+    assert fake.embedding_model.embed_batch == original_embed_batch
+
+
+def test_counting_embedder_scoped_to_a_single_store_call() -> None:
+    """A second store() call with no cost_tracker sharing gets its own,
+    independent EmbedCallEntry -- counting never leaks/accumulates call
+    counts across separate store() invocations."""
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    adapter.store("session-1", "first")
+    adapter.store("session-1", "second, a longer piece of content")
+    assert len(tracker.embed_entries) == 2
+    assert tracker.embed_entries[0].call_count == 1
+    assert tracker.embed_entries[1].call_count == 1
+    assert tracker.embed_entries[0].estimated_tokens != tracker.embed_entries[1].estimated_tokens
+
+
+def test_embedder_cost_eval_reports_redundant_reembed_against_installed_pipeline() -> None:
+    """run_embedder_cost_eval()'s real-world verdict against the currently
+    installed mem0ai pipeline shape: every store() call independently
+    batch-embeds, with no reuse of a prior search()'s embedding -- see
+    evals/embedder_cost.py's module docstring for the honest scope of why
+    this is expected, not a bug this build introduced."""
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+
+    result = run_embedder_cost_eval(adapter, tracker, session_id="s1", content="unchanged content")
+
+    assert result.signal == EmbedderCostSignal.REDUNDANT_REEMBED
+    assert result.first_store_embed_calls == 1
+    assert result.second_store_embed_calls == 1
+    assert result.error is None
+
+
+def test_embedder_cost_eval_not_applicable_when_no_cost_tracker_wired_to_adapter() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)  # no cost_tracker= passed
+    tracker = CostTracker()  # a tracker this adapter was never given
+
+    result = run_embedder_cost_eval(adapter, tracker)
+    assert result.signal == EmbedderCostSignal.NOT_APPLICABLE
+    assert result.error is not None
+
+
+def test_embedder_cost_eval_not_applicable_on_backend_error() -> None:
+    fake = _FakeMemory()
+    fake.raise_on_add = RuntimeError("vendor exploded")
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+
+    result = run_embedder_cost_eval(adapter, tracker)
+    assert result.signal == EmbedderCostSignal.NOT_APPLICABLE
+    assert result.error is not None
 
 
 def test_query_parses_records_and_reports_not_applicable_conflict_signal() -> None:
