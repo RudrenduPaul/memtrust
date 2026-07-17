@@ -727,6 +727,52 @@ class UpdateResult:
 
 
 @dataclass
+class RawFilterProbeResult:
+    """Result of MemoryBackendAdapter.probe_raw_filter() -- a single,
+    caller-controlled filter dict submitted directly to this backend's
+    underlying vector-store filter-query-building layer, bypassing the
+    normal session-scoped query()'s hardcoded `{"user_id": session_id}`
+    filter. This is the primitive evals/filter_injection.py needs to
+    reproduce mem0ai/mem0#5980's exact injection shape (a dict/list-valued
+    filter value that could embed arbitrary Elasticsearch query operators
+    into a `term` query) against a real backend's own filter-building code,
+    not a memtrust reimplementation of it.
+    """
+
+    accepted: bool
+    """True if the underlying call completed without raising -- the
+    backend's filter-building layer accepted this filter value as given,
+    whatever its type. False if it raised (a validation rejection, a
+    malformed-query error from the vendor's own client, or any other
+    exception) -- see `error` for detail. This is a raw pass/fail
+    observation only, not itself a judgment of "safe" vs "vulnerable":
+    evals/filter_injection.py's FilterInjectionSignal makes that judgment
+    by cross-referencing `accepted` against each case's known-malicious/
+    known-benign ground truth, the same way ExtractionQualitySignal
+    cross-references a case's `should_be_stored` ground truth rather than
+    treating "retrievable" as inherently good or bad."""
+    error: str | None = None
+    """The caught exception's message when accepted is False, else None."""
+    applicable: bool = True
+    """False when the probe never actually reached the vector store's
+    filter-building call at all -- e.g. a construction-time config
+    rejection (a missing embedding-dimension config, a missing
+    Elasticsearch credential) failed before `filters` was ever submitted
+    to anything. Distinct from `accepted=False`, which means the call DID
+    reach the filter-building layer and that layer rejected the value.
+    Without this distinction, a case that never got a real filter-
+    validation verdict (construction failed) would be indistinguishable
+    from one the backend genuinely rejected on the filter's own merits --
+    evals/filter_injection.py's classify_filter_injection_case() checks
+    this first and reports FilterInjectionSignal.NOT_APPLICABLE whenever
+    it is False, before ever looking at `accepted`."""
+    raw: dict[str, object] = field(default_factory=dict)
+    """Best-effort raw detail from a successful call (e.g. a truncated
+    repr of the vendor response), kept for audit purposes only -- never
+    used for scoring."""
+
+
+@dataclass
 class DeleteResult:
     """Result of MemoryBackendAdapter.delete().
 
@@ -811,6 +857,19 @@ class MemoryBackendAdapter(ABC):
     #: this gates, and docs/methodology.md for why that eval cannot prove
     #: anything about a real backend's process-lifecycle behavior.
     supports_crash_recovery_simulation: bool = False
+
+    #: Whether this adapter can submit an arbitrary, caller-controlled
+    #: filter dict directly to the underlying vector store's own
+    #: filter-query-building layer, bypassing query()'s hardcoded
+    #: `{"user_id": session_id}` filter, via probe_raw_filter() below.
+    #: Defaults to False -- every real, HTTP-only adapter in this repo has
+    #: no documented way to submit a raw, unvalidated filter value outside
+    #: its own normal session-scoped query() path. Only Mem0DirectAdapter,
+    #: which holds a direct, in-process handle to the vendor library
+    #: including its constructed vector_store, can genuinely reach into
+    #: that layer -- see evals/filter_injection.py, the eval this gates,
+    #: and mem0_direct_adapter.py's probe_raw_filter() override.
+    supports_raw_filter_probe: bool = False
 
     @abstractmethod
     def store(
@@ -1040,6 +1099,28 @@ class MemoryBackendAdapter(ABC):
         raise NotImplementedError(
             f"{self.name} does not implement raw_store_contains() "
             f"(supports_crash_recovery_simulation={self.supports_crash_recovery_simulation})"
+        )
+
+    def probe_raw_filter(self, filters: dict[str, object]) -> RawFilterProbeResult:
+        """Submit `filters` directly to this backend's underlying
+        vector-store filter-query-building layer, bypassing the normal
+        session-scoped query()'s hardcoded `{"user_id": session_id}`
+        filter -- the primitive evals/filter_injection.py needs to probe
+        whether a dict/list-valued filter value (the mem0ai/mem0#5980
+        injection shape) is validated before being embedded into a query.
+
+        Optional capability, same convention as list_resource_paths()/
+        trigger_resync()/simulate_crash_restart() above -- default raises
+        NotImplementedError, only adapters with supports_raw_filter_probe
+        = True are expected to override it.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_raw_filter_probe is False).
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement probe_raw_filter() "
+            f"(supports_raw_filter_probe={self.supports_raw_filter_probe})"
         )
 
     @staticmethod

@@ -36,6 +36,16 @@ surface:
      filtering assuming similarity (higher=better) when a vector store
      returns raw distance (lower=better), silently inverting which results
      pass the threshold.
+  8. mem0ai/mem0#5980 (merged, GitHub user HrushiYadav; confirmed fixed in
+     the installed Python package -- see "Elasticsearch support" below) --
+     `ElasticsearchVectorStore` embedded caller-supplied filter values
+     directly into Elasticsearch `term` queries with no type validation, so
+     a dict/list-valued filter value (e.g. `{"user_id": {"$ne": ""}}`)
+     could inject arbitrary Elasticsearch query-DSL operators, enabling
+     access-control bypass / cross-user memory enumeration. Part of a
+     coordinated 5-backend injection-prevention series covering
+     elasticsearch/neptune/azure/opensearch/databricks; this adapter and
+     its eval only concern the elasticsearch fix.
 
 ## Confidence and what was actually confirmed against the real package
 
@@ -145,6 +155,58 @@ parameter (forwarded straight through to `Memory.search()`) is what makes
 this reachable through this adapter at all -- the same role
 `Mem0SelfHostedAdapter.query()`'s `threshold` parameter plays over REST.
 
+**Elasticsearch support (`vector_store_provider="elasticsearch"`) and
+#5980 -- confirmed fixed in the installed package, by reading
+`mem0.vector_stores.elasticsearch` and `mem0.configs.vector_stores.elasticsearch`
+source directly, not by trusting the GitHub PR's "merged" status.**
+`mem0/vector_stores/elasticsearch.py` defines a module-level
+`_validate_filter(key, value)` helper (compiled against
+`_SAFE_FILTER_KEY = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")` for the key,
+and `isinstance(value, (str, int, float, bool))` for the value) and calls
+it on every `(key, value)` pair immediately before building a `{"term":
+{f"metadata.{key}": value}}` clause, in all three places
+`ElasticsearchDB` constructs term-query filter clauses:
+`search()` (the KNN pre-filter path), `keyword_search()` (the BM25 path),
+and `list()`. A dict/list-valued filter -- the exact #5980 shape, e.g.
+`{"user_id": {"$ne": ""}}` -- fails the `isinstance` check and raises
+`ValueError` before the query is ever built or sent to the Elasticsearch
+client, closing the access-control-bypass/cross-user-enumeration path the
+issue describes. This was confirmed against real, merged upstream state:
+`gh pr view 5980 --repo mem0ai/mem0` shows PR #5980 ("fix(elasticsearch):
+validate filter keys and values to prevent term injection", author
+HrushiYadav, merged 2026-07-02, closing #5976) describes exactly this
+`_validate_filter()` addition, and the installed `mem0ai==2.0.12` source
+matches that description line for line -- this is not a case where the
+issue says "merged" but the pinned version predates the fix.
+`tests/test_mem0_direct_adapter.py` exercises the real, installed
+`mem0.vector_stores.elasticsearch.ElasticsearchDB` class directly (mocking
+only the `elasticsearch.Elasticsearch` wire client) with both a benign,
+scalar-valued filter (accepted, forwarded to a real `client.search()`
+call) and a malicious dict-valued filter (rejected with `ValueError`
+before the client is ever touched) -- see `evals/filter_injection.py` for
+the harness-level eval built on top of this, via
+`Mem0DirectAdapter.probe_raw_filter()` and `MemoryBackendAdapter.
+supports_raw_filter_probe`. `ElasticsearchConfig.embedding_model_dims`
+(`mem0/configs/vector_stores/elasticsearch.py`) is a plain `int` field
+defaulting to `1536`, the same field name Redis/Valkey/Qdrant configs use
+-- `_build_vector_store_config()` below threads the resolved embedder
+dimension into it the same defensive way it already does for the other
+three providers, so this adapter never relies on that 1536 default either.
+`ElasticsearchConfig` also requires either `cloud_id` or `host`, and
+either `api_key` or `user`+`password` (a `model_validator(mode="before")`
+raises `ValueError` otherwise) -- this adapter threads
+`MEM0_DIRECT_VECTOR_STORE_URL`/`MEM0_DIRECT_ELASTICSEARCH_URL` into
+`host` and an optional `MEM0_DIRECT_ELASTICSEARCH_API_KEY` into `api_key`,
+but does not synthesize a fake credential when neither is set: a caller
+who configures `vector_store_provider="elasticsearch"` with no API key
+and no `user`/`password` override in `vector_store_config` gets a real
+`pydantic.ValidationError` from the installed package at first use,
+caught and reported as `CorruptionSignal.CONFIG_REJECTED` -- the same
+honest "fail loudly and specifically" shape Valkey's missing-dims case
+already establishes above, not a bug this adapter works around silently.
+This adapter has never been run against a live Elasticsearch cluster in
+this environment -- see "What this adapter is NOT" below.
+
 **mem0ai#3558 (Kuzu) cannot be reproduced against the installed package --
 the code path it lived in does not exist here.** This was the one
 surprising finding of this build: `mem0ai==2.0.12`'s `MemoryConfig`
@@ -191,15 +253,20 @@ not being claimed.
 
 It does not support `graph_store` (see above -- refused outright, loudly).
 It does not implement every vector-store or embedder provider mem0 ships,
-only the ones the seven motivating bugs concern: embedders `openai`,
+only the ones the eight motivating bugs concern: embedders `openai`,
 `aws_bedrock`, `gemini`, `fastembed`; vector stores `redis`, `valkey`,
-`qdrant`. It has never been run against a live backend of any kind in this
-environment -- every test mocks the vendor SDK/wire-client boundary, same
-convention `docs/methodology.md` already documents for `mem0_adapter.py`.
-`query()`'s `threshold` parameter is forwarded to the real
-`Memory.search()` unexercised against a live Qdrant server -- see the
+`qdrant`, `elasticsearch`. It has never been run against a live backend of
+any kind in this environment -- every test mocks the vendor SDK/wire-client
+boundary, same convention `docs/methodology.md` already documents for
+`mem0_adapter.py`. `query()`'s `threshold` parameter is forwarded to the
+real `Memory.search()` unexercised against a live Qdrant server -- see the
 Qdrant support section above for exactly what was and was not confirmed
-about #4297/#4453 against the installed package alone.
+about #4297/#4453 against the installed package alone. `probe_raw_filter()`
+(see base.py) is exercised against the real, installed
+`mem0.vector_stores.elasticsearch.ElasticsearchDB` class with the
+`Elasticsearch` wire client mocked, never against a live Elasticsearch
+cluster -- see the Elasticsearch support section above for exactly what
+was and was not confirmed about #5980 against the installed package alone.
 
 ## Configuration
 
@@ -217,16 +284,27 @@ fallback):
   * `gemini` -> `GOOGLE_API_KEY`
   * `fastembed` -> none (local ONNX model, no credential)
 
-`MEM0_DIRECT_VECTOR_STORE_PROVIDER` (`redis`, `valkey`, or `qdrant`, default
-`redis`) selects the vector store; `MEM0_DIRECT_VECTOR_STORE_URL` (or the
-provider-specific `MEM0_DIRECT_QDRANT_URL`/`MEM0_DIRECT_REDIS_URL`/
-`MEM0_DIRECT_VALKEY_URL`) is required for whichever one is selected.
-`MEM0_DIRECT_EMBEDDING_DIMS` optionally overrides the per-provider default
-dimension count threaded into both the embedder config and the vector
-store config (including Qdrant's `embedding_model_dims`, which otherwise
-defaults to a hardcoded `1536` in the installed package -- see the Qdrant
-support section above), so they never silently disagree. `query()` also
-accepts an optional `threshold` keyword argument, forwarded straight
+`MEM0_DIRECT_VECTOR_STORE_PROVIDER` (`redis`, `valkey`, `qdrant`, or
+`elasticsearch`, default `redis`) selects the vector store;
+`MEM0_DIRECT_VECTOR_STORE_URL` (or the provider-specific
+`MEM0_DIRECT_QDRANT_URL`/`MEM0_DIRECT_REDIS_URL`/`MEM0_DIRECT_VALKEY_URL`/
+`MEM0_DIRECT_ELASTICSEARCH_URL`) is required for whichever one is selected
+-- for `elasticsearch` this value is threaded into `ElasticsearchConfig.host`,
+not a `url` field (the installed config class has no such field; see the
+Elasticsearch support section above), or a caller may instead pass an
+explicit `cloud_id` via `vector_store_config` for Elastic Cloud. An
+optional `MEM0_DIRECT_ELASTICSEARCH_API_KEY` is threaded into
+`ElasticsearchConfig.api_key`; the installed package's own validator
+requires either that or a `user`+`password` override in
+`vector_store_config`, and raises loudly if neither is present (see
+Elasticsearch support section above). `MEM0_DIRECT_EMBEDDING_DIMS`
+optionally overrides the per-provider default dimension count threaded
+into both the embedder config and the vector store config (including
+Qdrant's and Elasticsearch's `embedding_model_dims`, which both otherwise
+default to a hardcoded `1536` in the installed package -- see the Qdrant
+and Elasticsearch support sections above), so they never silently
+disagree. `query()` also accepts an optional `threshold` keyword argument,
+forwarded straight
 through to the real `Memory.search()`.
 """
 
@@ -246,6 +324,7 @@ from memtrust.adapters.base import (
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
+    RawFilterProbeResult,
     StoreResult,
     UpdateResult,
 )
@@ -257,11 +336,27 @@ from memtrust.adapters.base import (
 SUPPORTED_EMBEDDER_PROVIDERS = ("openai", "aws_bedrock", "gemini", "fastembed")
 
 #: The vector store providers this adapter wires up: `redis`/`valkey` for
-#: mem0ai#4362 (vector-zeroed-on-metadata-update), and `qdrant` for
+#: mem0ai#4362 (vector-zeroed-on-metadata-update), `qdrant` for
 #: mem0ai#4297 (embedding-dimension mismatch) and mem0ai#4453 (search-
-#: threshold inversion) -- see module docstring for what this build
-#: actually confirmed about each against the installed package.
-SUPPORTED_VECTOR_STORE_PROVIDERS = ("redis", "valkey", "qdrant")
+#: threshold inversion), and `elasticsearch` for mem0ai#5980 (filter-value
+#: term-injection) -- see module docstring for what this build actually
+#: confirmed about each against the installed package.
+SUPPORTED_VECTOR_STORE_PROVIDERS = ("redis", "valkey", "qdrant", "elasticsearch")
+
+#: Field name each installed `mem0.configs.vector_stores.*` config class
+#: uses for its connection endpoint, confirmed by reading all four
+#: installed config classes directly -- `redis`/`valkey` name it
+#: `redis_url`/`valkey_url`, `qdrant` names it plain `url`, and
+#: `elasticsearch` has no `url` field at all, only `host`/`port`/`cloud_id`
+#: (see module docstring's Elasticsearch support section). Shared by
+#: `__init__`'s configuration presence-check and `_build_vector_store_config`
+#: below so the two never disagree about which key a given provider uses.
+_VECTOR_STORE_URL_KEYS: dict[str, str] = {
+    "redis": "redis_url",
+    "valkey": "valkey_url",
+    "qdrant": "url",
+    "elasticsearch": "host",
+}
 
 #: Per-provider embedding dimension defaults, used only when neither
 #: `embedder_config`/`vector_store_config` nor `MEM0_DIRECT_EMBEDDING_DIMS`
@@ -331,6 +426,18 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
     name = "mem0_direct"
     env_var = "MEM0_DIRECT_EMBEDDER_PROVIDER"
     supports_update = True
+    supports_raw_filter_probe = True
+    """This adapter holds a direct, in-process handle to the real
+    `mem0.Memory` object, including its constructed `vector_store` -- see
+    `probe_raw_filter()` below, which calls straight into
+    `vector_store.list(filters=...)`, bypassing `query()`'s hardcoded
+    `{"user_id": session_id}` filter. True unconditionally (not gated to
+    `vector_store_provider="elasticsearch"`): every installed vector-store
+    class this adapter wires up implements the same `list(filters=...)`
+    signature (`mem0.vector_stores.base.VectorStoreBase.list`), so the
+    probe itself always works -- what differs per provider is whether the
+    underlying store validates the filter value before using it, which is
+    exactly the fact evals/filter_injection.py exists to surface."""
 
     def __init__(
         self,
@@ -394,12 +501,17 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
             raise BackendAPIError(
                 self.name,
                 f"unsupported vector_store_provider {resolved_vector_store_provider!r}; this "
-                f"adapter only wires up {SUPPORTED_VECTOR_STORE_PROVIDERS} -- the two "
-                "mem0ai/mem0#4362 concerns. See module docstring.",
+                f"adapter only wires up {SUPPORTED_VECTOR_STORE_PROVIDERS} -- the ones "
+                "mem0ai/mem0#4362, #4297, #4453, and #5980 concern. See module docstring.",
             )
         url_env_var = f"MEM0_DIRECT_{resolved_vector_store_provider.upper()}_URL"
         resolved_url = os.environ.get("MEM0_DIRECT_VECTOR_STORE_URL") or os.environ.get(url_env_var)
-        if not resolved_url and "url" not in (vector_store_config or {}):
+        url_key = _VECTOR_STORE_URL_KEYS[resolved_vector_store_provider]
+        _configured_via_vector_store_config = url_key in (vector_store_config or {}) or (
+            resolved_vector_store_provider == "elasticsearch"
+            and "cloud_id" in (vector_store_config or {})
+        )
+        if not resolved_url and not _configured_via_vector_store_config:
             raise BackendNotConfiguredError(self.name, "MEM0_DIRECT_VECTOR_STORE_URL")
         built_vector_store_config = _build_vector_store_config(
             resolved_vector_store_provider,
@@ -692,6 +804,44 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
             raise BackendAPIError(self.name, str(exc)) from exc
         return DeleteResult(success=True, memory_id=memory_id, latency_ms=timer.elapsed_ms())
 
+    def probe_raw_filter(self, filters: dict[str, object]) -> RawFilterProbeResult:
+        """Submit `filters` directly to `self._memory.vector_store.list()`,
+        the real, installed vector store's own filter-query-building layer
+        -- bypassing `query()`'s hardcoded `{"user_id": session_id}` filter
+        entirely. `list()` is used rather than `search()` because it needs
+        no query embedding (`mem0.vector_stores.base.VectorStoreBase.list`
+        takes only `filters`/`top_k`), so this probes the filter-building
+        layer in isolation, without also depending on the embedder being
+        configured/reachable. This is the primitive
+        evals/filter_injection.py needs to reproduce mem0ai/mem0#5980's
+        exact injection shape (a dict/list-valued filter value) against the
+        real, installed `mem0.vector_stores.elasticsearch.ElasticsearchDB`
+        -- see this module's docstring, "Elasticsearch support" section.
+
+        A construction-time config rejection (e.g. Valkey's missing
+        `embedding_model_dims`, or Elasticsearch's missing auth credential
+        -- see module docstring) is reported as `accepted=False` here too,
+        same as any other exception this call can raise -- it is not
+        itself evidence about filter validation, but it is not silently
+        swallowed either.
+        """
+        try:
+            memory = self._get_memory()
+        except ValueError as exc:
+            # Never reached the vector store's filter-building layer at
+            # all -- applicable=False, not a filter-validation verdict.
+            return RawFilterProbeResult(
+                accepted=False, error=f"config rejected: {exc}", applicable=False, raw={}
+            )
+        vector_store = memory.vector_store
+        try:
+            result = vector_store.list(filters=dict(filters))
+        except Exception as exc:  # noqa: BLE001 - real vendor call, classify uniformly
+            return RawFilterProbeResult(accepted=False, error=str(exc), raw={})
+        return RawFilterProbeResult(
+            accepted=True, error=None, raw={"result_repr": repr(result)[:500]}
+        )
+
     def _get_memory_or_raise_backend_error(self) -> _MemoryProtocol:
         try:
             return self._get_memory()
@@ -748,16 +898,22 @@ def _build_vector_store_config(
     config: dict[str, object] = dict(vector_store_config)
     # `mem0.configs.vector_stores.{redis,valkey}.py` name their URL field
     # `redis_url`/`valkey_url`; `mem0.configs.vector_stores.qdrant.QdrantConfig`
-    # names it plain `url` -- confirmed by reading all three installed
-    # config classes directly.
-    if provider == "redis":
-        url_key = "redis_url"
-    elif provider == "valkey":
-        url_key = "valkey_url"
-    else:
-        url_key = "url"
+    # names it plain `url`; `mem0.configs.vector_stores.elasticsearch.
+    # ElasticsearchConfig` has no `url` field at all, only `host` (plus
+    # `port`/`cloud_id`) -- confirmed by reading all four installed config
+    # classes directly. See _VECTOR_STORE_URL_KEYS above.
+    url_key = _VECTOR_STORE_URL_KEYS[provider]
     if url_key not in config and resolved_url is not None:
         config[url_key] = resolved_url
+    if provider == "elasticsearch" and "api_key" not in config and "user" not in config:
+        # ElasticsearchConfig.validate_auth requires api_key OR user+password
+        # -- threaded only when actually set (never a fake/empty credential;
+        # a caller with neither gets a real, honest pydantic.ValidationError
+        # from the installed package at first use -- see module docstring's
+        # Elasticsearch support section).
+        env_api_key = os.environ.get("MEM0_DIRECT_ELASTICSEARCH_API_KEY")
+        if env_api_key:
+            config["api_key"] = env_api_key
     if "embedding_model_dims" not in config:
         config["embedding_model_dims"] = resolved_dims
     config.setdefault("collection_name", "memtrust_mem0_direct")
