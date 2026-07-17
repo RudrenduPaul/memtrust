@@ -62,6 +62,21 @@ OpenViking's real server-side reindex bug without a live instance.
 Gated on OPENVIKING_API_KEY, matching the project's hosted "OpenViking
 Studio" offering; OPENVIKING_BASE_URL may override the default host to
 point at a self-hosted server instead.
+
+On volcengine/OpenViking#1523 (contributor A0nameless0man: an embedder
+migration silently degrades search quality mid-migration -- switching
+embedding models overwrites vectors in place with no dimension/model
+validation): the `/v1/search` response shape documented and confirmed
+during this build (see the top of this docstring) surfaces `path`,
+`content`/`snippet`, `score`, `updated_at`, and `metadata` per result --
+nothing that identifies which embedding model or vector dimensionality
+produced a given record. `query()` above therefore cannot report
+`MemoryRecord.embedding_model`/`embedding_dims` (see adapters/base.py) for
+real OpenViking responses; both stay at their default `None`. This is why
+#1523 is scored at the harness level instead, against fake adapters
+engineered to reproduce its exact bug shape -- see
+evals/embedding_drift.py and docs/methodology.md for the eval and its
+honest scope.
 """
 
 from __future__ import annotations
