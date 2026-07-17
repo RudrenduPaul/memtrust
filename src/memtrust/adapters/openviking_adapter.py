@@ -93,6 +93,14 @@ process-lifecycle control, the crash-recovery eval only ever runs
 against a purpose-built fake adapter that models #2644's shape; see
 evals/crash_recovery.py's module docstring and docs/methodology.md for
 exactly what that does and does not prove.
+
+`supports_stats = True`: get_stats() hits `GET /api/v1/stats/memories`
+and reads its `total_memories` field. Confidence HIGH on this specific
+endpoint and response shape -- both are quoted verbatim in volcengine/
+OpenViking#1255's bug report (contributor SeeYangZhi), which is also the
+motivating case: the endpoint silently returns an all-zero count even
+when filesystem listing and `/v1/search` both independently confirm real
+memories exist. See evals/stats_accuracy.py, the eval this feeds.
 """
 
 from __future__ import annotations
@@ -109,6 +117,7 @@ from memtrust.adapters.base import (
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
+    StatsResult,
     StoreResult,
     UpdateResult,
 )
@@ -144,6 +153,7 @@ class OpenVikingAdapter(MemoryBackendAdapter):
     env_var = "OPENVIKING_API_KEY"
     supports_update = True
     supports_resource_sync = True
+    supports_stats = True
 
     def __init__(self, base_url: str | None = None, timeout: float = 30.0) -> None:
         api_key = os.environ.get(self.env_var)
@@ -334,6 +344,37 @@ class OpenVikingAdapter(MemoryBackendAdapter):
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             raise BackendAPIError(self.name, _error_detail(exc)) from exc
+
+    def get_stats(self, session_id: str | None = None) -> StatsResult:
+        """Read OpenViking's dedicated stats/dashboard endpoint.
+
+        Confidence: HIGH on the endpoint path and response shape --
+        `GET /api/v1/stats/memories` and its `total_memories` field are
+        confirmed verbatim from volcengine/OpenViking#1255's real bug
+        report (contributor SeeYangZhi), which pastes the exact JSON
+        response shape this parses. Distinct from the LOW-confidence
+        guessed `/v1/fs/write`/`/v1/search` endpoints elsewhere in this
+        adapter (see the module docstring): this path was never confirmed
+        against a live instance either, but the exact response shape comes
+        from a real, reproduced report rather than being inferred by
+        analogy.
+
+        `session_id` is accepted for interface compatibility with
+        MemoryBackendAdapter.get_stats() but ignored -- the real endpoint
+        this targets is a tenant-wide/global counter (per #1255's report),
+        not session-scoped, so there is nothing to pass it as.
+        """
+        del session_id
+        timer = self._timed()
+        try:
+            resp = self._http.get("/api/v1/stats/memories")
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as exc:
+            raise BackendAPIError(self.name, _error_detail(exc)) from exc
+        total = data.get("total_memories")
+        total_memories = int(total) if isinstance(total, int | float) else None
+        return StatsResult(total_memories=total_memories, latency_ms=timer.elapsed_ms(), raw=data)
 
     def close(self) -> None:
         self._http.close()
