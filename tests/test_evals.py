@@ -25,6 +25,7 @@ from memtrust.adapters.base import (
     MemoryRecord,
     QueryResult,
     RankingSignal,
+    RawFilterProbeResult,
     RetrievalWarning,
     StoreResult,
     UpdateResult,
@@ -61,6 +62,15 @@ from memtrust.evals.extraction_quality import (
 )
 from memtrust.evals.extraction_quality import (
     load_dataset as load_extraction_quality_dataset,
+)
+from memtrust.evals.filter_injection import (
+    FilterInjectionCase,
+    FilterInjectionSignal,
+    classify_filter_injection_case,
+    run_filter_injection_eval,
+)
+from memtrust.evals.filter_injection import (
+    load_dataset as load_filter_injection_dataset,
 )
 from memtrust.evals.locomo import load_dataset as load_locomo_dataset
 from memtrust.evals.locomo import load_exclude_question_ids as load_locomo_exclude_question_ids
@@ -2232,3 +2242,168 @@ def test_extraction_quality_registered_in_eval_list() -> None:
     from memtrust.cli import ALL_EVALS
 
     assert "extraction_quality" in ALL_EVALS
+
+
+# ---------------------------------------------------------------------------
+# Filter-Injection eval (evals/filter_injection.py) -- mem0ai/mem0#5980.
+# Structurally validated here against hand-written fake adapters, the same
+# convention evals/crash_recovery.py's CrashRecoveryFakeAdapter family
+# establishes -- proving the classification logic itself correctly tells a
+# safe (rejecting) backend apart from a vulnerable (accepting) one. The
+# real, installed mem0.vector_stores.elasticsearch.ElasticsearchDB is
+# exercised separately, directly, in tests/test_mem0_direct_adapter.py.
+# ---------------------------------------------------------------------------
+
+
+class FilterInjectionUnsupportedFakeAdapter(MemoryBackendAdapter):
+    """supports_raw_filter_probe defaults to False -- models every adapter
+    in this repo except Mem0DirectAdapter, none of which have a raw
+    filter-building layer a caller can reach directly."""
+
+    name = "fake-filter-injection-unsupported"
+    env_var = "FAKE_API_KEY"
+
+    def store(
+        self, session_id: str, content: str, metadata: dict[str, str] | None = None
+    ) -> StoreResult:
+        return StoreResult(memory_id="m1", latency_ms=0.1)
+
+    def query(self, session_id: str, query: str, top_k: int = 5) -> QueryResult:
+        return QueryResult(
+            records=[], conflict_signal=ConflictSignal.NOT_APPLICABLE, latency_ms=0.1
+        )
+
+    def update(self, session_id: str, memory_id: str, content: str) -> UpdateResult:
+        return UpdateResult(memory_id=memory_id, acknowledged=True, latency_ms=0.1)
+
+    def delete(self, memory_id: str) -> DeleteResult:
+        return DeleteResult(success=True, memory_id=memory_id, latency_ms=0.1)
+
+
+class FilterInjectionSafeFakeAdapter(FilterInjectionUnsupportedFakeAdapter):
+    """Models a backend whose filter-building layer validates values before
+    use -- the fixed shape mem0ai/mem0#5980's real ElasticsearchDB now
+    exhibits (see module docstring and tests/test_mem0_direct_adapter.py
+    for that exact real-package confirmation): a scalar filter value is
+    accepted, a dict/list value raises."""
+
+    name = "fake-filter-injection-safe"
+    supports_raw_filter_probe = True
+
+    def probe_raw_filter(self, filters: dict[str, object]) -> RawFilterProbeResult:
+        for value in filters.values():
+            if isinstance(value, dict | list):
+                return RawFilterProbeResult(
+                    accepted=False, error=f"unsafe filter value type: {type(value).__name__}"
+                )
+        return RawFilterProbeResult(accepted=True)
+
+
+class FilterInjectionVulnerableFakeAdapter(FilterInjectionUnsupportedFakeAdapter):
+    """Models a backend whose filter-building layer trusts every value
+    unconditionally -- the exact vulnerable pre-fix #5980 shape. This eval
+    must classify every malicious case here as INJECTION_SUCCEEDED, never
+    a false FILTER_REJECTED."""
+
+    name = "fake-filter-injection-vulnerable"
+    supports_raw_filter_probe = True
+
+    def probe_raw_filter(self, filters: dict[str, object]) -> RawFilterProbeResult:
+        return RawFilterProbeResult(accepted=True)
+
+
+class FilterInjectionNotApplicableFakeAdapter(FilterInjectionUnsupportedFakeAdapter):
+    """Models a backend whose probe never reaches the filter-building layer
+    at all (e.g. a construction-time config rejection) -- applicable=False
+    regardless of accepted, so every case must land on NOT_APPLICABLE, not
+    be misread as a real rejection/acceptance verdict."""
+
+    name = "fake-filter-injection-not-applicable"
+    supports_raw_filter_probe = True
+
+    def probe_raw_filter(self, filters: dict[str, object]) -> RawFilterProbeResult:
+        return RawFilterProbeResult(
+            accepted=False, error="config rejected: no credential", applicable=False
+        )
+
+
+def test_filter_injection_dataset_loads() -> None:
+    cases = load_filter_injection_dataset()
+    assert len(cases) >= 4
+    assert any(c.malicious for c in cases)
+    assert any(not c.malicious for c in cases)
+
+
+@pytest.mark.parametrize(
+    ("malicious", "accepted", "applicable", "expected"),
+    [
+        (True, False, True, FilterInjectionSignal.FILTER_REJECTED),
+        (True, True, True, FilterInjectionSignal.INJECTION_SUCCEEDED),
+        (False, True, True, FilterInjectionSignal.FILTER_ACCEPTED_SAFELY),
+        (False, False, True, FilterInjectionSignal.FILTER_REJECTED),
+        (True, False, False, FilterInjectionSignal.NOT_APPLICABLE),
+        (True, True, False, FilterInjectionSignal.NOT_APPLICABLE),
+        (False, False, False, FilterInjectionSignal.NOT_APPLICABLE),
+    ],
+)
+def test_classify_filter_injection_case_matrix(
+    malicious: bool, accepted: bool, applicable: bool, expected: FilterInjectionSignal
+) -> None:
+    case = FilterInjectionCase(
+        case_id="c1", malicious=malicious, filter_key="user_id", filter_value="x"
+    )
+    probe = RawFilterProbeResult(accepted=accepted, applicable=applicable)
+    assert classify_filter_injection_case(case, probe) == expected
+
+
+def test_filter_injection_eval_skips_cleanly_for_unsupported_adapter() -> None:
+    adapter = FilterInjectionUnsupportedFakeAdapter()
+    result = run_filter_injection_eval(adapter)
+    assert result.skipped is True
+    assert result.case_results == []
+    assert result.injection_succeeded_rate is None
+
+
+def test_filter_injection_eval_safe_adapter_rejects_all_malicious_accepts_all_benign() -> None:
+    adapter = FilterInjectionSafeFakeAdapter()
+    result = run_filter_injection_eval(adapter)
+    assert result.skipped is False
+    assert result.injection_succeeded_rate == 0.0
+    assert result.malicious_rejected_rate == 1.0
+    assert result.benign_accepted_rate == 1.0
+    assert result.benign_false_positive_rate == 0.0
+    for case_result in result.case_results:
+        if case_result.case.malicious:
+            assert case_result.signal == FilterInjectionSignal.FILTER_REJECTED
+        else:
+            assert case_result.signal == FilterInjectionSignal.FILTER_ACCEPTED_SAFELY
+
+
+def test_filter_injection_eval_vulnerable_adapter_flags_every_malicious_case() -> None:
+    adapter = FilterInjectionVulnerableFakeAdapter()
+    result = run_filter_injection_eval(adapter)
+    assert result.skipped is False
+    assert result.injection_succeeded_rate == 1.0
+    assert result.malicious_rejected_rate == 0.0
+    # A vulnerable backend that accepts everything unconditionally still
+    # accepts every benign case too -- that half is not itself a bug.
+    assert result.benign_accepted_rate == 1.0
+    for case_result in result.malicious_case_results:
+        assert case_result.signal == FilterInjectionSignal.INJECTION_SUCCEEDED
+
+
+def test_filter_injection_eval_not_applicable_adapter_never_scores_a_verdict() -> None:
+    adapter = FilterInjectionNotApplicableFakeAdapter()
+    result = run_filter_injection_eval(adapter)
+    assert result.skipped is False
+    assert result.injection_succeeded_rate == 0.0
+    assert result.malicious_rejected_rate == 0.0
+    assert result.benign_accepted_rate == 0.0
+    for case_result in result.case_results:
+        assert case_result.signal == FilterInjectionSignal.NOT_APPLICABLE
+
+
+def test_filter_injection_registered_in_eval_list() -> None:
+    from memtrust.cli import ALL_EVALS
+
+    assert "filter_injection" in ALL_EVALS

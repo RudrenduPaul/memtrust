@@ -54,6 +54,7 @@ pytest.importorskip("fastembed")
 pytest.importorskip("redis")
 pytest.importorskip("valkey")
 pytest.importorskip("qdrant_client")
+pytest.importorskip("elasticsearch")
 
 from memtrust.adapters.base import (  # noqa: E402
     BackendAPIError,
@@ -389,7 +390,7 @@ def test_rejects_unsupported_vector_store_provider(monkeypatch: pytest.MonkeyPat
 
 def test_supported_provider_tuples_match_the_bugs_this_adapter_targets() -> None:
     assert SUPPORTED_EMBEDDER_PROVIDERS == ("openai", "aws_bedrock", "gemini", "fastembed")
-    assert SUPPORTED_VECTOR_STORE_PROVIDERS == ("redis", "valkey", "qdrant")
+    assert SUPPORTED_VECTOR_STORE_PROVIDERS == ("redis", "valkey", "qdrant", "elasticsearch")
 
 
 # ---------------------------------------------------------------------------
@@ -885,3 +886,261 @@ def test_hypothetical_raw_distance_scores_would_invert_threshold_filtering() -> 
     # (raw distance 0.05) is wrongly dropped and the FARTHEST (0.95) kept.
     assert kept_ids == {"actually_far"}
     assert "actually_close" not in kept_ids
+
+
+# ---------------------------------------------------------------------------
+# Elasticsearch support: adapter-level config-building tests for
+# vector_store_provider="elasticsearch" -- see mem0_direct_adapter.py's
+# module docstring for the #5980 finding these exist to make reachable.
+# ---------------------------------------------------------------------------
+
+
+def test_elasticsearch_vector_store_config_threads_embedder_dims_into_embedding_model_dims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same defensive dimension-threading pattern already used for
+    redis/valkey/qdrant (see _build_vector_store_config) applies identically
+    to elasticsearch: the resolved embedder dimension is threaded into
+    `embedding_model_dims` explicitly, so this adapter never relies on
+    ElasticsearchConfig's own 1536 default.
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "elasticsearch")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "https://es.internal:9200")
+    monkeypatch.setenv("MEM0_DIRECT_ELASTICSEARCH_API_KEY", "fake-test-api-key")
+
+    adapter = Mem0DirectAdapter()
+
+    vector_store_config = adapter._config_dict["vector_store"]["config"]  # type: ignore[index]
+    assert vector_store_config["embedding_model_dims"] == 384  # fastembed's default
+    assert vector_store_config["host"] == "https://es.internal:9200"
+    assert vector_store_config["api_key"] == "fake-test-api-key"
+    assert adapter._config_dict["vector_store"]["provider"] == "elasticsearch"  # type: ignore[index]
+
+
+def test_elasticsearch_vector_store_url_env_var_is_provider_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MEM0_DIRECT_ELASTICSEARCH_URL (the provider-specific fallback) works
+    the same way MEM0_DIRECT_REDIS_URL/MEM0_DIRECT_VALKEY_URL/
+    MEM0_DIRECT_QDRANT_URL already do -- threaded into `host`, not `url`
+    (ElasticsearchConfig has no `url` field; see module docstring).
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "elasticsearch")
+    monkeypatch.delenv("MEM0_DIRECT_VECTOR_STORE_URL", raising=False)
+    monkeypatch.setenv("MEM0_DIRECT_ELASTICSEARCH_URL", "https://es.example.internal:9200")
+    monkeypatch.setenv("MEM0_DIRECT_ELASTICSEARCH_API_KEY", "fake-test-api-key")
+
+    adapter = Mem0DirectAdapter()
+
+    vector_store_config = adapter._config_dict["vector_store"]["config"]  # type: ignore[index]
+    assert vector_store_config["host"] == "https://es.example.internal:9200"
+    assert "url" not in vector_store_config
+
+
+def test_elasticsearch_cloud_id_override_satisfies_configuration_presence_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller who wants Elastic Cloud (`cloud_id`, no `host`) can pass it
+    via `vector_store_config` without needing MEM0_DIRECT_VECTOR_STORE_URL
+    set at all -- the presence check accepts `cloud_id` as an alternative
+    to the usual url_key, matching ElasticsearchConfig's own
+    `cloud_id`-or-`host` validator.
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "elasticsearch")
+    monkeypatch.delenv("MEM0_DIRECT_VECTOR_STORE_URL", raising=False)
+    monkeypatch.delenv("MEM0_DIRECT_ELASTICSEARCH_URL", raising=False)
+
+    adapter = Mem0DirectAdapter(
+        vector_store_config={"cloud_id": "test:deployment-id", "api_key": "fake-test-api-key"}
+    )
+
+    vector_store_config = adapter._config_dict["vector_store"]["config"]  # type: ignore[index]
+    assert vector_store_config["cloud_id"] == "test:deployment-id"
+    assert "host" not in vector_store_config
+
+
+def test_elasticsearch_without_url_or_cloud_id_raises_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "elasticsearch")
+    monkeypatch.delenv("MEM0_DIRECT_VECTOR_STORE_URL", raising=False)
+    monkeypatch.delenv("MEM0_DIRECT_ELASTICSEARCH_URL", raising=False)
+
+    with pytest.raises(BackendNotConfiguredError):
+        Mem0DirectAdapter()
+
+
+# ---------------------------------------------------------------------------
+# Real-package regression: mem0ai/mem0#5980 (Elasticsearch filter-value term
+# injection). Exercises the actual installed
+# mem0.vector_stores.elasticsearch.ElasticsearchDB and
+# mem0.configs.vector_stores.elasticsearch.ElasticsearchConfig classes
+# directly (mocking only the `elasticsearch.Elasticsearch` wire client), not
+# a memtrust reimplementation. See module docstring's "Elasticsearch
+# support" section: this bug class is confirmed FIXED in the installed
+# package.
+# ---------------------------------------------------------------------------
+
+
+def _real_elasticsearch_db(mock_client: MagicMock) -> Any:
+    """Constructs the real, installed ElasticsearchDB with the
+    elasticsearch.Elasticsearch wire client mocked out -- same pattern the
+    Qdrant real-package tests above use for QdrantClient.
+    """
+    from mem0.vector_stores.elasticsearch import ElasticsearchDB
+
+    with patch("mem0.vector_stores.elasticsearch.Elasticsearch", return_value=mock_client):
+        return ElasticsearchDB(
+            collection_name="memtrust_filter_injection_test",
+            host="https://es.internal",
+            port=9200,
+            api_key="fake-test-api-key",
+            embedding_model_dims=384,
+            auto_create_index=False,
+        )
+
+
+def test_real_elasticsearch_config_defaults_embedding_model_dims_to_1536() -> None:
+    """Pins the exact field default that makes the #4297 bug *class*
+    (embedding-dimension mismatch, not #5980's injection bug) possible for
+    elasticsearch too, in the installed mem0ai==2.0.12 Python package:
+    ElasticsearchConfig.embedding_model_dims defaults to 1536, the same
+    hardcoded OpenAI dimension QdrantConfig defaults to. If a future
+    mem0ai release changes this default, this test fails loudly, which is
+    the signal to revisit the module docstring's Elasticsearch support
+    finding.
+    """
+    from mem0.configs.vector_stores.elasticsearch import ElasticsearchConfig
+
+    config = ElasticsearchConfig(host="localhost", api_key="fake-test-api-key")
+    assert config.embedding_model_dims == 1536
+
+
+def test_real_elasticsearch_benign_scalar_filter_is_accepted_and_forwarded() -> None:
+    """Control case: an ordinary, single-user scalar filter (exactly what
+    Mem0DirectAdapter.query() itself sends) is accepted by the real,
+    installed ElasticsearchDB.list() and forwarded into a real
+    Elasticsearch term-query filter clause -- a fix for #5980 must not
+    reject this.
+    """
+    mock_client = MagicMock()
+    mock_client.search.return_value = {"hits": {"hits": []}}
+    db = _real_elasticsearch_db(mock_client)
+
+    results = db.list(filters={"user_id": "alice"})
+
+    assert results == [[]]
+    query_body = mock_client.search.call_args.kwargs["body"]
+    assert query_body["query"]["bool"]["must"] == [{"term": {"metadata.user_id": "alice"}}]
+
+
+def test_real_elasticsearch_malicious_dict_filter_is_rejected_before_reaching_client() -> None:
+    """Reproduces mem0ai/mem0#5980's literal example against the real,
+    installed ElasticsearchDB: a dict-valued filter for user_id
+    (`{"$ne": ""}`, designed to make an unvalidated term query match every
+    user) raises ValueError from the installed `_validate_filter()` helper
+    BEFORE the query is ever built or sent to the Elasticsearch client --
+    confirming the fix, not just trusting the PR's "merged" status.
+    """
+    mock_client = MagicMock()
+    db = _real_elasticsearch_db(mock_client)
+
+    with pytest.raises(ValueError, match="Filter value"):
+        db.list(filters={"user_id": {"$ne": ""}})
+
+    # The rejection happens before any query is ever built/sent -- the
+    # real Elasticsearch client is never touched for a malicious filter.
+    mock_client.search.assert_not_called()
+
+
+def test_real_elasticsearch_malicious_list_filter_is_rejected_before_reaching_client() -> None:
+    """Same #5980 shape, list-valued instead of dict-valued -- confirms the
+    real _validate_filter() rejects any non-scalar type, not just dict."""
+    mock_client = MagicMock()
+    db = _real_elasticsearch_db(mock_client)
+
+    with pytest.raises(ValueError, match="Filter value"):
+        db.list(filters={"user_id": ["victim-a", "victim-b"]})
+
+    mock_client.search.assert_not_called()
+
+
+def test_real_elasticsearch_malicious_key_is_also_rejected() -> None:
+    """The installed fix validates the filter KEY too (a regex allowlist),
+    not only the value -- confirms the key-injection half of #5980's fix
+    (`_SAFE_FILTER_KEY`) is present, not just the value-type half."""
+    mock_client = MagicMock()
+    db = _real_elasticsearch_db(mock_client)
+
+    with pytest.raises(ValueError, match="Invalid filter key"):
+        db.list(filters={"user_id) OR 1=1 --": "alice"})
+
+    mock_client.search.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Mem0DirectAdapter.probe_raw_filter() -- the primitive
+# evals/filter_injection.py calls. Adapter-level control-flow tests via the
+# memory= injection point (see _FakeMemory above), same layer-1 convention
+# as the rest of this file's non-real-package tests.
+# ---------------------------------------------------------------------------
+
+
+def test_probe_raw_filter_reports_accepted_true_when_vector_store_list_succeeds() -> None:
+    fake_vector_store = MagicMock()
+    fake_vector_store.list.return_value = [[]]
+    fake = _FakeMemory(vector_store=fake_vector_store)
+    adapter = Mem0DirectAdapter(memory=fake)
+
+    result = adapter.probe_raw_filter({"user_id": "alice"})
+
+    assert result.accepted is True
+    assert result.applicable is True
+    assert result.error is None
+    fake_vector_store.list.assert_called_once_with(filters={"user_id": "alice"})
+
+
+def test_probe_raw_filter_reports_accepted_false_when_vector_store_list_raises() -> None:
+    """Models a store whose filter-building layer rejects a malicious
+    value, the same shape the real, installed ElasticsearchDB exhibits --
+    see the real-package regression tests above for that exact case
+    exercised against the installed package instead of this fake."""
+    fake_vector_store = MagicMock()
+    fake_vector_store.list.side_effect = ValueError("Filter value for 'user_id' must be scalar")
+    fake = _FakeMemory(vector_store=fake_vector_store)
+    adapter = Mem0DirectAdapter(memory=fake)
+
+    result = adapter.probe_raw_filter({"user_id": {"$ne": ""}})
+
+    assert result.accepted is False
+    assert result.applicable is True
+    assert result.error is not None
+    assert "scalar" in result.error
+
+
+def test_probe_raw_filter_reports_not_applicable_construction_failure_via_applicable_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A construction-time config rejection (Valkey's missing
+    embedding_model_dims -- see the CONFIG_REJECTED tests above) never
+    reaches the vector store's filter-building layer at all -- accepted is
+    False, but applicable is also False, so
+    evals/filter_injection.py's classify_filter_injection_case() can tell
+    this apart from a genuine filter-validation rejection and report
+    NOT_APPLICABLE instead of crediting/blaming the filter value.
+    """
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_PROVIDER", "valkey")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "redis://localhost:6379")
+    adapter = Mem0DirectAdapter(embedder_config={"embedding_dims": None})
+
+    result = adapter.probe_raw_filter({"user_id": "alice"})
+
+    assert result.accepted is False
+    assert result.applicable is False
+    assert result.error is not None
+    assert "config rejected" in result.error

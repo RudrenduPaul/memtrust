@@ -37,6 +37,7 @@ from memtrust.evals.extraction_quality import (
     ExtractionQualityEvalResult,
     run_extraction_quality_eval,
 )
+from memtrust.evals.filter_injection import FilterInjectionEvalResult, run_filter_injection_eval
 from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
 from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
@@ -57,8 +58,8 @@ from memtrust.receipt import (
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 10
-#: evals now registered, the `report` table has 12 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 11
+#: evals now registered, the `report` table has 13 columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
@@ -81,6 +82,7 @@ ALL_EVALS = [
     "embedding_drift",
     "crash_recovery",
     "extraction_quality",
+    "filter_injection",
 ]
 
 
@@ -261,6 +263,29 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for c in result.feedback_loop_results
             ],
         }
+    if isinstance(result, FilterInjectionEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "injection_succeeded_rate": result.injection_succeeded_rate,
+            "malicious_rejected_rate": result.malicious_rejected_rate,
+            "benign_accepted_rate": result.benign_accepted_rate,
+            "benign_false_positive_rate": result.benign_false_positive_rate,
+            "n_cases": len(result.case_results),
+            "cases": [
+                {
+                    "case_id": c.case.case_id,
+                    "malicious": c.case.malicious,
+                    "filter_key": c.case.filter_key,
+                    "signal": str(c.signal),
+                    "probe_accepted": c.probe_accepted,
+                    "error": c.error,
+                }
+                for c in result.case_results
+            ],
+        }
     if isinstance(result, CompressionEvalResult):
         return {
             "backend": result.backend_name,
@@ -346,7 +371,8 @@ def main() -> None:
     help=(
         "Comma-separated eval list (longmemeval,locomo,contradiction,"
         "resource_sync_safety,compression,ranking_quality,scale_stress,"
-        "embedding_drift,crash_recovery,extraction_quality), or 'all'."
+        "embedding_drift,crash_recovery,extraction_quality,filter_injection), "
+        "or 'all'."
     ),
 )
 @click.option(
@@ -626,6 +652,25 @@ def run(
             else:
                 console.print("    feedback-loop-duplicate: N/A (no scoreable feedback-loop cases)")
 
+        if "filter_injection" in eval_names:
+            console.print(f"  Running Filter-Injection against {backend_name}...")
+            filter_injection_result = run_filter_injection_eval(adapter)
+            backend_report["evals"]["filter_injection"] = _serialize_eval_result(
+                filter_injection_result
+            )
+            if filter_injection_result.skipped:
+                console.print(f"    SKIPPED: {filter_injection_result.skip_reason}")
+            else:
+                isr = filter_injection_result.injection_succeeded_rate
+                bfr = filter_injection_result.benign_false_positive_rate
+                bfr_str = f"{bfr:.1%}" if bfr is not None else "N/A"
+                if isr is not None:
+                    console.print(
+                        f"    injection-succeeded: {isr:.1%}  benign-false-positive: {bfr_str}"
+                    )
+                else:
+                    console.print("    N/A (no scoreable cases)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -683,12 +728,14 @@ def report(report_path: Path) -> None:
     table.add_column("Embedding Drift (drift rate)")
     table.add_column("Crash-Recovery (index-lost-data-survived rate)")
     table.add_column("Extraction Quality (junk-retained / valid-lost / feedback-loop-dup)")
+    table.add_column("Filter Injection (injection-succeeded / benign-false-positive)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
             table.add_row(
                 backend_name,
                 "SKIPPED",
+                "-",
                 "-",
                 "-",
                 "-",
@@ -713,6 +760,7 @@ def report(report_path: Path) -> None:
         drift = evals.get("embedding_drift", {})
         crash_recovery = evals.get("crash_recovery", {})
         extraction = evals.get("extraction_quality", {})
+        filter_injection = evals.get("filter_injection", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -766,6 +814,15 @@ def report(report_path: Path) -> None:
             if extraction
             else "-"
         )
+        if filter_injection.get("skipped"):
+            filter_injection_str = "SKIPPED (unsupported)"
+        elif filter_injection:
+            filter_injection_str = (
+                f"{_fmt_pct(filter_injection.get('injection_succeeded_rate'))} / "
+                f"{_fmt_pct(filter_injection.get('benign_false_positive_rate'))}"
+            )
+        else:
+            filter_injection_str = "-"
         table.add_row(
             backend_name,
             "configured",
@@ -779,6 +836,7 @@ def report(report_path: Path) -> None:
             drift_str,
             crash_recovery_str,
             extraction_str,
+            filter_injection_str,
         )
 
     console.print(table)
