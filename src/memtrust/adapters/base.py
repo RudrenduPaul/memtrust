@@ -38,6 +38,60 @@ class BackendNotConfiguredError(Exception):
         )
 
 
+class CrashSignal(StrEnum):
+    """WHY a store()/query()/update()/delete() call raised BackendAPIError,
+    classified by pattern-matching the caught exception's type and message
+    against known internal-library crash shapes -- distinct from *whether*
+    the call failed (that's BackendAPIError itself, always raised on any
+    failure) and distinct from ConflictSignal/RankingSignal/CorruptionSignal
+    above, which all classify the *content* of a successful response, never
+    an exception. Without this, every internal crash of a vendor library --
+    a known, previously-reported bug class vs. some unrelated transient
+    error -- surfaces as an identical opaque `BackendAPIError(detail=str(exc))`
+    with no way to tell them apart.
+
+    This is pattern-matching on an exception's type and a substring of its
+    message, not proof the crash reproduces a specific upstream line of code
+    every time this signal is assigned -- a message string is the only
+    surface an adapter has to work with once the vendor library has already
+    raised. See zep_graphiti_selfhosted_adapter.py's `_classify_crash()` and
+    docs/methodology.md for the honesty caveat: this classifies a known
+    crash *shape* by pattern-matching the exception, it does not prevent the
+    crash or fix the underlying library itself.
+    """
+
+    UNPACK_ERROR = "unpack_error"
+    """A `ValueError` raised from a Python tuple/list unpacking count
+    mismatch (message contains "values to unpack", covering both "too many
+    values to unpack" and "not enough values to unpack"). Matches the shape
+    of getzep/graphiti#836: `add_episode(update_communities=True)`'s
+    community-update branch does
+    `communities, community_edges = await semaphore_gather(*[...])`, which
+    only succeeds when `semaphore_gather` returns exactly 2 items -- any
+    episode whose extracted node count is not exactly 2 raises this
+    `ValueError` shape from graphiti_core's own internals, not from
+    anything this adapter's own code does."""
+
+    TYPE_COMPARISON_ERROR = "type_comparison_error"
+    """A `TypeError` raised from comparing incompatible types, specifically
+    a timezone-naive vs. timezone-aware `datetime` comparison (message
+    contains "offset-naive and offset-aware"). Matches the shape of
+    getzep/graphiti#920: an edge-contradiction-resolution code path
+    compares a stored edge's (possibly tz-naive) timestamp against a
+    tz-aware `datetime` value without normalizing both to the same
+    awareness first, raising this exact `TypeError` from Python's own
+    datetime comparison, surfaced through graphiti_core's internals."""
+
+    UNKNOWN = "unknown"
+    """The caught exception's type/message did not match any known crash
+    shape this enum classifies. This is the honest, expected outcome for
+    the overwhelming majority of failures -- network errors, auth
+    failures, database unavailability, and any vendor bug other than the
+    two specific shapes above all land here. `UNKNOWN` is not a gap in
+    this classification; it is what "not one of the specific bug classes
+    we know how to recognize" looks like."""
+
+
 class BackendAPIError(Exception):
     """Raised when a configured backend's API call fails (network, auth,
     5xx, malformed response). Distinct from BackendNotConfiguredError so
@@ -45,9 +99,22 @@ class BackendAPIError(Exception):
     the call still failed."
     """
 
-    def __init__(self, backend_name: str, detail: str) -> None:
+    def __init__(
+        self, backend_name: str, detail: str, crash_signal: CrashSignal | None = None
+    ) -> None:
         self.backend_name = backend_name
         self.detail = detail
+        self.crash_signal = crash_signal
+        """Which known internal-library crash shape (see CrashSignal above)
+        this failure's exception matched, or None when the adapter that
+        raised this error did not attempt classification at all (most
+        adapters -- classification is opt-in per adapter, the same
+        "None means not attempted" convention StoreResult.verified uses).
+        A non-None value that equals CrashSignal.UNKNOWN means the adapter
+        DID attempt classification and the exception simply didn't match
+        any known shape -- that is a meaningfully different fact from
+        "this adapter never classifies," which is why the default is None,
+        not UNKNOWN."""
         super().__init__(f"{backend_name} API error: {detail}")
 
 
