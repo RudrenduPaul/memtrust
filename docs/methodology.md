@@ -606,6 +606,46 @@ no-op) is what this adapter can demonstrate against the currently installed pack
 `mem0_direct_adapter.py`'s module docstring and `CorruptionSignal.CONFIG_REJECTED`'s docstring
 in `base.py` for the same caveat stated where the code itself lives.
 
+**ExtractionSignal and mem0ai/mem0#5178: "store() succeeded but silently extracted zero facts."**
+All three mem0-backed adapters (`Mem0Adapter`, `Mem0SelfHostedAdapter`, `Mem0DirectAdapter`) share
+one more gap `CorruptionSignal` above cannot express: a `store()`/`add()` call can complete
+without raising, and return a perfectly normal-shaped 200/dict response, while Mem0's own
+LLM-based fact-extraction pass finds nothing worth persisting -- no `id` field, no non-empty
+`results` list, nothing. Before this change, every adapter's private `_extract_memory_id()`
+helper silently returned `""` in that case, and the resulting `StoreResult` was byte-identical to
+a genuine successful store from the caller's side: same shape, no exception, no other field
+indicating anything unusual happened. This is exactly the failure class mem0ai/mem0#5178
+(GitHub user thalesfsp) reports. This backlog item originally also cited mem0ai/mem0#5878/#5901/
+#5903 (GitHub user Bartok9) as adjacent reports of the same shape; #5178 is the one this signal
+is scoped and tested against directly, since it is the specific row this change closes -- the
+other three were not independently re-read against the installed package for this change and
+should not be treated as separately confirmed.
+
+`StoreResult.extraction_signal` (an `ExtractionSignal | None`, defined in `adapters/base.py`
+alongside `ConflictSignal`/`RankingSignal`/`CorruptionSignal`) is what closes this gap:
+`FACTS_EXTRACTED` when `_extract_memory_id()` finds a usable id, `EMPTY_EXTRACTION` when it
+doesn't, and `NOT_APPLICABLE` for `Mem0DirectAdapter`'s `CONFIG_REJECTED` path specifically (a
+rejected construction means extraction never ran at all, which is a different failure than
+"extraction ran and found nothing," so it is not misreported as `EMPTY_EXTRACTION`). Every other
+adapter's `StoreResult` leaves this field at its default of `None` -- distinct from
+`NOT_APPLICABLE`, mirroring `verified`'s existing `None`-means-"not measured" convention -- since
+no non-mem0 backend in this repo has an LLM-extraction step to observe in the first place.
+
+**What this honestly does and does not prove.** `ExtractionSignal` gives a caller a real,
+tested way to tell "Mem0 stored my fact" apart from "Mem0's call returned 200 but kept nothing" --
+that is the concrete capability #5178 asks for, and `tests/test_adapters.py` /
+`tests/test_mem0_direct_adapter.py` exercise it against a mocked response shaped exactly like the
+empty-extraction case, for all three adapters. What it does not do: distinguish a genuine mem0
+*bug* (a real fact silently dropped) from mem0's extraction pipeline correctly deciding there was
+nothing worth remembering in a given input (e.g. pure chit-chat with no factual content) -- both
+produce the identical `{"results": []}`-shaped response from the adapter's vantage point, and
+`EMPTY_EXTRACTION` is deliberately a *value-neutral* flag ("nothing was extracted this call"),
+never a claim that a bug occurred. Telling those two apart would require ground truth about what
+the input actually contained, which is exactly what `evals/longmemeval.py` and `evals/locomo.py`
+already do on the *query* side via `records_empty`/`n_records_empty` -- this signal is the
+store-side counterpart that makes the underlying vendor behavior visible in the first place,
+not a verdict on every individual case.
+
 **Why MemPalace's "configuration" is a storage path, not an API key.** MemPalace is genuinely
 local-first and documented as requiring no API key at all. Forcing it to read a fake API key
 env var to match the other three adapters would misrepresent how the product actually works.

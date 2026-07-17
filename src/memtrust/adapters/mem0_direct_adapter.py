@@ -158,6 +158,7 @@ from memtrust.adapters.base import (
     ConflictSignal,
     CorruptionSignal,
     DeleteResult,
+    ExtractionSignal,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -390,17 +391,30 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
                 latency_ms=timer.elapsed_ms(),
                 raw={"error": str(exc)},
                 corruption_signal=CorruptionSignal.CONFIG_REJECTED,
+                # NOT_APPLICABLE, not EMPTY_EXTRACTION -- memory_id="" here
+                # means construction was rejected before any extraction
+                # could run, a different failure class than "extraction ran
+                # and found nothing." See ExtractionSignal.NOT_APPLICABLE
+                # in base.py.
+                extraction_signal=ExtractionSignal.NOT_APPLICABLE,
             )
         try:
             data = memory.add(content, user_id=session_id, metadata=metadata or {})
         except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
         memory_id = _extract_memory_id(data)
+        # Same mem0ai/mem0#5178 gap this adapter's REST siblings in
+        # mem0_adapter.py guard against -- Memory.add() can return without
+        # raising and carry no usable id anywhere in its response.
+        extraction_signal = (
+            ExtractionSignal.EMPTY_EXTRACTION if not memory_id else ExtractionSignal.FACTS_EXTRACTED
+        )
         return StoreResult(
             memory_id=memory_id,
             latency_ms=timer.elapsed_ms(),
             raw=data if isinstance(data, dict) else {"results": data},
             corruption_signal=CorruptionSignal.CLEAN,
+            extraction_signal=extraction_signal,
         )
 
     def query(

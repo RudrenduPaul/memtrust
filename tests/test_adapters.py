@@ -17,6 +17,7 @@ from memtrust.adapters.base import (
     BackendNotConfiguredError,
     ConflictSignal,
     DeleteResult,
+    ExtractionSignal,
     MemoryBackendAdapter,
     QueryResult,
     RankingSignal,
@@ -98,6 +99,7 @@ def test_mem0_store_query_update(monkeypatch: pytest.MonkeyPatch, httpx_mock: HT
     store_result = adapter.store("session-1", "I like tea.")
     assert store_result.memory_id == "mem-1"
     assert store_result.latency_ms >= 0
+    assert store_result.extraction_signal == ExtractionSignal.FACTS_EXTRACTED
 
     httpx_mock.add_response(
         method="POST",
@@ -127,6 +129,29 @@ def test_mem0_store_raises_backend_api_error_on_http_failure(
     httpx_mock.add_response(status_code=500)
     with pytest.raises(BackendAPIError):
         adapter.store("session-1", "content")
+    adapter.close()
+
+
+def test_mem0_store_reports_empty_extraction_signal_when_no_id_in_response(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """mem0ai/mem0#5178: a store() call can complete with a 200 and a
+    normal-shaped body that nonetheless carries no usable memory id --
+    Mem0's own extraction pipeline decided there was nothing worth
+    persisting. Before this fix, `_extract_memory_id()` silently returned
+    "" and the resulting StoreResult looked identical to a genuine
+    successful store. This proves the adapter now flags that gap.
+    """
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    adapter = Mem0Adapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/",
+        json={"results": []},
+    )
+    store_result = adapter.store("session-1", "just saying hi, nothing to remember")
+    assert store_result.memory_id == ""
+    assert store_result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
     adapter.close()
 
 
@@ -242,6 +267,7 @@ def test_mem0_selfhosted_store_query_update_use_unprefixed_routes(
     )
     store_result = adapter.store("session-1", "I like tea.")
     assert store_result.memory_id == "mem-1"
+    assert store_result.extraction_signal == ExtractionSignal.FACTS_EXTRACTED
 
     httpx_mock.add_response(
         method="POST",
@@ -347,6 +373,25 @@ def test_mem0_selfhosted_store_raises_backend_api_error_on_http_failure(
     httpx_mock.add_response(status_code=500)
     with pytest.raises(BackendAPIError):
         adapter.store("session-1", "content")
+    adapter.close()
+
+
+def test_mem0_selfhosted_store_reports_empty_extraction_signal_when_no_id_in_response(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Same mem0ai/mem0#5178 gap as Mem0Adapter above, reproduced against
+    the self-hosted server's unprefixed POST /memories route.
+    """
+    monkeypatch.setenv("MEM0_SELFHOSTED_BASE_URL", "http://localhost:8888")
+    adapter = Mem0SelfHostedAdapter()
+    httpx_mock.add_response(
+        method="POST",
+        url="http://localhost:8888/memories",
+        json={"results": []},
+    )
+    store_result = adapter.store("session-1", "just saying hi, nothing to remember")
+    assert store_result.memory_id == ""
+    assert store_result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
     adapter.close()
 
 
