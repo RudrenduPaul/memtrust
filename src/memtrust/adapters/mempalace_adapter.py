@@ -2,11 +2,23 @@
 
 Confidence: MEDIUM on product behavior, LOW on exact Python method names.
 
-MemPalace is confirmed local-first and explicitly requires no API key --
-it stores verbatim conversation text in a local, SQLite-backed index
-(chromadb for embeddings) organized as a "palace" of wings/rooms/drawers,
-and separately ships a temporal entity-relationship graph documented as
-supporting add/query/invalidate/timeline operations. It publishes a
+MemPalace requires no API key: authentication is not part of its
+configuration surface, unlike the other three adapters in this repo (see
+"Because MemPalace needs no cloud API key" below). That is a narrower
+claim than "no network access required," and conflating the two is a
+real, documented bug, not a hypothetical one. Motivating case:
+mempalace/mempalace#524 (contributor gaby) found that `pip install
+mempalace` succeeds entirely offline, but `mempalace mine .` then fails
+on a network-restricted VM: chromadb's default embedder does not ship
+its model, it downloads an ONNX model from an AWS S3 bucket the first
+time it is actually used to embed something. So MemPalace is local-first
+for storage -- it stores verbatim conversation text in a local,
+SQLite-backed index (chromadb for embeddings) organized as a "palace" of
+wings/rooms/drawers -- but it is NOT network-independent: a first-use
+embedder call still requires outbound network access, API key or not.
+MemPalace separately ships a temporal entity-relationship graph
+documented as supporting add/query/invalidate/timeline operations. It
+publishes a
 `mempalace` package on PyPI and documents a Python API at
 mempalaceofficial.com/reference/python-api, but that reference page's
 exact class and method names were not confirmed during this build (the
