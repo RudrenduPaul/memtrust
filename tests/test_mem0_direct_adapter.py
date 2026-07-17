@@ -36,6 +36,7 @@ crash on missing dependency" contract. CI installs this group (see
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1298,6 +1299,103 @@ def test_hypothetical_raw_distance_scores_would_invert_threshold_filtering() -> 
     # (raw distance 0.05) is wrongly dropped and the FARTHEST (0.95) kept.
     assert kept_ids == {"actually_far"}
     assert "actually_close" not in kept_ids
+
+
+# ---------------------------------------------------------------------------
+# Live reproduction: malformed-LLM-response extraction failures
+# (mukahraman, rank 180, mem0ai/mem0#3051) -- a real, installed
+# mem0.Memory built via Memory.from_config(), with only the OpenAI LLM
+# client / fastembed embedder / Redis wire-client SDK boundaries mocked,
+# exercising the REAL _add_to_vector_store() pipeline against a genuinely
+# malformed LLM JSON response. Proves ExtractionSignal.EMPTY_EXTRACTION
+# fires instead of a crash, end to end through the real installed
+# package -- not just against the hand-written _FakeMemory double Layer 1
+# above uses. See tests/fixtures/extraction_quality_cases.json's new
+# malformed_llm_response_cases category for the case shapes this mirrors.
+# ---------------------------------------------------------------------------
+
+
+def _build_real_memory_with_mocked_boundaries(llm_response_content: str):
+    """Constructs a REAL mem0.Memory (via Memory.from_config()) with the
+    OpenAI LLM client, fastembed embedder, and Redis vector store all
+    real, installed classes -- only each vendor's own SDK/wire-client
+    boundary is mocked, same convention every other "Layer 2" test in this
+    file follows. `llm_response_content` is the exact string the mocked
+    LLM call returns as its message content, standing in for whatever a
+    real Ollama/OpenAI-compatible endpoint could return.
+    """
+    import mem0
+    import mem0.embeddings.fastembed as fastembed_mod
+    import mem0.llms.openai as openai_llm_mod
+    import mem0.vector_stores.redis as redis_mod
+
+    mock_openai_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = llm_response_content
+    mock_choice.message.tool_calls = None
+    mock_completion = MagicMock()
+    mock_completion.choices = [mock_choice]
+    mock_openai_client.chat.completions.create.return_value = mock_completion
+
+    mock_text_embedding_instance = MagicMock()
+    mock_text_embedding_instance.embed.return_value = iter([MagicMock(tolist=lambda: [0.1] * 384)])
+
+    with (
+        patch.object(openai_llm_mod, "OpenAI", return_value=mock_openai_client),
+        patch.object(fastembed_mod, "TextEmbedding", return_value=mock_text_embedding_instance),
+        patch.object(redis_mod, "redis"),
+        patch.object(redis_mod, "SearchIndex") as mock_search_index_cls,
+    ):
+        mock_index = MagicMock()
+        mock_search_index_cls.from_dict.return_value = mock_index
+        memory = mem0.Memory.from_config(
+            {
+                "embedder": {"provider": "fastembed", "config": {"embedding_dims": 384}},
+                "vector_store": {
+                    "provider": "redis",
+                    "config": {
+                        "redis_url": "redis://localhost:6379",
+                        "collection_name": "memtrust_test",
+                        "embedding_model_dims": 384,
+                    },
+                },
+            }
+        )
+    return memory
+
+
+def _load_malformed_llm_response_cases() -> list[dict[str, Any]]:
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "extraction_quality_cases.json").read_text()
+    )
+    cases: list[dict[str, Any]] = fixture["malformed_llm_response_cases"]
+    return cases
+
+
+@pytest.mark.parametrize(
+    "case",
+    _load_malformed_llm_response_cases(),
+    ids=lambda case: case["case_id"],
+)
+def test_live_reproduction_malformed_llm_response_reports_empty_extraction(
+    case: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives every malformed_llm_response_cases fixture shape through the
+    REAL installed mem0.Memory.add() pipeline (mocking only the
+    LLM/embedder/vector-store SDK boundaries) and confirms
+    Mem0DirectAdapter.store() reports ExtractionSignal.EMPTY_EXTRACTION --
+    no KeyError, no other crash -- for every malformed-response shape.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used-network-is-mocked")
+
+    memory = _build_real_memory_with_mocked_boundaries(case["raw_llm_response"])
+    adapter = Mem0DirectAdapter(memory=memory)
+
+    result = adapter.store(case["session_id"], case["content"])
+
+    assert result.memory_id == ""
+    assert result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
+    assert result.corruption_signal == CorruptionSignal.CLEAN
 
 
 # ---------------------------------------------------------------------------
