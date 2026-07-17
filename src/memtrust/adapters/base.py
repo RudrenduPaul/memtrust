@@ -252,6 +252,73 @@ class CorruptionSignal(StrEnum):
     field."""
 
 
+class ExtractionSignal(StrEnum):
+    """Whether a store() call that completed without raising actually found
+    something to persist, or silently extracted zero facts from the input.
+
+    This is a distinct taxonomy from ConflictSignal/RankingSignal/
+    CorruptionSignal above, not a variant of any of them. Those three all
+    classify *query()* responses or write-path *corruption*; this one
+    classifies the one failure mode none of them can see: a store() call
+    that raises nothing, returns a normal-shaped 200/dict response, and yet
+    the backend's own LLM-based fact-extraction step found nothing worth
+    keeping -- so the response has no usable `id` (and no `results[0].id`)
+    for the adapter to report back to the caller. Byte-for-byte, that
+    response is indistinguishable from a genuine successful store unless an
+    adapter explicitly checks for it, which is exactly what
+    `mem0_adapter.py`'s `_extract_memory_id()` historically did not do: it
+    silently returned `""` and let a normal-looking StoreResult mask the
+    difference between "stored" and "extracted nothing."
+
+    Motivating case: mem0ai/mem0#5178 (GitHub user thalesfsp) -- `add()`
+    can return a response with zero extracted memories for input the caller
+    clearly intended to be remembered, with no exception and no other
+    signal that anything different happened versus a normal store. This
+    backlog item originally also referenced mem0ai/mem0#5878/#5901/#5903
+    (GitHub user Bartok9) as adjacent reports of the same "store()
+    succeeded but the fact silently never made it in" shape; #5178 is the
+    one this signal is scoped against directly, since it is the row this
+    change closes.
+
+    This is the "LLM extraction silently swallowed" failure class: a vendor
+    fact-extraction pass (which can legitimately decide "there is nothing
+    worth remembering here," e.g. for chit-chat with no factual content)
+    and a vendor bug that drops a real fact are indistinguishable from the
+    response shape alone. This signal does not attempt to tell those two
+    apart -- see EMPTY_EXTRACTION's docstring -- it exists so that
+    distinction is at least visible to a caller instead of silently
+    collapsed into an ordinary-looking StoreResult.
+    """
+
+    FACTS_EXTRACTED = "facts_extracted"
+    """store() completed without raising and the response carried a usable
+    memory id (a top-level `id`, or `results[0].id`) -- the backend's
+    extraction step found and persisted at least one fact."""
+
+    EMPTY_EXTRACTION = "empty_extraction"
+    """store() completed without raising, but the response carried no
+    usable memory id anywhere this adapter knows to look. This is the exact
+    mem0ai/mem0#5178 shape: a call that looks identical to a successful
+    store from its return value alone, except that nothing was actually
+    extracted. Recorded explicitly rather than silently returning a
+    StoreResult with memory_id="" and no other trace anything unusual
+    happened -- a caller (or an eval) that only checks "did store() raise"
+    has no way to see this otherwise."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """This adapter has no extraction concept to observe here -- either the
+    backend has no LLM-extraction step at all (most non-mem0 adapters,
+    which persist exactly what they're given rather than deciding what's
+    worth keeping), or this specific store() call failed for a different,
+    already-classified reason (e.g. Mem0DirectAdapter's CONFIG_REJECTED
+    corruption_signal path below, where memory_id="" means "construction
+    was rejected before any extraction could run," not "extraction ran and
+    found nothing" -- conflating the two would misattribute a config error
+    to this signal). Recorded explicitly, same convention as
+    ConflictSignal.NOT_APPLICABLE/RankingSignal.NOT_APPLICABLE/
+    CorruptionSignal.NOT_APPLICABLE above."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
@@ -316,6 +383,17 @@ class StoreResult:
     only an adapter with a genuine construction-time-config or raw-write
     inspection surface (see Mem0DirectAdapter) should ever set this to
     something else."""
+    extraction_signal: ExtractionSignal | None = None
+    """See ExtractionSignal above. `None` (not NOT_APPLICABLE) is the
+    default so every existing adapter's StoreResult construction keeps
+    working unchanged, mirroring `verified`'s None-vs-False distinction
+    immediately below: `None` means "this adapter does not report this
+    signal at all," which is different from NOT_APPLICABLE meaning "this
+    adapter reports the signal and this particular call had nothing to
+    classify it against." Only the mem0-backed adapters (Mem0Adapter,
+    Mem0SelfHostedAdapter, Mem0DirectAdapter), which are the ones with a
+    real LLM-extraction step to observe, set this to something other than
+    None -- see mem0_adapter.py's and mem0_direct_adapter.py's store()."""
     verified: bool | None = None
     """Whether a post-write read-back confirmed the content is actually
     retrievable. `None` means the adapter did not attempt verification

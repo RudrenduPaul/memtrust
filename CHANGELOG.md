@@ -18,6 +18,15 @@ All notable changes to this project are documented here. Format loosely follows
   published to npm -- gated on a separate publish step. See the README's "npx (agent-native)"
   section and `npm/` for the wrapper source and third-party attribution.
 
+### Added
+
+- `StoreResult.extraction_signal` (`ExtractionSignal`, `adapters/base.py`) -- flags when a `store()`
+  call completes without raising but the response carried no usable memory id, the exact
+  mem0ai/mem0#5178 "store() succeeded but silently extracted zero facts" shape. `Mem0Adapter`,
+  `Mem0SelfHostedAdapter`, and `Mem0DirectAdapter` all now set `FACTS_EXTRACTED`/`EMPTY_EXTRACTION`
+  instead of silently returning a normal-looking `StoreResult` with `memory_id=""`. See
+  docs/methodology.md's "ExtractionSignal and mem0ai/mem0#5178" section.
+
 ### Fixed
 
 - PyPI `project.urls` now link each author to their GitHub profile instead of leaving the `Author` field email-less with no way to reach either maintainer
