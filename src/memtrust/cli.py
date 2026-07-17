@@ -39,6 +39,10 @@ from memtrust.evals.extraction_quality import (
 )
 from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
+from memtrust.evals.migration_rollback import (
+    MigrationRollbackEvalResult,
+    run_migration_rollback_eval,
+)
 from memtrust.evals.ranking_quality import RankingQualityEvalResult, run_ranking_quality_eval
 from memtrust.evals.resource_sync_safety import ResourceSyncEvalResult, run_resource_sync_eval
 from memtrust.evals.scale_stress import (
@@ -57,8 +61,8 @@ from memtrust.receipt import (
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 10
-#: evals now registered, the `report` table has 12 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 11
+#: evals now registered, the `report` table has 13 columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
@@ -81,6 +85,7 @@ ALL_EVALS = [
     "embedding_drift",
     "crash_recovery",
     "extraction_quality",
+    "migration_rollback",
 ]
 
 
@@ -228,6 +233,26 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for c in result.case_results
             ],
         }
+    if isinstance(result, MigrationRollbackEvalResult):
+        return {
+            "backend": result.backend_name,
+            "dataset_path": result.dataset_path,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "restored_rate": result.restored_rate,
+            "data_lost_rate": result.data_lost_rate,
+            "n_cases": len(result.case_results),
+            "cases": [
+                {
+                    "case_id": c.case.case_id,
+                    "signal": str(c.signal),
+                    "original_data_recoverable": c.original_data_recoverable,
+                    "adapter_reported_recoverable": c.adapter_reported_recoverable,
+                    "error": c.error,
+                }
+                for c in result.case_results
+            ],
+        }
     if isinstance(result, ExtractionQualityEvalResult):
         return {
             "backend": result.backend_name,
@@ -346,7 +371,8 @@ def main() -> None:
     help=(
         "Comma-separated eval list (longmemeval,locomo,contradiction,"
         "resource_sync_safety,compression,ranking_quality,scale_stress,"
-        "embedding_drift,crash_recovery,extraction_quality), or 'all'."
+        "embedding_drift,crash_recovery,extraction_quality,"
+        "migration_rollback), or 'all'."
     ),
 )
 @click.option(
@@ -626,6 +652,20 @@ def run(
             else:
                 console.print("    feedback-loop-duplicate: N/A (no scoreable feedback-loop cases)")
 
+        if "migration_rollback" in eval_names:
+            console.print(f"  Running Migration-Rollback against {backend_name}...")
+            migration_result = run_migration_rollback_eval(adapter)
+            backend_report["evals"]["migration_rollback"] = _serialize_eval_result(migration_result)
+            if migration_result.skipped:
+                console.print(f"    SKIPPED: {migration_result.skip_reason}")
+            else:
+                rr = migration_result.restored_rate
+                dl = migration_result.data_lost_rate
+                if rr is not None:
+                    console.print(f"    restored: {rr:.1%}  data-lost: {dl:.1%}")
+                else:
+                    console.print("    N/A (no scoreable cases)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -683,12 +723,14 @@ def report(report_path: Path) -> None:
     table.add_column("Embedding Drift (drift rate)")
     table.add_column("Crash-Recovery (index-lost-data-survived rate)")
     table.add_column("Extraction Quality (junk-retained / valid-lost / feedback-loop-dup)")
+    table.add_column("Migration-Rollback (restored / data-lost)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
             table.add_row(
                 backend_name,
                 "SKIPPED",
+                "-",
                 "-",
                 "-",
                 "-",
@@ -713,6 +755,7 @@ def report(report_path: Path) -> None:
         drift = evals.get("embedding_drift", {})
         crash_recovery = evals.get("crash_recovery", {})
         extraction = evals.get("extraction_quality", {})
+        migration_rollback = evals.get("migration_rollback", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -766,6 +809,15 @@ def report(report_path: Path) -> None:
             if extraction
             else "-"
         )
+        if migration_rollback.get("skipped"):
+            migration_rollback_str = "SKIPPED (unsupported)"
+        elif migration_rollback:
+            migration_rollback_str = (
+                f"{_fmt_pct(migration_rollback.get('restored_rate'))} / "
+                f"{_fmt_pct(migration_rollback.get('data_lost_rate'))}"
+            )
+        else:
+            migration_rollback_str = "-"
         table.add_row(
             backend_name,
             "configured",
@@ -779,6 +831,7 @@ def report(report_path: Path) -> None:
             drift_str,
             crash_recovery_str,
             extraction_str,
+            migration_rollback_str,
         )
 
     console.print(table)
