@@ -823,6 +823,35 @@ class DeleteResult:
 
 
 @dataclass
+class StatsResult:
+    """Result of MemoryBackendAdapter.get_stats() -- a backend's own
+    self-reported count of how many memories it currently holds, read from
+    a dedicated stats/dashboard endpoint rather than derived from a
+    store()/query() call.
+
+    This exists to reproduce volcengine/OpenViking#1255 (contributor
+    SeeYangZhi): `GET /api/v1/stats/memories` returns an all-zero count
+    even when filesystem listing (`list_resource_paths()`) and semantic
+    search (`query()`) both independently confirm the memories genuinely
+    exist -- a separate metrics/counting code path that was never wired up
+    to the real write path. `total_memories` here is deliberately the
+    backend's own self-report, exactly the number a caller would see if it
+    trusted this endpoint alone; evals/stats_accuracy.py is what
+    cross-checks it against an independent ground-truth count."""
+
+    total_memories: int | None
+    """The backend's self-reported total memory count, or `None` if the
+    response had no field this adapter knows how to read (distinct from a
+    real `0`, which is a valid, meaningful count that may still turn out
+    to be wrong -- see StatsSignal.STATS_UNDERCOUNTED in
+    evals/stats_accuracy.py)."""
+    latency_ms: float = 0.0
+    raw: dict[str, object] = field(default_factory=dict)
+    """Unmodified vendor response, kept for audit purposes only -- never
+    used for scoring directly (see StatsResult.total_memories above)."""
+
+
+@dataclass
 class MigrationFailureResult:
     """Result of MemoryBackendAdapter.simulate_migration_failure().
 
@@ -959,6 +988,15 @@ class MemoryBackendAdapter(ABC):
     #: that layer -- see evals/filter_injection.py, the eval this gates,
     #: and mem0_direct_adapter.py's probe_raw_filter() override.
     supports_raw_filter_probe: bool = False
+
+    #: Whether this backend exposes a dedicated stats/dashboard endpoint
+    #: this adapter can read via get_stats() below, distinct from deriving
+    #: a count from query()/list_resource_paths() results. Defaults to
+    #: False -- most adapters in this repo have no such endpoint documented
+    #: at all. See evals/stats_accuracy.py, the eval this gates, and
+    #: openviking_adapter.py's get_stats() for the one adapter that
+    #: currently sets this True (volcengine/OpenViking#1255).
+    supports_stats: bool = False
 
     @abstractmethod
     def store(
@@ -1260,6 +1298,39 @@ class MemoryBackendAdapter(ABC):
         raise NotImplementedError(
             f"{self.name} does not implement probe_raw_filter() "
             f"(supports_raw_filter_probe={self.supports_raw_filter_probe})"
+        )
+
+    def get_stats(self, session_id: str | None = None) -> StatsResult:
+        """Read this backend's own dedicated stats/dashboard endpoint --
+        e.g. a `total_memories` counter maintained by a separate
+        metrics/aggregation code path, not derived from a store()/query()
+        call this adapter makes itself.
+
+        This is the primitive evals/stats_accuracy.py needs to reproduce
+        volcengine/OpenViking#1255's exact shape: a stats endpoint that
+        returns an all-zero (or otherwise undercounted) result even though
+        the memories genuinely exist and are independently confirmed via
+        `list_resource_paths()`/`query()`.
+
+        Optional capability, same convention as list_resource_paths()/
+        trigger_resync()/probe_raw_filter() above -- default raises
+        NotImplementedError, only adapters with supports_stats = True are
+        expected to override it.
+
+        Args:
+            session_id: optional scope to read stats for, if this
+                backend's stats endpoint supports scoping. Adapters whose
+                real endpoint has no such concept accept and ignore it
+                (no-op), the same backward-compatible convention store()'s
+                `mode` parameter establishes.
+
+        Raises:
+            NotImplementedError: if the adapter does not implement this
+                (i.e. supports_stats is False).
+            BackendAPIError: on any network or vendor-side failure.
+        """
+        raise NotImplementedError(
+            f"{self.name} does not implement get_stats() (supports_stats={self.supports_stats})"
         )
 
     @staticmethod

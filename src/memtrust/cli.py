@@ -38,6 +38,7 @@ from memtrust.evals.extraction_quality import (
     run_extraction_quality_eval,
 )
 from memtrust.evals.filter_injection import FilterInjectionEvalResult, run_filter_injection_eval
+from memtrust.evals.lock_contention import LockContentionEvalResult, run_lock_contention_eval
 from memtrust.evals.locomo import LoCoMoResult, load_exclude_question_ids, run_locomo
 from memtrust.evals.longmemeval import LongMemEvalResult, run_longmemeval
 from memtrust.evals.migration_rollback import (
@@ -51,6 +52,7 @@ from memtrust.evals.scale_stress import (
     ScaleTestResult,
     run_scale_stress_eval,
 )
+from memtrust.evals.stats_accuracy import StatsAccuracyEvalResult, run_stats_accuracy_eval
 from memtrust.receipt import (
     PUBLIC_KEY_ENV_VAR,
     ReceiptError,
@@ -62,8 +64,8 @@ from memtrust.receipt import (
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 11
-#: evals now registered, the `report` table has 13 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 14
+#: evals now registered, the `report` table has 16 columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
@@ -88,6 +90,8 @@ ALL_EVALS = [
     "extraction_quality",
     "migration_rollback",
     "filter_injection",
+    "lock_contention",
+    "stats_accuracy",
 ]
 
 
@@ -375,6 +379,41 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                 for r in result.record_results
             ],
         }
+    if isinstance(result, LockContentionEvalResult):
+        return {
+            "backend": result.backend_name,
+            "resource_path": result.resource_path,
+            "budget_ms": result.budget_ms,
+            "n_concurrent": result.n_concurrent,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "signal": str(result.signal),
+            "stalled_count": result.stalled_count,
+            "max_latency_ms": result.max_latency_ms,
+            "requests": [
+                {
+                    "worker_index": r.worker_index,
+                    "completed": r.completed,
+                    "succeeded": r.succeeded,
+                    "latency_ms": r.latency_ms,
+                    "error": r.error,
+                }
+                for r in result.requests
+            ],
+        }
+    if isinstance(result, StatsAccuracyEvalResult):
+        return {
+            "backend": result.backend_name,
+            "n_records_requested": result.n_records_requested,
+            "records_stored": result.records_stored,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "signal": str(result.signal),
+            "verified_count": result.verified_count,
+            "reported_count": result.reported_count,
+            "undercount_gap": result.undercount_gap,
+            "error": result.error,
+        }
     raise TypeError(f"no serializer for {type(result)!r}")
 
 
@@ -397,7 +436,7 @@ def main() -> None:
         "Comma-separated eval list (longmemeval,locomo,contradiction,"
         "resource_sync_safety,compression,ranking_quality,scale_stress,"
         "embedding_drift,crash_recovery,extraction_quality,"
-        "migration_rollback,filter_injection), or 'all'."
+        "migration_rollback,filter_injection,lock_contention,stats_accuracy), or 'all'."
     ),
 )
 @click.option(
@@ -710,6 +749,36 @@ def run(
                 else:
                     console.print("    N/A (no scoreable cases)")
 
+        if "lock_contention" in eval_names:
+            console.print(f"  Running Lock-Contention/Hang-Detection against {backend_name}...")
+            lock_contention_result = run_lock_contention_eval(adapter)
+            backend_report["evals"]["lock_contention"] = _serialize_eval_result(
+                lock_contention_result
+            )
+            if lock_contention_result.skipped:
+                console.print(f"    SKIPPED: {lock_contention_result.skip_reason}")
+            else:
+                console.print(
+                    f"    signal: {lock_contention_result.signal}"
+                    f"  stalled: {lock_contention_result.stalled_count}/"
+                    f"{lock_contention_result.n_concurrent}"
+                )
+
+        if "stats_accuracy" in eval_names:
+            console.print(f"  Running Stats/Dashboard-Accuracy against {backend_name}...")
+            stats_result = run_stats_accuracy_eval(adapter)
+            backend_report["evals"]["stats_accuracy"] = _serialize_eval_result(stats_result)
+            if stats_result.skipped:
+                console.print(f"    SKIPPED: {stats_result.skip_reason}")
+            elif stats_result.verified_count is not None:
+                console.print(
+                    f"    signal: {stats_result.signal}"
+                    f"  verified: {stats_result.verified_count}"
+                    f"  reported: {stats_result.reported_count}"
+                )
+            else:
+                console.print("    N/A (no scoreable records)")
+
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)
         if callable(close):
@@ -769,12 +838,16 @@ def report(report_path: Path) -> None:
     table.add_column("Extraction Quality (junk-retained / valid-lost / feedback-loop-dup)")
     table.add_column("Migration-Rollback (restored / data-lost)")
     table.add_column("Filter Injection (injection-succeeded / benign-false-positive)")
+    table.add_column("Lock Contention (signal, stalled/n)")
+    table.add_column("Stats Accuracy (signal, verified/reported)")
 
     for backend_name, backend_data in data.get("results", {}).items():
         if backend_data.get("status") == "skipped":
             table.add_row(
                 backend_name,
                 "SKIPPED",
+                "-",
+                "-",
                 "-",
                 "-",
                 "-",
@@ -803,6 +876,8 @@ def report(report_path: Path) -> None:
         extraction = evals.get("extraction_quality", {})
         migration_rollback = evals.get("migration_rollback", {})
         filter_injection = evals.get("filter_injection", {})
+        lock_contention = evals.get("lock_contention", {})
+        stats_accuracy = evals.get("stats_accuracy", {})
 
         def _fmt_pct(value: float | None) -> str:
             return f"{value:.1%}" if value is not None else "N/A"
@@ -874,6 +949,28 @@ def report(report_path: Path) -> None:
             )
         else:
             filter_injection_str = "-"
+        if lock_contention.get("skipped"):
+            lock_contention_str = "SKIPPED (unsupported)"
+        elif lock_contention:
+            lock_contention_str = (
+                f"{lock_contention.get('signal', 'unknown')} "
+                f"({lock_contention.get('stalled_count', 0)}/"
+                f"{lock_contention.get('n_concurrent', 0)})"
+            )
+        else:
+            lock_contention_str = "-"
+        if stats_accuracy.get("skipped"):
+            stats_accuracy_str = "SKIPPED (unsupported)"
+        elif stats_accuracy and stats_accuracy.get("verified_count") is not None:
+            stats_accuracy_str = (
+                f"{stats_accuracy.get('signal', 'unknown')} "
+                f"({stats_accuracy.get('verified_count')}/"
+                f"{stats_accuracy.get('reported_count')})"
+            )
+        elif stats_accuracy:
+            stats_accuracy_str = "N/A"
+        else:
+            stats_accuracy_str = "-"
         table.add_row(
             backend_name,
             "configured",
@@ -889,6 +986,8 @@ def report(report_path: Path) -> None:
             extraction_str,
             migration_rollback_str,
             filter_injection_str,
+            lock_contention_str,
+            stats_accuracy_str,
         )
 
     console.print(table)
