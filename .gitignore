@@ -24,3 +24,5 @@ node_modules/
 .idea/
 .vscode/
 .claude/
+uv.lock
+memtrust-report-*.json
