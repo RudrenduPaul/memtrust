@@ -36,6 +36,7 @@ crash on missing dependency" contract. CI installs this group (see
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -62,12 +63,19 @@ from memtrust.adapters.base import (  # noqa: E402
     ConflictSignal,
     CorruptionSignal,
     ExtractionSignal,
+    LanguageDegradationSignal,
 )
 from memtrust.adapters.mem0_direct_adapter import (  # noqa: E402
     SUPPORTED_EMBEDDER_PROVIDERS,
     SUPPORTED_VECTOR_STORE_PROVIDERS,
     Mem0DirectAdapter,
 )
+from memtrust.evals.embedder_cost import (  # noqa: E402
+    EmbedderCostSignal,
+    run_embedder_cost_eval,
+)
+from memtrust.evals.language_degradation import run_language_degradation_eval  # noqa: E402
+from memtrust.scoring.cost_tracker import CostTracker  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Layer 1: adapter control-flow tests, via a fake in-process Memory double
@@ -107,17 +115,49 @@ class _FakePoint:
         self.payload = payload
 
 
+class _FakeEmbedder:
+    """Matches the `embed()`/`embed_batch()` shape every real, installed
+    mem0 embedder class (`mem0.embeddings.base.EmbeddingBase` subclass)
+    exposes -- stands in for `Memory.embedding_model`. Records every call
+    so tests can assert on exactly what `_CountingEmbedder` counted,
+    independent of whatever `_CountingEmbedder`'s own wrapping logic
+    does."""
+
+    def __init__(self) -> None:
+        self.embed_calls: list[str] = []
+        self.embed_batch_calls: list[list[str]] = []
+
+    def embed(self, text: str, action: str | None = None) -> list[float]:
+        self.embed_calls.append(text)
+        return [0.1, 0.2, 0.3]
+
+    def embed_batch(self, texts: list[str], action: str | None = None) -> list[list[float]]:
+        self.embed_batch_calls.append(list(texts))
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+
 class _FakeMemory:
     """Matches `_MemoryProtocol` in mem0_direct_adapter.py."""
 
-    def __init__(self, vector_store: _FakeVectorStore | None = None) -> None:
+    def __init__(
+        self,
+        vector_store: _FakeVectorStore | None = None,
+        embedding_model: _FakeEmbedder | None = None,
+    ) -> None:
         self.vector_store = vector_store or _FakeVectorStore({"data": "seed"}, b"\xaa\xbb\xcc\xdd")
+        self.embedding_model = embedding_model if embedding_model is not None else _FakeEmbedder()
         self.add_calls: list[dict[str, object]] = []
         self.search_calls: list[dict[str, object]] = []
         self.update_calls: list[dict[str, object]] = []
         self.delete_calls: list[str] = []
         self.raise_on_add: Exception | None = None
         self.raise_on_search: Exception | None = None
+        self.search_results_override: list[dict[str, object]] | None = None
+        """When set, search() returns exactly this results list instead of
+        its default single-record response -- lets tests control each
+        result's `score_details` shape directly (the field
+        LanguageDegradationSignal classification reads) without needing a
+        separate fake-adapter subclass per scenario."""
         self.add_returns_empty_results: bool = False
         """When True, add() returns a well-formed response with zero
         extracted memories -- the exact mem0ai/mem0#5178 shape: no
@@ -132,16 +172,39 @@ class _FakeMemory:
         if self.raise_on_add:
             raise self.raise_on_add
         self.add_calls.append({"messages": messages, "user_id": user_id, "metadata": metadata})
+        # Models the real, installed package's Phase 3 batch-embed step
+        # (mem0/memory/main.py's `_add_to_vector_store()`) closely enough
+        # for _CountingEmbedder tests: one embed_batch() call per add(),
+        # over the single message text -- a real add() may call
+        # embed_batch() with more than one extracted fact, but this fake
+        # never does its own LLM extraction, so one text in, one text
+        # embedded is the honest fake-adapter shape here. Real mem0's
+        # Memory.add() always has a real embedding_model (never None) --
+        # the None case only exists in this fake to test this adapter's
+        # own "no embedder surface" gate, which a real mem0.Memory could
+        # never actually trigger.
+        if self.embedding_model is not None:
+            self.embedding_model.embed_batch([str(messages)], "add")
         if self.add_returns_empty_results:
             return {"results": []}
         return {"results": [{"id": "mem-1", "memory": str(messages), "event": "ADD"}]}
 
-    def search(self, query: str, *, filters=None, top_k=5, threshold=None) -> dict[str, object]:
+    def search(
+        self, query: str, *, filters=None, top_k=5, threshold=None, explain=False
+    ) -> dict[str, object]:
         if self.raise_on_search:
             raise self.raise_on_search
         self.search_calls.append(
-            {"query": query, "filters": filters, "top_k": top_k, "threshold": threshold}
+            {
+                "query": query,
+                "filters": filters,
+                "top_k": top_k,
+                "threshold": threshold,
+                "explain": explain,
+            }
         )
+        if self.search_results_override is not None:
+            return {"results": self.search_results_override}
         return {
             "results": [
                 {
@@ -204,6 +267,127 @@ def test_store_reports_empty_extraction_signal_when_add_returns_no_results() -> 
     assert result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
 
 
+# ---------------------------------------------------------------------------
+# Vendor embedder-call counting and cost attribution (spike-spiegel-21,
+# rank 104, mem0ai/mem0#1900) -- CostTracker.record_embed_calls() wired
+# through store()'s _CountingEmbedder. See scoring/cost_tracker.py's
+# EmbedCallEntry and evals/embedder_cost.py.
+# ---------------------------------------------------------------------------
+
+
+def test_store_records_embed_call_when_cost_tracker_configured() -> None:
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    adapter.store("session-1", "My dog is named Baxter.")
+
+    assert len(tracker.embed_entries) == 1
+    entry = tracker.embed_entries[0]
+    assert entry.call_count == 1
+    assert entry.provider == "injected"  # memory= injection path's embedder_provider default
+    assert entry.estimated_tokens == len("My dog is named Baxter.") // 4
+    assert fake.embedding_model.embed_batch_calls == [["My dog is named Baxter."]]
+
+
+def test_store_records_real_embedder_provider_when_configured() -> None:
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker, embedder_provider="openai")
+    adapter.store("session-1", "content")
+    assert tracker.embed_entries[0].provider == "openai"
+
+
+def test_store_no_embed_call_recorded_when_cost_tracker_not_configured() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)
+    adapter.store("session-1", "content")
+    # Real embed_batch() still ran (this fake's add() always calls it) --
+    # what's under test is that memtrust records NOTHING when no
+    # cost_tracker was configured, not that the vendor call didn't happen.
+    assert fake.embedding_model.embed_batch_calls == [["content"]]
+
+
+def test_store_no_embed_call_recorded_when_memory_has_no_embedding_model() -> None:
+    fake = _FakeMemory()
+    fake.embedding_model = None  # type: ignore[assignment]
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    # Must not raise even though embedding_model is absent -- this adapter
+    # gates counting on embedder being present, same "optional
+    # instrumentation, never a hard requirement" convention every other
+    # opt-in signal in this codebase follows.
+    result = adapter.store("session-1", "content")
+    assert result.memory_id == "mem-1"
+    assert tracker.embed_entries == []
+
+
+def test_counting_embedder_restores_original_methods_after_store() -> None:
+    """_CountingEmbedder must not leave the real embedder's methods
+    monkeypatched after store() returns -- a second, uninstrumented caller
+    sharing the same underlying mem0.Memory must see the original,
+    unwrapped embed()/embed_batch()."""
+    fake = _FakeMemory()
+    original_embed_batch = fake.embedding_model.embed_batch
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    adapter.store("session-1", "content")
+    assert fake.embedding_model.embed_batch == original_embed_batch
+
+
+def test_counting_embedder_scoped_to_a_single_store_call() -> None:
+    """A second store() call with no cost_tracker sharing gets its own,
+    independent EmbedCallEntry -- counting never leaks/accumulates call
+    counts across separate store() invocations."""
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+    adapter.store("session-1", "first")
+    adapter.store("session-1", "second, a longer piece of content")
+    assert len(tracker.embed_entries) == 2
+    assert tracker.embed_entries[0].call_count == 1
+    assert tracker.embed_entries[1].call_count == 1
+    assert tracker.embed_entries[0].estimated_tokens != tracker.embed_entries[1].estimated_tokens
+
+
+def test_embedder_cost_eval_reports_redundant_reembed_against_installed_pipeline() -> None:
+    """run_embedder_cost_eval()'s real-world verdict against the currently
+    installed mem0ai pipeline shape: every store() call independently
+    batch-embeds, with no reuse of a prior search()'s embedding -- see
+    evals/embedder_cost.py's module docstring for the honest scope of why
+    this is expected, not a bug this build introduced."""
+    fake = _FakeMemory()
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+
+    result = run_embedder_cost_eval(adapter, tracker, session_id="s1", content="unchanged content")
+
+    assert result.signal == EmbedderCostSignal.REDUNDANT_REEMBED
+    assert result.first_store_embed_calls == 1
+    assert result.second_store_embed_calls == 1
+    assert result.error is None
+
+
+def test_embedder_cost_eval_not_applicable_when_no_cost_tracker_wired_to_adapter() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)  # no cost_tracker= passed
+    tracker = CostTracker()  # a tracker this adapter was never given
+
+    result = run_embedder_cost_eval(adapter, tracker)
+    assert result.signal == EmbedderCostSignal.NOT_APPLICABLE
+    assert result.error is not None
+
+
+def test_embedder_cost_eval_not_applicable_on_backend_error() -> None:
+    fake = _FakeMemory()
+    fake.raise_on_add = RuntimeError("vendor exploded")
+    tracker = CostTracker()
+    adapter = Mem0DirectAdapter(memory=fake, cost_tracker=tracker)
+
+    result = run_embedder_cost_eval(adapter, tracker)
+    assert result.signal == EmbedderCostSignal.NOT_APPLICABLE
+    assert result.error is not None
+
+
 def test_query_parses_records_and_reports_not_applicable_conflict_signal() -> None:
     fake = _FakeMemory()
     adapter = Mem0DirectAdapter(memory=fake)
@@ -218,6 +402,7 @@ def test_query_parses_records_and_reports_not_applicable_conflict_signal() -> No
             "filters": {"user_id": "session-1"},
             "top_k": 5,
             "threshold": None,
+            "explain": False,
         }
     ]
 
@@ -242,6 +427,166 @@ def test_query_forwards_threshold_to_memory_search() -> None:
     adapter = Mem0DirectAdapter(memory=fake)
     adapter.query("session-1", "what is my dog's name?", threshold=0.6)
     assert fake.search_calls[-1]["threshold"] == 0.6
+
+
+# ---------------------------------------------------------------------------
+# LanguageDegradationSignal (wangjiawei-vegetable, rank 147,
+# mem0ai/mem0#4884) -- query(explain=True) surfaces whether mem0's real
+# hybrid-retrieval BM25/entity-boost signals fired, from score_details.
+# ---------------------------------------------------------------------------
+
+
+def test_query_forwards_explain_to_memory_search() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)
+    adapter.query("session-1", "q", explain=True)
+    assert fake.search_calls[-1]["explain"] is True
+
+
+def test_query_language_degradation_not_applicable_when_explain_false() -> None:
+    fake = _FakeMemory()
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q")  # explain defaults to False
+    assert result.language_degradation_signal == LanguageDegradationSignal.NOT_APPLICABLE
+
+
+def test_query_language_degradation_not_applicable_when_no_records() -> None:
+    fake = _FakeMemory()
+    fake.search_results_override = []
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.NOT_APPLICABLE
+
+
+def test_query_language_degradation_active_when_bm25_score_nonzero() -> None:
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "用户的部署窗口是每周二早上。",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.6, "entity_boost": 0.0},
+        }
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+
+
+def test_query_language_degradation_active_when_entity_boost_nonzero() -> None:
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "content",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.5},
+        }
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+
+
+def test_query_language_degradation_semantic_only_when_every_result_has_zero_bm25_and_entity() -> (
+    None
+):
+    """The exact mem0ai/mem0#4884 shape: every returned result's
+    score_details shows zero contribution from BM25/entity-boost --
+    hybrid retrieval silently degraded to semantic-only for this query."""
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "用户的部署窗口是每周二早上。",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.0},
+        },
+        {
+            "id": "m2",
+            "memory": "不相关的内容",
+            "score": 0.3,
+            "score_details": {"semantic_score": 0.3, "bm25_score": 0.0, "entity_boost": 0.0},
+        },
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.SEMANTIC_ONLY_DEGRADED
+
+
+def test_query_language_degradation_active_if_any_single_result_shows_signal() -> None:
+    """One result with a genuine BM25/entity contribution is enough to
+    classify HYBRID_SIGNALS_ACTIVE, even when other results in the same
+    response show zero -- never a blind "all-or-nothing on the first
+    result" check."""
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "content one",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.0},
+        },
+        {
+            "id": "m2",
+            "memory": "content two",
+            "score": 0.5,
+            "score_details": {"semantic_score": 0.5, "bm25_score": 0.4, "entity_boost": 0.0},
+        },
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+
+
+def test_query_language_degradation_not_applicable_when_score_details_absent() -> None:
+    # explain=True was requested but results carry no score_details field
+    # at all (e.g. an older mem0 version, or a vector store that doesn't
+    # populate it) -- must not crash, and must not guess either signal.
+    fake = _FakeMemory()  # default search() response has no score_details
+    adapter = Mem0DirectAdapter(memory=fake)
+    result = adapter.query("session-1", "q", explain=True)
+    assert result.language_degradation_signal == LanguageDegradationSignal.NOT_APPLICABLE
+
+
+def test_language_degradation_eval_reports_per_script_breakdown() -> None:
+    """run_language_degradation_eval() end to end: a fake mem0 instance
+    whose search() always reports zero bm25_score/entity_boost (modeling
+    mem0ai/mem0#4884's exact bug) classifies every case
+    SEMANTIC_ONLY_DEGRADED, and the per-script breakdown reflects that."""
+    fake = _FakeMemory()
+    fake.search_results_override = [
+        {
+            "id": "m1",
+            "memory": "content",
+            "score": 0.8,
+            "score_details": {"semantic_score": 0.8, "bm25_score": 0.0, "entity_boost": 0.0},
+        }
+    ]
+    adapter = Mem0DirectAdapter(memory=fake)
+
+    result = run_language_degradation_eval(adapter)
+
+    assert len(result.case_results) == 8
+    assert result.semantic_only_degraded_rate == 1.0
+    assert result.hybrid_signals_active_rate == 0.0
+    by_script = result.rate_by_script(LanguageDegradationSignal.SEMANTIC_ONLY_DEGRADED)
+    assert by_script["chinese"] == 1.0
+    assert by_script["arabic"] == 1.0
+    assert by_script["thai"] == 1.0
+    assert by_script["hindi"] == 1.0
+    assert by_script["japanese"] == 1.0
+
+
+def test_language_degradation_eval_records_error_without_crashing() -> None:
+    fake = _FakeMemory()
+    fake.raise_on_search = RuntimeError("vendor exploded")
+    adapter = Mem0DirectAdapter(memory=fake)
+
+    result = run_language_degradation_eval(adapter)
+    assert len(result.case_results) == 8
+    assert all(c.error is not None for c in result.case_results)
+    assert result.scored_cases == []
 
 
 def test_update_full_content_reports_clean_and_calls_memory_update_with_text() -> None:
@@ -954,6 +1299,103 @@ def test_hypothetical_raw_distance_scores_would_invert_threshold_filtering() -> 
     # (raw distance 0.05) is wrongly dropped and the FARTHEST (0.95) kept.
     assert kept_ids == {"actually_far"}
     assert "actually_close" not in kept_ids
+
+
+# ---------------------------------------------------------------------------
+# Live reproduction: malformed-LLM-response extraction failures
+# (mukahraman, rank 180, mem0ai/mem0#3051) -- a real, installed
+# mem0.Memory built via Memory.from_config(), with only the OpenAI LLM
+# client / fastembed embedder / Redis wire-client SDK boundaries mocked,
+# exercising the REAL _add_to_vector_store() pipeline against a genuinely
+# malformed LLM JSON response. Proves ExtractionSignal.EMPTY_EXTRACTION
+# fires instead of a crash, end to end through the real installed
+# package -- not just against the hand-written _FakeMemory double Layer 1
+# above uses. See tests/fixtures/extraction_quality_cases.json's new
+# malformed_llm_response_cases category for the case shapes this mirrors.
+# ---------------------------------------------------------------------------
+
+
+def _build_real_memory_with_mocked_boundaries(llm_response_content: str):
+    """Constructs a REAL mem0.Memory (via Memory.from_config()) with the
+    OpenAI LLM client, fastembed embedder, and Redis vector store all
+    real, installed classes -- only each vendor's own SDK/wire-client
+    boundary is mocked, same convention every other "Layer 2" test in this
+    file follows. `llm_response_content` is the exact string the mocked
+    LLM call returns as its message content, standing in for whatever a
+    real Ollama/OpenAI-compatible endpoint could return.
+    """
+    import mem0
+    import mem0.embeddings.fastembed as fastembed_mod
+    import mem0.llms.openai as openai_llm_mod
+    import mem0.vector_stores.redis as redis_mod
+
+    mock_openai_client = MagicMock()
+    mock_choice = MagicMock()
+    mock_choice.message.content = llm_response_content
+    mock_choice.message.tool_calls = None
+    mock_completion = MagicMock()
+    mock_completion.choices = [mock_choice]
+    mock_openai_client.chat.completions.create.return_value = mock_completion
+
+    mock_text_embedding_instance = MagicMock()
+    mock_text_embedding_instance.embed.return_value = iter([MagicMock(tolist=lambda: [0.1] * 384)])
+
+    with (
+        patch.object(openai_llm_mod, "OpenAI", return_value=mock_openai_client),
+        patch.object(fastembed_mod, "TextEmbedding", return_value=mock_text_embedding_instance),
+        patch.object(redis_mod, "redis"),
+        patch.object(redis_mod, "SearchIndex") as mock_search_index_cls,
+    ):
+        mock_index = MagicMock()
+        mock_search_index_cls.from_dict.return_value = mock_index
+        memory = mem0.Memory.from_config(
+            {
+                "embedder": {"provider": "fastembed", "config": {"embedding_dims": 384}},
+                "vector_store": {
+                    "provider": "redis",
+                    "config": {
+                        "redis_url": "redis://localhost:6379",
+                        "collection_name": "memtrust_test",
+                        "embedding_model_dims": 384,
+                    },
+                },
+            }
+        )
+    return memory
+
+
+def _load_malformed_llm_response_cases() -> list[dict[str, Any]]:
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "extraction_quality_cases.json").read_text()
+    )
+    cases: list[dict[str, Any]] = fixture["malformed_llm_response_cases"]
+    return cases
+
+
+@pytest.mark.parametrize(
+    "case",
+    _load_malformed_llm_response_cases(),
+    ids=lambda case: case["case_id"],
+)
+def test_live_reproduction_malformed_llm_response_reports_empty_extraction(
+    case: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives every malformed_llm_response_cases fixture shape through the
+    REAL installed mem0.Memory.add() pipeline (mocking only the
+    LLM/embedder/vector-store SDK boundaries) and confirms
+    Mem0DirectAdapter.store() reports ExtractionSignal.EMPTY_EXTRACTION --
+    no KeyError, no other crash -- for every malformed-response shape.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-used-network-is-mocked")
+
+    memory = _build_real_memory_with_mocked_boundaries(case["raw_llm_response"])
+    adapter = Mem0DirectAdapter(memory=memory)
+
+    result = adapter.store(case["session_id"], case["content"])
+
+    assert result.memory_id == ""
+    assert result.extraction_signal == ExtractionSignal.EMPTY_EXTRACTION
+    assert result.corruption_signal == CorruptionSignal.CLEAN
 
 
 # ---------------------------------------------------------------------------

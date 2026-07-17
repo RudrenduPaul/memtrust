@@ -138,5 +138,32 @@
       "unique_marker": "Marker-9d82be",
       "recall_query": "when is the quarterly report due"
     }
+  ],
+  "malformed_llm_response_cases": [
+    {
+      "_note": "Original memtrust fixture category -- not derived from any published dataset. Modeled on mem0ai/mem0#3051 (GitHub user mukahraman, 2 independent reporters): a local Ollama+Qdrant stack threw `KeyError: 'facts'` in fact-extraction response parsing when the LLM's JSON response didn't carry the expected key, intermittently (~1-in-7), silently saving nothing with no error surfaced to the caller. The specific `facts`-keyed parsing code path has since been rewritten upstream (the installed mem0ai==2.0.12 package's mem0/memory/main.py::_add_to_vector_store() now reads `.get('memory', [])` inside a broad try/except that falls back to an empty list on ANY parse failure), but the underlying PATTERN -- a malformed/schema-violating LLM extraction response silently swallowed, add() returning successfully having stored nothing -- is still architecturally present by design, confirmed by reading that installed source directly. Each case names the malformed JSON shape a real LLM call could return; see tests/test_mem0_direct_adapter.py's live-reproduction test (mocking only the OpenAI LLM/fastembed embedder/Redis wire-client SDK boundaries, exercising the real installed mem0.Memory.add() pipeline) for where ExtractionSignal.EMPTY_EXTRACTION is confirmed to fire instead of crashing.",
+      "case_id": "mt-extract-malformed-001",
+      "session_id": "extract-malformed-session-1",
+      "content": "The user's preferred deploy window is Tuesday mornings.",
+      "malformed_response_shape": "missing_expected_key",
+      "raw_llm_response": "{\"other_key\": []}",
+      "description": "The LLM's JSON response is well-formed JSON but omits the 'memory' key _add_to_vector_store() expects -- the exact mukahraman shape, updated for the current key name (the code historically expected 'facts')."
+    },
+    {
+      "case_id": "mt-extract-malformed-002",
+      "session_id": "extract-malformed-session-2",
+      "content": "The project deadline moved to September 1st.",
+      "malformed_response_shape": "not_valid_json",
+      "raw_llm_response": "I've extracted the following facts: deadline moved to September 1st.",
+      "description": "The LLM ignored the JSON-object response format instruction entirely and returned plain prose -- json.loads() raises JSONDecodeError, caught by the broad except Exception fallback."
+    },
+    {
+      "case_id": "mt-extract-malformed-003",
+      "session_id": "extract-malformed-session-3",
+      "content": "",
+      "malformed_response_shape": "empty_response",
+      "raw_llm_response": "",
+      "description": "The LLM returned an empty string -- the explicit `if not response or not response.strip()` branch in _add_to_vector_store()."
+    }
   ]
 }

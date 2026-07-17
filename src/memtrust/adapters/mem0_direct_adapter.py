@@ -336,12 +336,43 @@ two adapters -- one with the default prompt, one with a rewritten
 `extraction_quality.py`'s existing `ExtractionQualitySignal` classification
 (building an automated A/B-comparison mode for that eval is a separate,
 larger item, out of scope here).
+
+## Vendor embedder-call counting and cost attribution
+
+An optional `cost_tracker` constructor argument (a `scoring.cost_tracker
+.CostTracker`) enables `store()`'s `_CountingEmbedder`, which wraps
+`memory.embedding_model`'s real `embed()`/`embed_batch()` for the
+duration of a single `store()` call and reports vendor-side embedder-
+call count/estimated-cost via `CostTracker.record_embed_calls()` --
+closing an instrumentation gap this adapter previously had entirely
+(`cost_tracker.py` tracked only memtrust's own judge-LLM spend). Closes
+the gap that kept spike-spiegel-21's merged mem0ai/mem0#1900 fix
+unobservable through this adapter -- see `evals/embedder_cost.py`'s
+module docstring for the honest scope of what this measures against the
+currently installed package (that PR's own targeted code path no longer
+exists in `mem0ai==2.0.12`; this build measures the bug *class* against
+the pipeline that exists today instead, the same honest-substitution
+shape already established above for mem0ai/mem0#3558/Kuzu).
+
+## Language-degradation detection (non-Latin-script i18n)
+
+`query()`'s new `explain` keyword argument (forwarded straight through
+to the real, installed `Memory.search(explain=...)`) surfaces each
+result's `score_details` breakdown, letting `QueryResult
+.language_degradation_signal` report whether the hybrid retrieval
+pipeline's BM25/entity-boost signals genuinely fired for a query, or
+silently degraded to semantic-only retrieval -- see
+`LanguageDegradationSignal` in `base.py` for the full mem0ai/mem0#4884
+(wangjiawei-vegetable) provenance and `evals/language_degradation.py` for
+the eval built on top of this.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
+from types import TracebackType
 from typing import Any, Protocol
 
 from memtrust.adapters.base import (
@@ -351,6 +382,7 @@ from memtrust.adapters.base import (
     CorruptionSignal,
     DeleteResult,
     ExtractionSignal,
+    LanguageDegradationSignal,
     MemoryBackendAdapter,
     MemoryRecord,
     QueryResult,
@@ -358,6 +390,7 @@ from memtrust.adapters.base import (
     StoreResult,
     UpdateResult,
 )
+from memtrust.scoring.cost_tracker import CostTracker
 
 #: The four embedder providers mem0ai#5671 (aws_bedrock), #4711
 #: (fastembed), and #2304 (gemini, openai) concern. This adapter
@@ -419,6 +452,15 @@ class _MemoryProtocol(Protocol):
     """
 
     vector_store: Any
+    embedding_model: Any
+    """The real, installed `mem0.Memory`'s own embedder instance --
+    confirmed present by reading `mem0/memory/main.py` on the installed
+    `mem0ai==2.0.12` package (`self.embedding_model = EmbedderFactory
+    .create(...)` in `Memory.__init__`). Only read by `store()`'s
+    `_CountingEmbedder` wrapper below, which counts real vendor
+    embedder-API calls for cost attribution -- see
+    `scoring/cost_tracker.py`'s `EmbedCallEntry` and this module's "Vendor
+    embedder-call counting" section."""
 
     def add(
         self,
@@ -436,6 +478,7 @@ class _MemoryProtocol(Protocol):
         filters: Mapping[str, object] | None = None,
         top_k: int = ...,
         threshold: float | None = ...,
+        explain: bool = ...,
     ) -> dict[str, object]: ...
 
     def update(
@@ -443,6 +486,78 @@ class _MemoryProtocol(Protocol):
     ) -> dict[str, object]: ...
 
     def delete(self, memory_id: str) -> object: ...
+
+
+class _CountingEmbedder(AbstractContextManager["_CountingEmbedder"]):
+    """Wraps a real, installed mem0 embedder instance's `embed()`/
+    `embed_batch()` methods for the duration of a single `store()` call,
+    counting vendor-side embedding-API calls and total input characters --
+    the primitive `scoring/cost_tracker.py`'s `EmbedCallEntry` needs. See
+    this module's "Vendor embedder-call counting" section.
+
+    Every mem0 embedder class this adapter wires up (`OpenAIEmbedding`,
+    `AWSBedrockEmbedding`, `GoogleGenAIEmbedding`, `FastEmbedEmbedding`)
+    subclasses `mem0.embeddings.base.EmbeddingBase`, which declares both
+    `embed(text, action=None)` and `embed_batch(texts, action=None)` --
+    confirmed by reading the installed `mem0ai==2.0.12` package's
+    `mem0/embeddings/base.py` and every concrete subclass directly. This
+    wrapper monkeypatches the two *instance* methods (not the class),
+    counts calls/characters, and restores the originals on `__exit__` --
+    counting is scoped to exactly one `store()` call's real embedding
+    activity, never leaking across calls or adapters sharing the same
+    underlying `mem0.Memory`.
+
+    This does NOT reproduce spike-spiegel-21's original mem0ai/mem0#1900
+    diff literally -- that PR targeted an older mem0 architecture (a
+    separate LLM-driven ADD/UPDATE/DELETE-decision pass reusing a
+    `new_memories_with_actions` embedding) that no longer exists in the
+    installed `mem0ai==2.0.12`'s "V3 PHASED BATCH PIPELINE" (confirmed by
+    reading `mem0/memory/main.py`'s `_add_to_vector_store()` directly: its
+    Phase 1 embeds only the incoming query text for a similarity search,
+    and Phase 3 unconditionally batch-embeds every LLM-extracted fact with
+    no code path that reuses Phase 1's embedding for unmodified content).
+    Same honest-substitution shape this adapter's own module docstring
+    already establishes for mem0ai/mem0#3558 (Kuzu) -- see
+    `evals/embedder_cost.py`'s module docstring for what this build
+    actually measures against the currently installed package instead.
+    """
+
+    def __init__(self, embedder: Any) -> None:
+        self._embedder = embedder
+        self.call_count = 0
+        self.total_chars = 0
+        self._orig_embed = getattr(embedder, "embed", None)
+        self._orig_embed_batch = getattr(embedder, "embed_batch", None)
+
+    def __enter__(self) -> _CountingEmbedder:
+        if self._orig_embed is not None:
+
+            def counting_embed(text: str, *args: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                self.total_chars += len(text) if isinstance(text, str) else 0
+                return self._orig_embed(text, *args, **kwargs)  # type: ignore[misc]
+
+            self._embedder.embed = counting_embed
+        if self._orig_embed_batch is not None:
+
+            def counting_embed_batch(texts: list[str], *args: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                self.total_chars += sum(len(t) for t in texts if isinstance(t, str))
+                return self._orig_embed_batch(texts, *args, **kwargs)  # type: ignore[misc]
+
+            self._embedder.embed_batch = counting_embed_batch
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if self._orig_embed is not None:
+            self._embedder.embed = self._orig_embed
+        if self._orig_embed_batch is not None:
+            self._embedder.embed_batch = self._orig_embed_batch
 
 
 class Mem0DirectAdapter(MemoryBackendAdapter):
@@ -477,8 +592,19 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         vector_store_config: dict[str, object] | None = None,
         graph_store_provider: str | None = None,
         custom_instructions: str | None = None,
+        cost_tracker: CostTracker | None = None,
         memory: _MemoryProtocol | None = None,
     ) -> None:
+        self._cost_tracker = cost_tracker
+        """Optional shared `CostTracker` this adapter reports vendor-side
+        embedder-call/cost attribution into (see `store()`'s
+        `_CountingEmbedder` usage and `scoring/cost_tracker.py`'s
+        `EmbedCallEntry`) -- `None` (the default) means "not tracked,"
+        matching every other optional-instrumentation default in this
+        codebase (e.g. `StoreResult.verified`'s `None`-means-"not
+        attempted" convention). Counting only actually happens when both
+        this is set AND `memory.embedding_model` is present -- see
+        `store()`."""
         if memory is not None:
             # Test-injection path: skip all env/credential resolution and
             # real mem0.Memory construction entirely. Mirrors
@@ -647,10 +773,27 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
                 # in base.py.
                 extraction_signal=ExtractionSignal.NOT_APPLICABLE,
             )
+        embedder = getattr(memory, "embedding_model", None)
+        counting = (
+            _CountingEmbedder(embedder)
+            if (embedder is not None and self._cost_tracker is not None)
+            else None
+        )
         try:
-            data = memory.add(content, user_id=session_id, metadata=metadata or {})
+            with counting or nullcontext():
+                data = memory.add(content, user_id=session_id, metadata=metadata or {})
         except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
+        if counting is not None and self._cost_tracker is not None:
+            # See scoring/cost_tracker.py's EMBEDDER_PRICING_PER_MILLION_TOKENS
+            # docstring for why this is a char/4 heuristic, not a real
+            # vendor-reported token count.
+            self._cost_tracker.record_embed_calls(
+                label=f"{self.name}:store:{session_id}",
+                provider=self._embedder_provider,
+                call_count=counting.call_count,
+                estimated_tokens=counting.total_chars // 4,
+            )
         memory_id = _extract_memory_id(data)
         # Same mem0ai/mem0#5178 gap this adapter's REST siblings in
         # mem0_adapter.py guard against -- Memory.add() can return without
@@ -673,6 +816,7 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         top_k: int = 5,
         mode: str | None = None,
         threshold: float | None = None,
+        explain: bool = False,
     ) -> QueryResult:
         """Retrieve memories relevant to `query` within `session_id`.
 
@@ -692,6 +836,21 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         them, per `VectorStoreBase.search()`'s documented contract and
         `tests/test_mem0_direct_adapter.py`'s real-package regression
         tests against `mem0.utils.scoring.score_and_rank`).
+
+        `explain` is forwarded to the real, installed `Memory.search()`'s
+        own `explain` parameter (confirmed by reading `mem0/memory/main.py`
+        during this build: `explain (bool, optional): Whether to include
+        score_details for each result. Defaults to False.`). When `True`,
+        each returned result's `score_details` dict (`bm25_score`,
+        `entity_boost`, `semantic_score`, ... -- confirmed by reading
+        `mem0/utils/scoring.py::score_and_rank()` directly) is what this
+        method inspects to set `QueryResult.language_degradation_signal`
+        -- see `LanguageDegradationSignal` in base.py and
+        `evals/language_degradation.py` for the mem0ai/mem0#4884
+        motivation (wangjiawei-vegetable). `explain=False` (the default)
+        leaves `language_degradation_signal` at its own default
+        `NOT_APPLICABLE`, same backward-compatible-default convention
+        `threshold=None` already establishes for this method.
         """
         del mode  # no-op, see store() above
         timer = self._timed()
@@ -701,7 +860,11 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
             raise BackendAPIError(self.name, f"config rejected: {exc}") from exc
         try:
             data = memory.search(
-                query, filters={"user_id": session_id}, top_k=top_k, threshold=threshold
+                query,
+                filters={"user_id": session_id},
+                top_k=top_k,
+                threshold=threshold,
+                explain=explain,
             )
         except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
@@ -736,6 +899,7 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
             records=records,
             conflict_signal=ConflictSignal.NOT_APPLICABLE,
             latency_ms=timer.elapsed_ms(),
+            language_degradation_signal=_classify_language_degradation(raw_results, explain),
             raw=data if isinstance(data, dict) else {"results": data},
         )
 
@@ -1000,3 +1164,54 @@ def _extract_memory_id(data: object) -> str:
         if "id" in data:
             return str(data["id"])
     return ""
+
+
+def _classify_language_degradation(
+    raw_results: list[dict[str, object]], explain: bool
+) -> LanguageDegradationSignal:
+    """Classify whether the hybrid retrieval pipeline's BM25/entity-boost
+    signals fired for this query, from each result's real, installed
+    `score_details` breakdown -- see `LanguageDegradationSignal`'s
+    docstring in base.py and `query()`'s own docstring above for exactly
+    where `score_details` comes from.
+
+    Never trusts a single result's `score_details` in isolation: a query
+    is only classified `SEMANTIC_ONLY_DEGRADED` when at least one result
+    actually carries a `score_details` breakdown to inspect AND every such
+    result shows zero contribution from both signals -- one result with a
+    nonzero `bm25_score`/`entity_boost` is concrete evidence the hybrid
+    pipeline genuinely engaged for this query, even if most results didn't
+    individually benefit from it (mirrors `evals/contradiction.py::
+    classify_case()`'s "never a blind pass-through of an adapter's bare
+    self-report" design principle: this reads the same real per-result
+    evidence every result set carries, not a single top-level flag mem0's
+    response never exposes in the first place). If NO result carries a
+    `score_details` field at all (an older mem0 version, or `explain`
+    wasn't actually honored by whatever handled the call), that is a
+    "nothing was observed" case -- NOT_APPLICABLE, never guessed as
+    degradation just because the diagnostic field itself was absent.
+    """
+    if not explain or not raw_results:
+        return LanguageDegradationSignal.NOT_APPLICABLE
+
+    any_score_details_observed = False
+    any_bm25_or_entity = False
+    for item in raw_results:
+        details = item.get("score_details")
+        if not isinstance(details, dict):
+            continue
+        any_score_details_observed = True
+        bm25_score = details.get("bm25_score") or 0.0
+        entity_boost = details.get("entity_boost") or 0.0
+        try:
+            if float(bm25_score) > 0.0 or float(entity_boost) > 0.0:
+                any_bm25_or_entity = True
+                break
+        except (TypeError, ValueError):
+            continue
+
+    if not any_score_details_observed:
+        return LanguageDegradationSignal.NOT_APPLICABLE
+    if any_bm25_or_entity:
+        return LanguageDegradationSignal.HYBRID_SIGNALS_ACTIVE
+    return LanguageDegradationSignal.SEMANTIC_ONLY_DEGRADED

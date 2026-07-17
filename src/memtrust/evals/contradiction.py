@@ -342,3 +342,110 @@ def run_contradiction_eval(
         )
 
     return result
+
+
+def run_add_only_contradiction_eval(
+    adapter: MemoryBackendAdapter,
+    dataset_path: Path | str = DEFAULT_FIXTURE_PATH,
+) -> ContradictionEvalResult:
+    """Drive each contradiction case through TWO plain `store()` calls, with
+    no explicit `update()` call and no `memory_id` threaded between them --
+    reusing `classify_case()`/`ConflictSignal` completely unchanged.
+
+    Motivating case: NDNM1408 (rank 114), mem0ai/mem0#4956. mem0 v3's
+    `add()` became a single-pass, ADD-only extraction pipeline with no
+    internal UPDATE/DELETE decision for a mutable-state fact (confirmed by
+    reading the installed `mem0ai==2.0.12` package's own
+    `Memory._add_to_vector_store()`, which the module docstring of
+    `mem0_direct_adapter.py` also cites for a different gap: Phase 3 of the
+    "V3 PHASED BATCH PIPELINE" batch-embeds and stores every LLM-extracted
+    fact with no code path that deletes or supersedes an existing, now-
+    contradicted vector). Old and new values for the same mutable fact can
+    therefore coexist in the vector store, and a later query can surface
+    either one -- including the stale one -- depending on ranking, not on
+    which is current.
+
+    `run_contradiction_eval()` above always drives the contradiction
+    through an explicit `adapter.update(session_id, memory_id, content)`
+    call, using the `memory_id` the first `store()` call returned -- the
+    exact "overwrite this specific record" primitive that structurally
+    bypasses the `add()`-time pipeline #4956's bug actually lives in (a
+    caller that always calls a targeted update-by-id will never exercise
+    mem0's own ADD-only extraction/dedup decision at all). This function
+    exists specifically to exercise that pipeline instead: it never calls
+    `update()` and never threads a `memory_id` from the first `store()`
+    call into the second, so a backend whose only conflict-resolution
+    logic lives inside its own explicit update()/upsert()-by-id code path
+    (and not inside `add()` itself) can show a genuinely different signal
+    here than under `run_contradiction_eval()` -- see
+    `tests/test_evals.py::test_add_only_contradiction_eval_reproduces_ndnm1408_stale_shape`
+    for a fake-adapter reproduction of exactly this divergence.
+
+    Same taxonomy, same `classify_case()` logic, same `ConflictSignal`
+    enum as `run_contradiction_eval()` above -- only the call sequence
+    differs. No adapter change and no new signal member were needed to
+    close this gap; `ConflictSignal.SERVED_STALE` already models exactly
+    the "a query can surface the stale one" failure shape #4956 reports,
+    it was just never reachable via this call sequence before.
+
+    Gated on `adapter.supports_update` the same way `run_contradiction_eval()`
+    is: a backend with no update/contradiction-relevant primitive at all has
+    nothing meaningful for this eval to observe either, and reports
+    `NOT_APPLICABLE` for the same reason -- this eval still measures the
+    backend's `add()`-time conflict behavior, which only makes sense to
+    score for backends this harness otherwise treats as contradiction-
+    capable.
+    """
+    cases = load_dataset(dataset_path)
+    result = ContradictionEvalResult(backend_name=adapter.name, dataset_path=str(dataset_path))
+
+    if not adapter.supports_update:
+        for case in cases:
+            result.case_results.append(
+                ContradictionCaseResult(
+                    case=case,
+                    signal=ConflictSignal.NOT_APPLICABLE,
+                    adapter_reported_signal=None,
+                    contains_initial_value=False,
+                    contains_updated_value=False,
+                    retrieved_content="",
+                    error=None,
+                )
+            )
+        return result
+
+    for case in cases:
+        try:
+            # Two plain store() calls -- no update(), no memory_id threaded
+            # from the first call into the second. See this function's
+            # docstring above for exactly why this call sequence matters.
+            adapter.store(case.session_id, case.initial_fact, metadata=case.metadata or None)
+            adapter.store(case.session_id, case.contradicting_fact, metadata=case.metadata or None)
+            query_result = adapter.query(case.session_id, case.query, top_k=5)
+        except BackendAPIError as exc:
+            result.case_results.append(
+                ContradictionCaseResult(
+                    case=case,
+                    signal=ConflictSignal.NOT_APPLICABLE,
+                    adapter_reported_signal=None,
+                    contains_initial_value=False,
+                    contains_updated_value=False,
+                    retrieved_content="",
+                    error=str(exc),
+                )
+            )
+            continue
+
+        final_signal, has_initial, has_updated = classify_case(case, query_result)
+        result.case_results.append(
+            ContradictionCaseResult(
+                case=case,
+                signal=final_signal,
+                adapter_reported_signal=query_result.conflict_signal,
+                contains_initial_value=has_initial,
+                contains_updated_value=has_updated,
+                retrieved_content=" ".join(r.content for r in query_result.records),
+            )
+        )
+
+    return result
