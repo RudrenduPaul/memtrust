@@ -128,6 +128,11 @@ def run_longmemeval(
             )
             continue
 
+        # actual_answer is the raw retrieved-record content, judged directly -- there is
+        # no answer-generation step here. This is "retrieval-graded accuracy," not the
+        # official LongMemEval leaderboard's generate+judge QA-accuracy measurement. See
+        # docs/methodology.md's "Retrieval-graded accuracy vs. generated-answer accuracy"
+        # section before comparing this metric to a leaderboard figure.
         actual_answer = " ".join(r.content for r in query_result.records)
         judge_result = judge.judge_answer(example["question"], example["answer"], actual_answer)
         result.case_results.append(
