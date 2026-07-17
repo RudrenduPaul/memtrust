@@ -1,0 +1,55 @@
+{
+  "_synthetic": true,
+  "_note": "Original memtrust fixture -- not derived from any published dataset. Each case is a single filter dict submitted directly to a backend's underlying vector-store filter-query-building layer via MemoryBackendAdapter.probe_raw_filter() (bypassing query()'s hardcoded {\"user_id\": session_id} filter), and classified by whether it was rejected or accepted. Modeled on mem0ai/mem0#5980 (merged, GitHub user HrushiYadav; closes #5976): ElasticsearchVectorStore previously embedded caller-supplied filter values directly into Elasticsearch `term` queries with no type validation, so a dict/list-valued filter value could inject arbitrary Elasticsearch query-DSL operators, enabling access-control bypass / cross-user memory enumeration. The malicious cases below reproduce that exact shape (a dict or list value where a scalar user/agent/run id is expected); the benign cases are scalar-valued controls a legitimate caller would send. No live Elasticsearch cluster was run against this fixture as of its creation -- see evals/filter_injection.py's module docstring and docs/methodology.md for the honest scope of what this eval closes.",
+  "cases": [
+    {
+      "case_id": "fi-malicious-001",
+      "malicious": true,
+      "filter_key": "user_id",
+      "filter_value": { "$ne": "" },
+      "description": "mem0ai/mem0#5980's literal reproduction case: a dict value for user_id designed to make an unvalidated term query match every document regardless of who owns it -- cross-user memory enumeration if accepted."
+    },
+    {
+      "case_id": "fi-malicious-002",
+      "malicious": true,
+      "filter_key": "user_id",
+      "filter_value": ["victim-a", "victim-b", "victim-c"],
+      "description": "A list value for user_id, reproducing the shape a caller could use to broaden a single-user filter into an OR across several other users' scopes if the filter-building layer treats it as a native Elasticsearch terms-style value with no type check."
+    },
+    {
+      "case_id": "fi-malicious-003",
+      "malicious": true,
+      "filter_key": "agent_id",
+      "filter_value": { "bool": { "should": [{ "match_all": {} }] } },
+      "description": "A nested Elasticsearch query-DSL fragment smuggled in as a filter value for agent_id -- the most direct version of #5980's 'inject arbitrary Elasticsearch query operators' description, since match_all would make the filter match unconditionally if embedded unvalidated."
+    },
+    {
+      "case_id": "fi-malicious-004",
+      "malicious": true,
+      "filter_key": "run_id",
+      "filter_value": { "wildcard": { "metadata.run_id": "*" } },
+      "description": "Same injection class as fi-malicious-003, targeting run_id instead of agent_id/user_id -- confirms the vulnerability class (or its fix) is not specific to a single filter key name."
+    },
+    {
+      "case_id": "fi-benign-001",
+      "malicious": false,
+      "filter_key": "user_id",
+      "filter_value": "alice",
+      "description": "Ordinary, single-user scalar filter -- exactly what Mem0DirectAdapter.query() itself sends as {\"user_id\": session_id}. The control case: a fix for #5980 must not reject this."
+    },
+    {
+      "case_id": "fi-benign-002",
+      "malicious": false,
+      "filter_key": "agent_id",
+      "filter_value": "support-agent-7",
+      "description": "Ordinary scalar agent_id filter, a different key than the user_id control case, to confirm the validation isn't accidentally scoped to only one field name."
+    },
+    {
+      "case_id": "fi-benign-003",
+      "malicious": false,
+      "filter_key": "run_id",
+      "filter_value": 42,
+      "description": "Ordinary scalar filter with a non-string scalar type (int) -- confirms the fix's scalar allowlist (str, int, float, bool) accepts more than just strings, not only the string case."
+    }
+  ]
+}
