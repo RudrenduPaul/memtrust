@@ -6,6 +6,7 @@ _PalaceProtocol shape defined in mempalace_adapter.py.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import httpx
@@ -2011,6 +2012,177 @@ def test_mempalace_query_raises_backend_api_error_when_dict_missing_results_key(
 
     with pytest.raises(BackendAPIError, match="results"):
         adapter.query("room-1", "query")
+
+
+# ---------------------------------------------------------------------------
+# MemPalaceAdapter.metadata_overview() / list_metadata_categories() /
+# list_metadata_subcategories() -- the confirmed-real
+# mempalace.mcp_server.tool_status/tool_list_wings/tool_list_rooms wrapper
+# (see mempalace_adapter.py's "MCP metadata-tool coverage" module docstring
+# section and MemPalace/mempalace#1871, contributor alionar).
+#
+# FakeMCPTools below stands in for the real mempalace.mcp_server module --
+# unlike FakePalace (which stands in for an *unconfirmed guess* at
+# mempalace.Palace), this fake's shape mirrors functions confirmed real
+# against the installed package during this build's investigation.
+# ---------------------------------------------------------------------------
+
+
+class FakeMCPTools:
+    def __init__(self) -> None:
+        self.status_response: dict[str, Any] = {
+            "total_drawers": 0,
+            "wings": {},
+            "rooms": {},
+            "backend": "chroma",
+        }
+        self.list_wings_response: dict[str, Any] = {"wings": {}}
+        self.list_rooms_response: dict[str, Any] = {"wing": "all", "rooms": {}}
+        self.list_rooms_calls: list[str | None] = []
+
+    def tool_status(self) -> dict[str, Any]:
+        return self.status_response
+
+    def tool_list_wings(self) -> dict[str, Any]:
+        return self.list_wings_response
+
+    def tool_list_rooms(self, wing: str | None = None) -> dict[str, Any]:
+        self.list_rooms_calls.append(wing)
+        return self.list_rooms_response
+
+
+class _RaisingMCPTools:
+    """Models the real mempalace.mcp_server functions raising outright
+    (as opposed to returning an `{"error": ...}` dict) -- e.g. an
+    unexpected exception inside the vendor's own code."""
+
+    def tool_status(self) -> dict[str, Any]:
+        raise RuntimeError("sqlite database is locked")
+
+    def tool_list_wings(self) -> dict[str, Any]:
+        raise RuntimeError("sqlite database is locked")
+
+    def tool_list_rooms(self, wing: str | None = None) -> dict[str, Any]:
+        raise RuntimeError("sqlite database is locked")
+
+
+def test_mempalace_supports_metadata_overview_is_true() -> None:
+    assert MemPalaceAdapter.supports_metadata_overview is True
+
+
+def test_mempalace_metadata_overview_reports_wing_room_counts() -> None:
+    tools = FakeMCPTools()
+    tools.status_response = {
+        "total_drawers": 500,
+        "wings": {"wing_0": 250, "wing_1": 250},
+        "rooms": {"room_0": 100, "room_1": 400},
+        "backend": "chroma",
+    }
+    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+
+    overview = adapter.metadata_overview()
+
+    assert overview.total_records == 500
+    assert overview.categories == {"wing_0": 250, "wing_1": 250}
+    assert overview.subcategories == {"room_0": 100, "room_1": 400}
+    assert overview.partial is False
+    assert overview.error is None
+    assert overview.latency_ms >= 0
+
+
+def test_mempalace_list_metadata_categories_wraps_tool_list_wings() -> None:
+    tools = FakeMCPTools()
+    tools.list_wings_response = {"wings": {"wing_a": 3, "wing_b": 7}}
+    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+
+    result = adapter.list_metadata_categories()
+
+    assert result.counts == {"wing_a": 3, "wing_b": 7}
+    assert result.scope is None
+    assert result.error is None
+
+
+def test_mempalace_list_metadata_subcategories_scopes_by_category() -> None:
+    tools = FakeMCPTools()
+    tools.list_rooms_response = {"wing": "wing_a", "rooms": {"room_x": 2, "room_y": 1}}
+    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+
+    result = adapter.list_metadata_subcategories(category="wing_a")
+
+    assert tools.list_rooms_calls == ["wing_a"]
+    assert result.counts == {"room_x": 2, "room_y": 1}
+    assert result.scope == "wing_a"
+
+
+def test_mempalace_list_metadata_subcategories_unscoped_passes_none_wing() -> None:
+    tools = FakeMCPTools()
+    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+
+    adapter.list_metadata_subcategories()
+
+    assert tools.list_rooms_calls == [None]
+
+
+def test_mempalace_metadata_overview_flags_partial_on_backend_error() -> None:
+    """Mirrors the rest of this adapter's "never trust the call didn't
+    raise" rule: a `{"error": ...}` response (the real package's own
+    partial-failure shape, confirmed via tool_status()'s sqlite-integrity
+    and metadata-fetch-exception fallback paths) must surface as
+    partial=True / a non-None error, not silently look like a clean 0."""
+    tools = FakeMCPTools()
+    tools.status_response = {
+        "total_drawers": 100,
+        "wings": {"wing_0": 100},
+        "rooms": {},
+        "error": "tool_status metadata fetch failed",
+        "partial": True,
+    }
+    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=tools)
+
+    overview = adapter.metadata_overview()
+
+    assert overview.partial is True
+    assert overview.error == "tool_status metadata fetch failed"
+
+
+def test_mempalace_metadata_calls_wrap_vendor_exceptions_in_backend_api_error() -> None:
+    adapter = MemPalaceAdapter(palace=FakePalace(), mcp_tools=_RaisingMCPTools())
+
+    with pytest.raises(BackendAPIError, match="sqlite database is locked"):
+        adapter.metadata_overview()
+    with pytest.raises(BackendAPIError, match="sqlite database is locked"):
+        adapter.list_metadata_categories()
+    with pytest.raises(BackendAPIError, match="sqlite database is locked"):
+        adapter.list_metadata_subcategories()
+
+
+def test_mempalace_get_mcp_metadata_tools_raises_clear_error_when_package_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same real-ImportError-path reasoning as
+    # test_mempalace_get_palace_raises_clear_error_when_package_missing
+    # above: the real `mempalace` package is genuinely not installed in
+    # this test environment.
+    monkeypatch.setenv("MEMPALACE_STORAGE_PATH", "/tmp/fake-palace")
+    adapter = MemPalaceAdapter()
+    with pytest.raises(BackendAPIError, match="not installed"):
+        adapter.metadata_overview()
+
+
+def test_mempalace_sync_mcp_palace_path_bridges_storage_path_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mempalace.mcp_server reads MEMPALACE_PALACE_PATH (confirmed real),
+    a different env var name than this adapter's own
+    MEMPALACE_STORAGE_PATH -- metadata_overview() must bridge the two
+    before every call rather than silently assuming they line up."""
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+    monkeypatch.setenv("MEMPALACE_STORAGE_PATH", "/tmp/a-real-palace-path")
+    adapter = MemPalaceAdapter(mcp_tools=FakeMCPTools())
+
+    adapter.metadata_overview()
+
+    assert os.environ.get("MEMPALACE_PALACE_PATH") == "/tmp/a-real-palace-path"
 
 
 # ---------------------------------------------------------------------------
