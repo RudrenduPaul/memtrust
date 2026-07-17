@@ -25,6 +25,17 @@ surface:
   5. mem0ai/mem0#2304 (merged, fixed upstream) -- Gemini/OpenAI embedders
      now forward `embedding_dims`/`dimensions` into the embed call instead
      of silently dropping it.
+  6. mem0ai/mem0#4297 (fixed in the TS SDK; the Python OSS SDK's Qdrant
+     path was never patched and still exhibits the bug *class* today --
+     see "Qdrant support" below) -- a vector-store collection created with
+     a hardcoded/default 1536-dim size regardless of the actual embedder's
+     output dimension, causing a dimension-mismatch `Bad Request` on
+     insert for any non-1536-dim embedder.
+  7. mem0ai/mem0#4453 (companion bug to #4297; confirmed fixed in the
+     installed Python package -- see "Qdrant support" below) -- threshold
+     filtering assuming similarity (higher=better) when a vector store
+     returns raw distance (lower=better), silently inverting which results
+     pass the threshold.
 
 ## Confidence and what was actually confirmed against the real package
 
@@ -70,6 +81,69 @@ the *installed* package, not against a copy of the fixed logic memtrust
 reimplemented itself. That is what justifies treating these four as
 re-validated PASS against the currently pinned `mem0ai` version, not just
 "the GitHub issue says merged."
+
+**Qdrant support (`vector_store_provider="qdrant"`) and #4297/#4453 --
+mixed result, confirmed by reading the installed `mem0.vector_stores.qdrant`,
+`mem0.configs.vector_stores.qdrant`, `mem0.vector_stores.base`, and
+`mem0.utils.scoring` source directly, not by trusting either GitHub issue's
+"merged" status.**
+
+*#4297 (embedding-dimension mismatch): the bug class is still reachable in
+the installed Python package, not fixed.* `QdrantConfig.embedding_model_dims`
+(`mem0/configs/vector_stores/qdrant.py`) defaults to `1536` -- the exact
+same hardcoded OpenAI dimension #4297's TS SDK fix removed for the
+equivalent JS config -- and nothing in `Memory.__init__`/`Memory.from_config()`
+(`mem0/memory/main.py`) reconciles that default against the embedder's real
+output dimension: `EmbedderFactory.create(...)` and
+`VectorStoreFactory.create(...)` are constructed independently, from
+`config.embedder.config` and `config.vector_store.config` respectively,
+with no cross-check between them. `tests/test_mem0_direct_adapter.py`
+exercises the real, installed `mem0.vector_stores.qdrant.Qdrant` class
+directly (mocking only the `QdrantClient` wire boundary) and shows it
+creates a collection sized to whatever `embedding_model_dims` it is given
+-- 1536 if a caller relies on `QdrantConfig`'s own default, the wrong size
+for any non-1536-dim embedder (e.g. `fastembed`'s 384-dim model), and the
+correct size only when a caller explicitly overrides it. This is exactly
+the failure shape #4297 originally described for the TS SDK, still present
+in the Python OSS package today. `Mem0DirectAdapter` itself never hits
+this bug in practice, for the same reason it never hits an analogous
+class of bug for Redis/Valkey: `_build_vector_store_config()` below always
+threads the resolved embedder dimension into `embedding_model_dims`
+explicitly, the same defensive pattern already used for
+`vector_store_provider="redis"`/`"valkey"`. That is a property of this
+adapter's own config-building code, not evidence that mem0ai's Qdrant path
+was fixed upstream -- a caller constructing `mem0.Memory.from_config()`
+directly, without this adapter, remains exposed.
+
+*#4453 (search-threshold inversion): confirmed fixed in the installed
+package, comprehensively, not just for Qdrant.* `mem0.vector_stores.base
+.VectorStoreBase.search()`'s docstring states an explicit, binding
+contract: "All implementations must return similarity scores where higher
+values indicate greater similarity ... Implementations using distance
+metrics must convert to similarity before returning." Every vector-store
+implementation this build inspected in the installed package complies --
+`chroma.py`, `faiss.py`, `milvus.py`, `pgvector.py`, `redis.py`,
+`valkey.py`, `supabase.py`, `turbopuffer.py`, `vertex_ai_vector_search.py`,
+and `s3_vectors.py` all convert a raw distance to a `[0, 1]`-ish similarity
+score (`max(0, 1 - distance)` or `1 / (1 + distance)`) before returning it;
+`qdrant.py`, `pinecone.py`, `weaviate.py`, `opensearch.py`,
+`elasticsearch.py`, `azure_ai_search.py`, and `mongodb.py` return each
+vendor's own already-higher-is-better native score directly, with no
+conversion needed. `mem0.utils.scoring.score_and_rank()` -- the real
+function `Memory._search_vector_store()` calls to apply `threshold` --
+then filters with `if semantic_score < threshold: continue`, i.e. "drop
+anything below the threshold, keep the rest," which is only correct
+because every store's `score` is already similarity-oriented by the time
+it gets there. `tests/test_mem0_direct_adapter.py` exercises this real
+function directly with similarity-shaped scores and confirms it keeps the
+closest matches and drops the farthest, plus a clearly-labeled hypothetical
+test showing what would happen if a store *didn't* comply (the best match
+gets dropped and the worst kept -- the literal inversion #4453 described)
+to make the contract's importance concrete without claiming any real,
+installed store violates it. `Mem0DirectAdapter.query()`'s new `threshold`
+parameter (forwarded straight through to `Memory.search()`) is what makes
+this reachable through this adapter at all -- the same role
+`Mem0SelfHostedAdapter.query()`'s `threshold` parameter plays over REST.
 
 **mem0ai#3558 (Kuzu) cannot be reproduced against the installed package --
 the code path it lived in does not exist here.** This was the one
@@ -117,11 +191,15 @@ not being claimed.
 
 It does not support `graph_store` (see above -- refused outright, loudly).
 It does not implement every vector-store or embedder provider mem0 ships,
-only the ones the five motivating bugs concern: embedders `openai`,
-`aws_bedrock`, `gemini`, `fastembed`; vector stores `redis`, `valkey`. It
-has never been run against a live backend of any kind in this environment
--- every test mocks the vendor SDK/wire-client boundary, same convention
-`docs/methodology.md` already documents for `mem0_adapter.py`.
+only the ones the seven motivating bugs concern: embedders `openai`,
+`aws_bedrock`, `gemini`, `fastembed`; vector stores `redis`, `valkey`,
+`qdrant`. It has never been run against a live backend of any kind in this
+environment -- every test mocks the vendor SDK/wire-client boundary, same
+convention `docs/methodology.md` already documents for `mem0_adapter.py`.
+`query()`'s `threshold` parameter is forwarded to the real
+`Memory.search()` unexercised against a live Qdrant server -- see the
+Qdrant support section above for exactly what was and was not confirmed
+about #4297/#4453 against the installed package alone.
 
 ## Configuration
 
@@ -139,11 +217,17 @@ fallback):
   * `gemini` -> `GOOGLE_API_KEY`
   * `fastembed` -> none (local ONNX model, no credential)
 
-`MEM0_DIRECT_VECTOR_STORE_PROVIDER` (`redis` or `valkey`, default `redis`)
-selects the vector store; `MEM0_DIRECT_VECTOR_STORE_URL` is required for
-whichever one is selected. `MEM0_DIRECT_EMBEDDING_DIMS` optionally overrides
-the per-provider default dimension count threaded into both the embedder
-config and the vector store config, so they never silently disagree.
+`MEM0_DIRECT_VECTOR_STORE_PROVIDER` (`redis`, `valkey`, or `qdrant`, default
+`redis`) selects the vector store; `MEM0_DIRECT_VECTOR_STORE_URL` (or the
+provider-specific `MEM0_DIRECT_QDRANT_URL`/`MEM0_DIRECT_REDIS_URL`/
+`MEM0_DIRECT_VALKEY_URL`) is required for whichever one is selected.
+`MEM0_DIRECT_EMBEDDING_DIMS` optionally overrides the per-provider default
+dimension count threaded into both the embedder config and the vector
+store config (including Qdrant's `embedding_model_dims`, which otherwise
+defaults to a hardcoded `1536` in the installed package -- see the Qdrant
+support section above), so they never silently disagree. `query()` also
+accepts an optional `threshold` keyword argument, forwarded straight
+through to the real `Memory.search()`.
 """
 
 from __future__ import annotations
@@ -172,8 +256,12 @@ from memtrust.adapters.base import (
 #: see module docstring.
 SUPPORTED_EMBEDDER_PROVIDERS = ("openai", "aws_bedrock", "gemini", "fastembed")
 
-#: The two vector store providers mem0ai#4362 concerns.
-SUPPORTED_VECTOR_STORE_PROVIDERS = ("redis", "valkey")
+#: The vector store providers this adapter wires up: `redis`/`valkey` for
+#: mem0ai#4362 (vector-zeroed-on-metadata-update), and `qdrant` for
+#: mem0ai#4297 (embedding-dimension mismatch) and mem0ai#4453 (search-
+#: threshold inversion) -- see module docstring for what this build
+#: actually confirmed about each against the installed package.
+SUPPORTED_VECTOR_STORE_PROVIDERS = ("redis", "valkey", "qdrant")
 
 #: Per-provider embedding dimension defaults, used only when neither
 #: `embedder_config`/`vector_store_config` nor `MEM0_DIRECT_EMBEDDING_DIMS`
@@ -217,7 +305,12 @@ class _MemoryProtocol(Protocol):
     ) -> dict[str, object]: ...
 
     def search(
-        self, query: str, *, filters: Mapping[str, object] | None = None, top_k: int = ...
+        self,
+        query: str,
+        *,
+        filters: Mapping[str, object] | None = None,
+        top_k: int = ...,
+        threshold: float | None = ...,
     ) -> dict[str, object]: ...
 
     def update(
@@ -418,8 +511,32 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         )
 
     def query(
-        self, session_id: str, query: str, top_k: int = 5, mode: str | None = None
+        self,
+        session_id: str,
+        query: str,
+        top_k: int = 5,
+        mode: str | None = None,
+        threshold: float | None = None,
     ) -> QueryResult:
+        """Retrieve memories relevant to `query` within `session_id`.
+
+        `threshold` is forwarded straight through to the real, installed
+        `mem0.Memory.search()`'s own `threshold` parameter (default `0.1`
+        there if this adapter passes `None`, per the installed
+        `Memory._search_vector_store()` -- confirmed by reading
+        `mem0/memory/main.py` during this build). This is the parameter
+        that makes mem0ai/mem0#4453 (search-threshold inversion) reachable
+        through this adapter, the same way `Mem0SelfHostedAdapter.query()`'s
+        `threshold` parameter makes it reachable over REST -- see module
+        docstring for what this build actually confirmed about #4453
+        against the installed package (short version: the bug class does
+        not currently reproduce -- every installed vector store, including
+        Qdrant, is confirmed to return similarity-oriented, higher-is-
+        better scores before `Memory`'s own threshold filtering ever sees
+        them, per `VectorStoreBase.search()`'s documented contract and
+        `tests/test_mem0_direct_adapter.py`'s real-package regression
+        tests against `mem0.utils.scoring.score_and_rank`).
+        """
         del mode  # no-op, see store() above
         timer = self._timed()
         try:
@@ -427,7 +544,9 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         except ValueError as exc:
             raise BackendAPIError(self.name, f"config rejected: {exc}") from exc
         try:
-            data = memory.search(query, filters={"user_id": session_id}, top_k=top_k)
+            data = memory.search(
+                query, filters={"user_id": session_id}, top_k=top_k, threshold=threshold
+            )
         except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
 
@@ -627,7 +746,16 @@ def _build_vector_store_config(
     resolved_dims: int | None,
 ) -> dict[str, object]:
     config: dict[str, object] = dict(vector_store_config)
-    url_key = "redis_url" if provider == "redis" else "valkey_url"
+    # `mem0.configs.vector_stores.{redis,valkey}.py` name their URL field
+    # `redis_url`/`valkey_url`; `mem0.configs.vector_stores.qdrant.QdrantConfig`
+    # names it plain `url` -- confirmed by reading all three installed
+    # config classes directly.
+    if provider == "redis":
+        url_key = "redis_url"
+    elif provider == "valkey":
+        url_key = "valkey_url"
+    else:
+        url_key = "url"
     if url_key not in config and resolved_url is not None:
         config[url_key] = resolved_url
     if "embedding_model_dims" not in config:
