@@ -398,6 +398,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -414,6 +415,7 @@ from memtrust.adapters.base import (
     RankingSignal,
     RetrievalWarning,
     StoreResult,
+    TemporalBoundarySignal,
     UpdateResult,
 )
 
@@ -469,6 +471,48 @@ def _classify_ranking_signal(records: list[MemoryRecord]) -> RankingSignal:
         return RankingSignal.SIGNAL_DRIVEN
 
     return RankingSignal.MISSING_ORDERING_KEY
+
+
+def _classify_boundary_signal(facts: list[KGFact], as_of: str | None) -> TemporalBoundarySignal:
+    """Inspect a `kg_query(as_of=...)` response's own facts for the exact
+    MemPalace/mempalace#1913 boundary-double-count shape (fixed by merged
+    PR#1914) -- see `TemporalBoundarySignal` (adapters/base.py) for the
+    full bug write-up and the "self-report, never trusted blindly by the
+    eval" convention this follows, same as `_classify_ranking_signal`
+    above.
+
+    `as_of=None` (no point-in-time query at all) and an empty `facts` list
+    are both NOT_APPLICABLE -- there is no boundary to have resolved
+    either way. Otherwise, facts are grouped by `(subject, predicate)` --
+    the real `_temporal_filter_sql` matches per-triple, so a boundary
+    double-count can only be observed within one subject/predicate group,
+    never across two different predicates that happen to share an
+    `as_of`. A group is only ever classified DOUBLE_COUNT when it carries
+    2+ distinct `object` values AND at least one fact's `valid_to` equals
+    `as_of` exactly AND at least one fact's `valid_from` equals `as_of`
+    exactly -- the literal "one fact ended here, another started here"
+    shared-instant shape PR#1914's half-open fix targets, not just "this
+    predicate happens to have multiple values" (which could be a
+    legitimately multi-valued predicate this adapter has no schema to
+    rule out, and would be a false positive to flag on that basis alone).
+    """
+    if as_of is None or not facts:
+        return TemporalBoundarySignal.NOT_APPLICABLE
+
+    groups: dict[tuple[str, str], list[KGFact]] = defaultdict(list)
+    for fact in facts:
+        groups[(fact.subject, fact.predicate)].append(fact)
+
+    for group in groups.values():
+        distinct_objects = {f.object for f in group}
+        if len(distinct_objects) < 2:
+            continue
+        ended_at_boundary = any(f.valid_to == as_of for f in group)
+        started_at_boundary = any(f.valid_from == as_of for f in group)
+        if ended_at_boundary and started_at_boundary:
+            return TemporalBoundarySignal.DOUBLE_COUNT
+
+    return TemporalBoundarySignal.CLEAN
 
 
 def _record_metadata(item: dict[str, Any]) -> dict[str, str]:
@@ -606,6 +650,16 @@ class KGQueryResult:
     facts: list[KGFact]
     count: int
     latency_ms: float
+    boundary_signal: TemporalBoundarySignal = TemporalBoundarySignal.NOT_APPLICABLE
+    """This adapter's OWN classification of whether `facts` shows the
+    MemPalace/mempalace#1913 boundary-double-count shape at `as_of` -- see
+    TemporalBoundarySignal (adapters/base.py) and `_classify_boundary_signal`
+    above. Defaults to NOT_APPLICABLE (mirrors every other signal field's
+    backward-compatible-default convention in this package); `kg_query()`
+    below always computes a real value. A self-report only -- see
+    evals/temporal_kg_boundary.py for the eval that independently re-derives
+    this from `facts` rather than trusting this field as the final verdict.
+    """
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1107,5 +1161,6 @@ class MemPalaceAdapter(MemoryBackendAdapter):
             facts=facts,
             count=int(raw.get("count", len(facts))),
             latency_ms=timer.elapsed_ms(),
+            boundary_signal=_classify_boundary_signal(facts, raw.get("as_of")),
             raw=raw,
         )
