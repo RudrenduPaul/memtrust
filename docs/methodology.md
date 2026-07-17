@@ -447,7 +447,7 @@ relying on its output.
 | `mem0_adapter.py` (`Mem0SelfHostedAdapter`, self-hosted OSS server) | **Medium-High on route shape, Low on live end-to-end behavior** | Route shape (`POST /memories`, `GET /memories`, `PUT`/`DELETE /memories/{id}`, `DELETE /memories`, `POST /search`, `GET /memories/{id}/history`, `POST /reset` -- unprefixed, no `/v1/...`) and request models (`MemoryCreate`, `MemoryUpdate`, `SearchRequest` fields including `filters`, `top_k`, `threshold`, and deprecated top-level `user_id`/`run_id`/`agent_id`) were confirmed by fetching the actual `server/main.py` and `server/auth.py` source from `mem0ai/mem0`'s `main` branch on GitHub during this build (2026-07-11) -- not reconstructed from documentation. No auth by default (`AUTH_DISABLED`), default local port 8888, confirmed via both `server/auth.py` and mem0's own Docker self-hosting guide. | This was never run against a live self-hosted instance in this environment -- no HTTP request in this adapter's test suite reaches a real server. `main` is an unpinned, moving branch that can drift from any specific deployment's actual server version. The exact JSON shape `Memory.search()`/`Memory.add()` return (as opposed to the FastAPI request models, which were confirmed) is reused from the hosted adapter's `{"results": [...]}` parsing, not independently re-verified against this server's response handling. |
 | `mem0_direct_adapter.py` (`Mem0DirectAdapter`, direct in-process library, embedder/vector-store selection) | **High on what the installed `mem0ai==2.0.12` package's code actually does (confirmed by reading its real, installed source, not documentation or the GitHub issues), Low on live end-to-end behavior** | Every embedder-dims-forwarding and vector-store vector=None-guard claim below was confirmed by reading the *installed* `mem0.embeddings.{aws_bedrock,fastembed,gemini,openai}.py` and `mem0.vector_stores.{redis,valkey}.py` source directly, and `tests/test_mem0_direct_adapter.py` exercises those real classes with only the vendor SDK/wire-client boundary mocked (`boto3`, `openai`, `google.genai`, `fastembed.TextEmbedding`, `redis`/`valkey`) -- see "Mem0DirectAdapter and the retired Kuzu bug" below for the full finding, including the one surprising negative result (`graph_store`/Kuzu support does not exist in this package version at all). | Never run against a live Redis/Valkey server, a live Bedrock/Gemini/OpenAI embedding endpoint, or a live FastEmbed model download in this environment -- every test mocks the vendor boundary, same convention this document already states for `mem0_adapter.py`. `_read_raw_embedding_bytes()`'s raw-client inspection (used by `update_metadata_only()` to derive `CorruptionSignal.CLEAN`/`VECTOR_ZEROED`) reaches into each vector store's private-ish `schema`/`prefix`/`client` attributes rather than a documented public API, since `VectorStoreBase.get()` does not expose raw vector bytes at all -- confirmed by reading the base class, but still an internals-reaching workaround that could break on a future `mem0ai` release's internal refactor (it would fail closed, into `NOT_APPLICABLE`, not silently misreport). |
 | `zep_graphiti_adapter.py` | **Medium-High** | Graphiti's `add_episode()`/`search()` behavior and its bi-temporal `invalid_at` contradiction-handling mechanism are confirmed via Graphiti's own docs and DeepWiki. This is real, documented product behavior, not a memtrust assumption. | Exact REST path strings under `api.getzep.com` are best-effort. The choice to target Zep Cloud's hosted API rather than self-hosted `graphiti-core` + Neo4j is a deliberate scope decision (see below), not an uncertainty. |
-| `zep_graphiti_selfhosted_adapter.py` (`ZepGraphitiSelfHostedAdapter`, self-hosted `graphiti-core`) | **Medium on wire-level shape, Low on live end-to-end behavior** | Every `graphiti_core` constructor/method signature this adapter calls (`Graphiti(uri=, user=, password=)`, `Graphiti(graph_driver=)`, `FalkorDriver(host=, port=, username=, password=)`, `add_episode(name=, episode_body=, source_description=, reference_time=, group_id=, update_communities=)` returning an `AddEpisodeResults` with an `.episode.uuid`, `search(query, group_ids=, num_results=)` returning `list[EntityEdge]` directly, `remove_episode(episode_uuid)`) was confirmed by fetching the real source files from `getzep/graphiti`'s `main` branch on GitHub (`raw.githubusercontent.com/getzep/graphiti/main/...`) on 2026-07-16 and reading them directly -- not reconstructed from documentation. The four bug citations this adapter's module docstring makes (getzep/graphiti#1302, #836, #1013, #1001) were confirmed the same way: #1302's per-character `O`/`R`/`N`/`T`/`A`/`D` escape-map entries and #836's `communities, community_edges = await semaphore_gather(...)` unpack-of-a-list-of-2-tuples were read verbatim out of `helpers.py`/`graphiti.py`/`community_operations.py` on `main`; #1013's fix (`SET e = edge` replacing an enumerated field list in the Neo4j bulk edge-save query -- Neo4j is the default case in `get_entity_edge_save_bulk_query()`; FalkorDB's own branch of the same function uses the equivalent `SET r = edge`) and #1001's closure (FalkorDB's old `add_triplet()` no longer exists anywhere in the rewritten `falkordb_driver.py`) were confirmed the same way. | The real `graphiti-core` package is not installed in this build environment, and no Neo4j or FalkorDB instance was started or reached during this build -- every signature above was confirmed by reading source, never by importing and calling the real package or a live database. This adapter's own unit tests (`tests/test_adapters.py`) mock a `graphiti_core`-shaped Protocol double, the same convention `mempalace_adapter.py`'s `_PalaceProtocol` already establishes. The `update_communities` toggle is confirmed to thread through to `add_episode()` (and is unit-tested doing so), but nothing in this build can demonstrate it actually triggers #836's `ValueError` without a live instance and real LLM credentials driving entity extraction. `lucene_sanitize()` (#1302) is internal to graphiti-core's search pipeline and is not called anywhere in this adapter's own code -- fixture case `mt-contra-006` (see below) only sets up a query a contributor with a live instance could use to observe the ranking degradation directly, it does not reproduce the bug in this repo's own test suite. `EDGE_INTEGRITY_VIOLATION` (#1013/#1001) is checked at the harness level in `evals/contradiction.py`, but both underlying bugs are confirmed fixed/closed on the `graphiti-core` version this adapter was built against, so a live run today should not actually trigger it. |
+| `zep_graphiti_selfhosted_adapter.py` (`ZepGraphitiSelfHostedAdapter`, self-hosted `graphiti-core`) | **Medium on wire-level shape, Low on live end-to-end behavior** | Every `graphiti_core` constructor/method signature this adapter calls (`Graphiti(uri=, user=, password=)`, `Graphiti(graph_driver=)`, `FalkorDriver(host=, port=, username=, password=)`, `add_episode(name=, episode_body=, source_description=, reference_time=, group_id=, update_communities=)` returning an `AddEpisodeResults` with an `.episode.uuid`, `search(query, group_ids=, num_results=)` returning `list[EntityEdge]` directly, `remove_episode(episode_uuid)`) was confirmed by fetching the real source files from `getzep/graphiti`'s `main` branch on GitHub (`raw.githubusercontent.com/getzep/graphiti/main/...`) on 2026-07-16 and reading them directly -- not reconstructed from documentation. The five bug citations this adapter's module docstring makes (getzep/graphiti#1302, #836, #920, #1013, #1001) were confirmed the same way: #1302's per-character `O`/`R`/`N`/`T`/`A`/`D` escape-map entries and #836's `communities, community_edges = await semaphore_gather(...)` unpack-of-a-list-of-2-tuples were read verbatim out of `helpers.py`/`graphiti.py`/`community_operations.py` on `main`; #920's `TypeError: can't compare offset-naive and offset-aware datetimes` was confirmed via the issue's own filed traceback (`gh issue view 920 --repo getzep/graphiti`, fetched 2026-07-16), pinpointing `resolve_edge_contradictions()` in `edge_operations.py`; #1013's fix (`SET e = edge` replacing an enumerated field list in the Neo4j bulk edge-save query -- Neo4j is the default case in `get_entity_edge_save_bulk_query()`; FalkorDB's own branch of the same function uses the equivalent `SET r = edge`) and #1001's closure (FalkorDB's old `add_triplet()` no longer exists anywhere in the rewritten `falkordb_driver.py`) were confirmed the same way. | The real `graphiti-core` package is not installed in this build environment, and no Neo4j or FalkorDB instance was started or reached during this build -- every signature above was confirmed by reading source, never by importing and calling the real package or a live database. This adapter's own unit tests (`tests/test_adapters.py`) mock a `graphiti_core`-shaped Protocol double, the same convention `mempalace_adapter.py`'s `_PalaceProtocol` already establishes. The `update_communities` toggle is confirmed to thread through to `add_episode()` (and is unit-tested doing so), but nothing in this build can demonstrate it actually triggers #836's `ValueError` without a live instance and real LLM credentials driving entity extraction -- the same limitation applies to #920's `TypeError`, since it also fires deep inside `add_episode()`'s own entity/edge-resolution pipeline, not from anything this adapter's own code calls directly. `lucene_sanitize()` (#1302) is internal to graphiti-core's search pipeline and is not called anywhere in this adapter's own code -- fixture case `mt-contra-006` (see below) only sets up a query a contributor with a live instance could use to observe the ranking degradation directly, it does not reproduce the bug in this repo's own test suite. `EDGE_INTEGRITY_VIOLATION` (#1013/#1001) is checked at the harness level in `evals/contradiction.py`, but both underlying bugs are confirmed fixed/closed on the `graphiti-core` version this adapter was built against, so a live run today should not actually trigger it. `store()` now catches `ValueError`/`TypeError` ahead of its generic exception handler and pattern-matches the exception's type and message against `CrashSignal.UNPACK_ERROR` (#836's shape) and `CrashSignal.TYPE_COMPARISON_ERROR` (#920's shape), attaching the result to the raised `BackendAPIError.crash_signal` -- unit-tested (`tests/test_adapters.py`) against fake clients raising the exact message strings each issue's filed traceback reports. **This closes the "opaque generic error" gap for both issues, not the underlying crashes themselves**: it proves this adapter correctly recognizes each crash's message shape once graphiti-core has already raised it, so a caller/eval can tell "a known bug class crashed" from "some other failure happened" without needing graphiti-core's live source -- it does not prevent either crash, does not fix graphiti-core, and (same limitation as the `update_communities` toggle above) does not prove this adapter's own calls actually trigger either crash against a live instance. |
 | `mempalace_adapter.py` | **Medium on behavior, Low on exact method names** | MemPalace is confirmed local-first, no API key required, SQLite + chromadb backed, and documented as shipping a temporal entity-relationship graph with add/query/invalidate/timeline operations. | The exact Python class and method names (`mempalace.Palace(storage_path=...)`, `.remember()`/`.recall()`/`.invalidate()`) were **not** confirmed against `mempalaceofficial.com/reference/python-api` -- that page was not fetchable during this build. The adapter is written against the documented *concepts*, isolated behind `_get_palace()` so a wrong guess fails with a clear `BackendAPIError` naming the exact assumption, not a confusing `AttributeError` three calls deep. `supported_modes = ("raw", "AAAK")` is the same kind of best-effort assumption: those two names come from mempalace/mempalace#27's community-documented compression-mode claim, not a confirmed `mode` keyword on the real package's `remember()`/`recall()`. **A contributor with access to the real API reference should verify and correct this adapter before treating its output as trustworthy against a live MemPalace instance.** The `importance`/`emotional_weight`/`weight` metadata keys `_classify_ranking_signal()` checks (see the Ranking-Quality eval above) are the same LOW-confidence category: they come from mempalace/mempalace#1733's own root-cause report on `layers.py`, not a confirmed field-name reference for what `recall()`'s response `metadata` actually contains on a live instance. |
 | `openviking_adapter.py` | **Medium on architecture, Low on exact memory-write/query paths** | OpenViking's `viking://` virtual-filesystem paradigm, REST server on port 1933, and `OpenViking`/`SyncHTTPClient`/`AsyncHTTPClient` Python client classes are confirmed via the project's own docs. | The documentation fetched during this build covered resource/skill ingestion (`add_resource`, `add_skill`) in detail but did not surface a confirmed endpoint for writing or querying a conversational *memory* entry specifically -- OpenViking's memory layer is described as automatic session-derived extraction, not a direct "store this fact" call. This adapter's `store()`/`query()`/`update()` are written best-effort against the confirmed filesystem paradigm (write a file under a session-scoped `viking://` path, search that path, overwrite on update). `store()` now honors a `resource_path` metadata key to write to a real nested path (falling back to the prior flat content-hash path otherwise), and `list_resource_paths()` now recursively walks directory entries instead of trusting one flat response -- both are still best-effort against the same unconfirmed `/v1/fs/write`/`/v1/fs/list` paths, not newly-confirmed wire format. **This is the adapter most likely to need correction against a live instance.** |
 
@@ -499,24 +499,56 @@ hosted API (`ZEP_API_KEY`) wraps Graphiti and fits that contract.
 **Self-hosted Graphiti support (`ZepGraphitiSelfHostedAdapter`, added 2026-07-16).** Following the
 precedent stated above, this is a second adapter, `zep_graphiti_selfhosted_adapter.py`, with its own
 configuration story (`GRAPHITI_NEO4J_URI` or `GRAPHITI_FALKORDB_URL`, not `ZEP_API_KEY`) rather than
-a branch inside `ZepGraphitiAdapter`. It exists specifically because four real, independently-verified
+a branch inside `ZepGraphitiAdapter`. It exists specifically because five real, independently-verified
 graphiti-core bug reports -- getzep/graphiti#1302 (`lucene_sanitize()` mis-escaping BM25 queries),
-#836 (`add_episode(update_communities=True)` raising `ValueError` on non-2-node episodes), #1013
-(Neo4j bulk edge-save silently omitting `attributes`/`reference_time`, now fixed upstream), and
-#1001 (FalkorDB's old `add_triplet()` silently no-oping and never setting edge endpoint UUIDs, now
-closed via #1013) -- all live entirely inside the self-hosted `graphiti-core` library layer that
-`ZepGraphitiAdapter`'s hosted REST calls can never reach. See that new adapter's module docstring for
-the full citation trail (each bug was confirmed by fetching and reading the real source from
-`getzep/graphiti`'s `main` branch on GitHub during this build, not by running it against a live
-database) and, plainly, what this build could NOT verify: no Neo4j or FalkorDB instance was ever
-started or reached in this environment, so nothing here demonstrates any of the four bugs actually
-reproducing end-to-end. `ConflictSignal.EDGE_INTEGRITY_VIOLATION` (`adapters/base.py`) and
-`MemoryRecord.attributes` (also `adapters/base.py`) are the two shared-interface additions this
-adapter needed: the former lets `evals/contradiction.py`'s `classify_case()` flag a structurally
-broken edge (missing `source_node_uuid`/`target_node_uuid`) as its own distinct signal instead of
-folding it into an ordinary text-classification miss; the latter lets a backend's structured
-per-record properties (graphiti-core's `EntityEdge.attributes`) survive the adapter boundary at all.
-Both are purely additive to the shared interface -- no existing adapter's behavior changes.
+#836 (`add_episode(update_communities=True)` raising `ValueError` on non-2-node episodes), #920
+(`add_episode()` raising `TypeError: can't compare offset-naive and offset-aware datetimes` from
+`resolve_edge_contradictions()` when a caller passes a tz-aware `reference_time` against a
+tz-naive stored edge timestamp), #1013 (Neo4j bulk edge-save silently omitting
+`attributes`/`reference_time`, now fixed upstream), and #1001 (FalkorDB's old `add_triplet()`
+silently no-oping and never setting edge endpoint UUIDs, now closed via #1013) -- all live entirely
+inside the self-hosted `graphiti-core` library layer that `ZepGraphitiAdapter`'s hosted REST calls
+can never reach. See that new adapter's module docstring for the full citation trail (#1302/#836/
+#1013/#1001 were confirmed by fetching and reading the real source from `getzep/graphiti`'s `main`
+branch on GitHub during this build; #920 was confirmed via the issue's own filed traceback, not by
+running any of them against a live database) and, plainly, what this build could NOT verify: no
+Neo4j or FalkorDB instance was ever started or reached in this environment, so nothing here
+demonstrates any of the five bugs actually reproducing end-to-end. `ConflictSignal.EDGE_INTEGRITY_VIOLATION`,
+`CrashSignal` (`UNPACK_ERROR`/`TYPE_COMPARISON_ERROR`/`UNKNOWN`), and `MemoryRecord.attributes`
+(all `adapters/base.py`) are the shared-interface additions this adapter needed: the first lets
+`evals/contradiction.py`'s `classify_case()` flag a structurally broken edge (missing
+`source_node_uuid`/`target_node_uuid`) as its own distinct signal instead of folding it into an
+ordinary text-classification miss; `CrashSignal` (added to close the #836/#920 "identical opaque
+error" gap -- see below) lets `store()`'s `BackendAPIError` carry which known crash *shape* the
+underlying exception matched, instead of every internal graphiti-core failure surfacing as the
+same undifferentiated string; the last lets a backend's structured per-record properties
+(graphiti-core's `EntityEdge.attributes`) survive the adapter boundary at all. All three are
+purely additive to the shared interface -- no existing adapter's behavior changes.
+
+**Crash classification for #836 and #920 (`CrashSignal`, added 2026-07-16).** Before this change,
+`store()` wrapped every failure -- a genuine network error, an auth failure, #836's `ValueError`,
+#920's `TypeError`, anything -- in the same `BackendAPIError(self.name, str(exc))`, with no way for
+a caller/eval to tell "this specific known graphiti-core bug crashed" apart from "some other,
+unrelated failure happened" short of string-matching `str(exc)` themselves. `store()` now catches
+`ValueError`/`TypeError` ahead of its generic `Exception` handler and pattern-matches the caught
+exception's type and a substring of its message (`_classify_crash()` in
+`zep_graphiti_selfhosted_adapter.py`) against `CrashSignal.UNPACK_ERROR` (message contains "values
+to unpack" -- #836's shape) and `CrashSignal.TYPE_COMPARISON_ERROR` (message contains "offset-naive
+and offset-aware" -- #920's shape), attaching whichever matched (or `CrashSignal.UNKNOWN` if
+neither did) to the raised `BackendAPIError.crash_signal`. This is unit-tested in
+`tests/test_adapters.py` against fake `_GraphitiProtocol` clients that raise the exact message
+strings each issue's own filed GitHub traceback reports, plus guard tests confirming an unrelated
+`ValueError`/`TypeError` (not matching either known shape) and a generic `RuntimeError` both still
+classify as `UNKNOWN` rather than being miscategorized. **What this honestly closes, and what it
+does not:** it proves this adapter can correctly distinguish these two specific crash shapes from
+each other and from a generic failure once graphiti-core has already raised the exception -- a
+real, tested capability a caller/eval can act on (e.g. skip re-running a case that hit a known,
+already-filed upstream bug, versus treating an `UNKNOWN` crash as worth investigating further).
+It does **not** prevent either crash, does not patch or work around graphiti-core, and -- same
+limitation this document already states for the `update_communities` toggle above -- does not
+prove this adapter's own calls into `add_episode()` actually trigger either bug against a live
+Neo4j/FalkorDB instance with real LLM-driven entity extraction; that still requires a live
+deployment this build never had.
 
 **Why Mem0 has two adapters, `Mem0Adapter` and `Mem0SelfHostedAdapter`, not one with a deployment
 flag.** Mem0 ships two materially different deployment shapes: the hosted Platform API
@@ -704,17 +736,33 @@ OpenViking server with `OPENVIKING_API_KEY` configured, which this build pass di
 `ZepGraphitiSelfHostedAdapter` deserves the strongest version of this objection of any adapter in
 this repo: it was built and unit-tested entirely against a Protocol double, because the real
 `graphiti-core` package is not installed in this build environment and no Neo4j or FalkorDB
-instance was ever started or reached. Of the four bugs motivating this adapter's addition, two
+instance was ever started or reached. Of the five bugs motivating this adapter's addition, two
 (getzep/graphiti#1013, #1001) are confirmed already fixed/closed upstream on the version of
 graphiti-core this adapter was built against -- so a live run today should not reproduce them at
 all, and `ConflictSignal.EDGE_INTEGRITY_VIOLATION` exists to catch them only if this adapter is
-ever run against an older, affected version. Of the remaining two, `update_communities=True` is
+ever run against an older, affected version. Of the remaining three, `update_communities=True` is
 confirmed to thread through to `add_episode()` correctly (unit-tested), but nothing in this build
 demonstrates it actually triggers #836's `ValueError` -- that requires a live instance with real
-LLM credentials driving entity extraction, which is outside this build's scope. `lucene_sanitize()`
-(#1302) is never called by this adapter's own code at all; it is internal to graphiti-core's search
-pipeline, and this adapter can only supply a fixture query (`mt-contra-006`) a contributor with a
-live instance could use to observe the effect, not reproduce it here. If a reader wants confidence
-that this adapter reproduces any of these four issues, the honest answer today is: it does not,
-demonstrably, in this build -- verifying against a live Neo4j/FalkorDB deployment is the necessary
-next step, not an optional nice-to-have.
+LLM credentials driving entity extraction, which is outside this build's scope. The same is true of
+#920's `TypeError`: it fires from `resolve_edge_contradictions()` deep inside `add_episode()`'s own
+edge-resolution pipeline, which this adapter's mocked `_GraphitiProtocol` double never actually
+executes, so nothing in this build demonstrates this adapter's own calls trigger it either.
+`lucene_sanitize()` (#1302) is never called by this adapter's own code at all; it is internal to
+graphiti-core's search pipeline, and this adapter can only supply a fixture query (`mt-contra-006`)
+a contributor with a live instance could use to observe the effect, not reproduce it here. If a
+reader wants confidence that this adapter reproduces any of these five issues, the honest answer
+today is: it does not, demonstrably, in this build -- verifying against a live Neo4j/FalkorDB
+deployment is the necessary next step, not an optional nice-to-have.
+
+One narrower, genuinely new capability this build does add and does prove, separate from
+"reproducing" any of the five issues above: `store()`'s `CrashSignal` classification
+(`CrashSignal.UNPACK_ERROR` for #836's exact `ValueError` message shape,
+`CrashSignal.TYPE_COMPARISON_ERROR` for #920's exact `TypeError` message shape) is real, tested
+logic that runs on whatever exception a live instance *would* raise, once it raises it -- proven
+by fake `_GraphitiProtocol` clients in `tests/test_adapters.py` that raise the exact message
+strings each issue's own filed GitHub traceback reports, plus negative tests confirming an
+unrelated `ValueError`/`TypeError` and a generic `RuntimeError` all correctly fall through to
+`CrashSignal.UNKNOWN` rather than being misclassified. That is a real, narrow, honestly-scoped
+capability: distinguishing these two specific known bug classes from an opaque generic failure.
+It is not, and should not be read as, evidence that this adapter reproduces either crash against
+a live deployment -- that remains exactly the unverified gap the paragraph above describes.

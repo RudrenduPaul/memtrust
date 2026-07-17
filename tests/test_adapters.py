@@ -16,6 +16,7 @@ from memtrust.adapters.base import (
     BackendAPIError,
     BackendNotConfiguredError,
     ConflictSignal,
+    CrashSignal,
     DeleteResult,
     ExtractionSignal,
     MemoryBackendAdapter,
@@ -30,6 +31,7 @@ from memtrust.adapters.openviking_adapter import OpenVikingAdapter
 from memtrust.adapters.zep_graphiti_adapter import ZepGraphitiAdapter
 from memtrust.adapters.zep_graphiti_selfhosted_adapter import (
     ZepGraphitiSelfHostedAdapter,
+    _classify_crash,
     _parse_falkordb_url,
 )
 
@@ -1325,6 +1327,46 @@ class _BrokenGraphitiClient:
         pass
 
 
+class _UnpackErrorGraphitiClient:
+    """`add_episode()` raises the exact `ValueError` shape/message
+    getzep/graphiti#836's filed traceback reports -- a tuple/list unpacking
+    count mismatch inside `add_episode(update_communities=True)`'s
+    community-update branch. Only `add_episode` needs to raise this; the
+    other Protocol methods are unused by the tests that inject this
+    client."""
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        raise ValueError("too many values to unpack (expected 2)")
+
+    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise NotImplementedError
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
+class _TypeComparisonErrorGraphitiClient:
+    """`add_episode()` raises the exact `TypeError` shape/message
+    getzep/graphiti#920's filed traceback reports -- a tz-naive vs.
+    tz-aware datetime comparison inside `resolve_edge_contradictions()`,
+    reached from `add_episode()`."""
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        raise TypeError("can't compare offset-naive and offset-aware datetimes")
+
+    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise NotImplementedError
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
 def test_graphiti_selfhosted_configured_via_falkordb_url_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1485,6 +1527,85 @@ def test_graphiti_selfhosted_wraps_vendor_exceptions_in_backend_api_error() -> N
         adapter.query("session-1", "q")
     with pytest.raises(BackendAPIError):
         adapter.delete("id-1")
+
+
+# ---------------------------------------------------------------------------
+# CrashSignal classification -- closes the gap where getzep/graphiti#836
+# and getzep/graphiti#920 both surfaced as an identical opaque
+# BackendAPIError with no way to distinguish "this specific known
+# graphiti-core bug crashed" from "some other failure happened." See
+# CrashSignal in base.py and _classify_crash() in
+# zep_graphiti_selfhosted_adapter.py.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_crash_unpack_value_error_matches_836_shape() -> None:
+    assert (
+        _classify_crash(ValueError("too many values to unpack (expected 2)"))
+        == CrashSignal.UNPACK_ERROR
+    )
+    # #836's traceback can also read "not enough values to unpack" depending
+    # on which side of 2 the extracted node count lands on -- both must
+    # classify the same way, since both come from the same semaphore_gather
+    # unpack-of-a-list-of-2-tuples root cause.
+    assert (
+        _classify_crash(ValueError("not enough values to unpack (expected 2, got 1)"))
+        == CrashSignal.UNPACK_ERROR
+    )
+
+
+def test_classify_crash_datetime_type_error_matches_920_shape() -> None:
+    assert (
+        _classify_crash(TypeError("can't compare offset-naive and offset-aware datetimes"))
+        == CrashSignal.TYPE_COMPARISON_ERROR
+    )
+
+
+def test_classify_crash_generic_runtime_error_is_unknown() -> None:
+    assert _classify_crash(RuntimeError("vendor exploded")) == CrashSignal.UNKNOWN
+
+
+def test_classify_crash_unrelated_value_error_is_unknown() -> None:
+    # A ValueError that is NOT the #836 unpack shape must not be
+    # miscategorized as UNPACK_ERROR just because it's a ValueError.
+    assert _classify_crash(ValueError("invalid literal for int()")) == CrashSignal.UNKNOWN
+
+
+def test_classify_crash_unrelated_type_error_is_unknown() -> None:
+    # Same guard, for TypeError -- must not be miscategorized as
+    # TYPE_COMPARISON_ERROR just because it's a TypeError.
+    assert _classify_crash(TypeError("unsupported operand type(s)")) == CrashSignal.UNKNOWN
+
+
+def test_graphiti_selfhosted_store_classifies_836_unpack_error() -> None:
+    """A fake client raising getzep/graphiti#836's exact ValueError shape
+    is classified as CrashSignal.UNPACK_ERROR on the raised
+    BackendAPIError, not the generic default."""
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=_UnpackErrorGraphitiClient())
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content")
+    assert exc_info.value.crash_signal == CrashSignal.UNPACK_ERROR
+
+
+def test_graphiti_selfhosted_store_classifies_920_type_comparison_error() -> None:
+    """A fake client raising getzep/graphiti#920's exact TypeError shape is
+    classified as CrashSignal.TYPE_COMPARISON_ERROR on the raised
+    BackendAPIError, not the generic default."""
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=_TypeComparisonErrorGraphitiClient())
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content")
+    assert exc_info.value.crash_signal == CrashSignal.TYPE_COMPARISON_ERROR
+
+
+def test_graphiti_selfhosted_store_classifies_generic_failure_as_unknown() -> None:
+    """A fake client raising an unrelated RuntimeError still raises
+    BackendAPIError (existing behavior, unchanged) but now carries an
+    explicit crash_signal=CrashSignal.UNKNOWN rather than leaving the
+    caller with no way to tell this apart from a classified crash."""
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=_BrokenGraphitiClient())
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.store("session-1", "content")
+    assert exc_info.value.crash_signal == CrashSignal.UNKNOWN
 
 
 def test_graphiti_selfhosted_close_calls_client_close() -> None:
