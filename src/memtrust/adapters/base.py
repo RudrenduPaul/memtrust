@@ -252,6 +252,105 @@ class CorruptionSignal(StrEnum):
     field."""
 
 
+class ExtractionQualitySignal(StrEnum):
+    """Whether a backend's write path retained content it should have
+    filtered, correctly filtered content it should have discarded, and
+    whether re-storing previously-recalled content silently fans out into
+    duplicate records.
+
+    This is a distinct taxonomy from ConflictSignal, RankingSignal, and
+    CorruptionSignal above, not a variant of any of them. Those three all
+    presuppose a *single, specific* stored fact -- one that gets
+    contradicted, one whose order matters, one whose write path corrupts
+    it. This taxonomy instead asks a corpus-scale question that none of
+    them can express: across many independently stored items, does the
+    backend retain content indiscriminately regardless of whether it was
+    ever worth storing at all? `evals/contradiction.py`'s own module
+    docstring is explicit that it is a *single-case* contradiction-
+    detection eval; this is the distinct "extraction quality at scale"
+    counterpart the backlog asked for -- see evals/extraction_quality.py.
+
+    Motivating case: mem0ai/mem0#4573 (GitHub user jamebobob). A 32-day
+    real production audit found 97.8% of 10,134 stored mem0 entries were
+    junk the extraction pipeline should never have persisted: boot-file
+    restating (~52.7% -- the agent's own startup/config text re-stored as
+    if it were a new memory every session), cron/heartbeat noise (~11.5%
+    -- routine liveness-check output with no durable content), system
+    dumps (~8.2% -- raw tracebacks/error payloads), and hallucinated
+    profiles (~5.2% -- attributes about the user the model invented, never
+    actually stated). On top of the base junk-retention problem, jamebobob
+    also documented a feedback-loop case: a single hallucinated memory,
+    once recalled back into context, got re-extracted and re-stored as
+    "new" input -- and that single re-store fanned out into 808 duplicate
+    records, not one.
+
+    Honesty caveat (see evals/extraction_quality.py and
+    docs/methodology.md for the full write-up): this enum and the eval
+    that classifies against it are structurally validated against
+    hand-written fake adapters in this repo's own test suite, proving the
+    *classification logic* correctly tells retained-junk apart from
+    rejected-junk and detects unexpected record-count growth after a
+    recall-then-re-store sequence. Neither this enum nor
+    evals/extraction_quality.py has been run against a live mem0 instance
+    at jamebobob's real 10,000+ entry scale -- no live number this eval
+    could report should be read as a reproduction of the 97.8%/808 figures
+    above, only as a harness now capable of measuring the same shape of
+    failure if pointed at a real backend.
+    """
+
+    RETAINED_JUNK = "retained_junk"
+    """A case whose ground-truth `should_be_stored` is False (boot-file
+    restating, cron/heartbeat noise, a system dump, or a hallucinated
+    profile) was still retrievable via query() after being stored -- the
+    backend has no effective extraction-quality gate, or the gate it has
+    did not catch this item. This is the exact failure mode jamebobob's
+    audit measured at 97.8% against real mem0."""
+
+    REJECTED_JUNK = "rejected_junk"
+    """A case whose ground-truth `should_be_stored` is False was NOT
+    retrievable via query() after being stored -- something in the write
+    path (an extraction-quality gate, a dedup/relevance filter, or
+    equivalent) correctly kept it out. The good outcome for a junk case."""
+
+    RETAINED_VALID = "retained_valid"
+    """A case whose ground-truth `should_be_stored` is True was
+    retrievable via query() after being stored -- genuinely valuable
+    content survived the write path. The good outcome for a valid case."""
+
+    LOST_VALID = "lost_valid"
+    """A case whose ground-truth `should_be_stored` is True was NOT
+    retrievable via query() after being stored -- an overly aggressive
+    filter (or an unrelated write-path bug) dropped content that should
+    have been kept. The bad outcome for a valid case, and the necessary
+    counterweight to RETAINED_JUNK: a backend that filters everything
+    would score perfectly on junk-rejection while failing every real user
+    here, which is why this eval scores both axes independently rather
+    than only measuring junk retention."""
+
+    FEEDBACK_LOOP_DUPLICATE = "feedback_loop_duplicate"
+    """After storing a seed item, querying it back (simulating an agent
+    recalling it into context), and re-storing that exact recalled text
+    as if it were new input, the number of matching records grew by more
+    than the single store() call that re-storage represents. This is the
+    generalized shape of jamebobob's exact 808-duplicate finding: one
+    piece of recalled content, re-extracted, fanning out into many stored
+    copies instead of one (or zero, if the backend dedups). See
+    evals/extraction_quality.py's `classify_feedback_loop_case` for the
+    exact growth threshold."""
+
+    NO_UNEXPECTED_GROWTH = "no_unexpected_growth"
+    """The feedback-loop sequence above completed and the record count
+    grew by at most what the single re-store() call should have added --
+    no runaway duplication observed. The good outcome for a feedback-loop
+    case."""
+
+    NOT_APPLICABLE = "not_applicable"
+    """A case could not be classified at all -- the store()/query() call
+    sequence raised BackendAPIError. Recorded explicitly, never silently
+    dropped from the results table, same convention as every other signal
+    enum's NOT_APPLICABLE above."""
+
+
 @dataclass
 class MemoryRecord:
     """One stored memory as returned by a backend's query response."""
