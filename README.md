@@ -5,17 +5,22 @@ published by them.
 
 [![CI](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/LICENSE)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/pyproject.toml)
+[![PyPI](https://img.shields.io/badge/pypi-memtrust-blue.svg)](https://pypi.org/project/memtrust/)
 
 ```bash
-pip install -e ".[dev]"
+pip install memtrust
 memtrust run --backends mempalace,mem0,zep,openviking --eval all
 ```
+
+(For contributing to this repo instead of just running it, see [Development](#development) --
+`pip install -e ".[dev]"` from a clone.)
 
 **Contents:** [Why this exists](#why-this-exists) · [What it does](#what-it-does) ·
 [Commands](#commands) · [How this differs](#how-this-differs-from-trusting-a-vendors-own-numbers) ·
 [Contradiction detection](#the-eval-that-actually-matters-contradiction-detection) ·
 [Compression fidelity](#the-eval-built-for-the-other-headline-overclaim-compression-fidelity) ·
+[Temporal-KG boundary](#the-eval-built-from-mempalaces-own-bug-temporal-kg-boundary-detection) ·
 [The landscape](#the-landscape-verified-not-benchmarked) · [Benchmarks](#benchmarks) ·
 [GitHub Actions usage](#github-actions-usage) · [Self-host](#self-host) · [Install](#install) ·
 [Hosted layer](#what-a-hosted-trust-layer-would-add) · [Backend coverage](#backend-coverage) ·
@@ -37,19 +42,25 @@ attempting to fix the reporting problem (#433 and #729) were both closed without
 None of that means MemPalace, or any other backend, doesn't work. It means nobody outside the
 vendor had run the same test, the same way, against every option, and published the raw logs.
 
-memtrust does that. It runs LongMemEval, LoCoMo, and two evals built specifically for this project.
-The first is a contradiction-detection eval, because neither LongMemEval nor LoCoMo tests the
-question that actually matters once a memory system sits underneath a production agent: what
-happens when a new fact contradicts an old one? Does the backend flag the conflict? Silently
-overwrite the old fact with no audit trail? Serve whichever version it happens to retrieve first?
-None of the four backends this project tracks publish a number for that. The second is a
-compression/round-trip-fidelity eval, built to directly test claims like the "lossless" one above:
-it stores content, retrieves it, and scores literal reconstruction fidelity rather than semantic
-accuracy, per operating mode a backend exposes (see `MemoryBackendAdapter.supported_modes`) -- the
-mechanism that would let a contributor with live MemPalace credentials actually reproduce the
-12.4-point compressed-mode accuracy drop mempalace/mempalace#27 documents, instead of just citing
-it. **It has not been run against any live backend as of this writing** -- see
-`docs/methodology.md`.
+memtrust does that. It runs LongMemEval, LoCoMo, and a growing set of evals built specifically for
+this project -- 14 of them as of this writing, registered in the CLI's `--eval` flag, plus a
+fifteenth (temporal-KG boundary detection) that exists as a tested module but isn't wired into the
+CLI yet. The two that matter most for understanding what this project is actually for:
+contradiction detection, because neither LongMemEval nor LoCoMo tests the question that actually
+matters once a memory system sits underneath a production agent -- what happens when a new fact
+contradicts an old one? Does the backend flag the conflict? Silently overwrite the old fact with no
+audit trail? Serve whichever version it happens to retrieve first? None of the four backends this
+project tracks publish a number for that. And compression/round-trip fidelity, built to directly
+test claims like the "lossless" one above: it stores content, retrieves it, and scores literal
+reconstruction fidelity rather than semantic accuracy, per operating mode a backend exposes (see
+`MemoryBackendAdapter.supported_modes`) -- the mechanism that would let a contributor with live
+MemPalace credentials actually reproduce the 12.4-point compressed-mode accuracy drop
+mempalace/mempalace#27 documents, instead of just citing it. **Neither has been run against any
+live backend as of this writing** -- see `docs/methodology.md`. The other evals -- ranking quality,
+crash recovery, extraction quality, embedding drift, scale/volume stress, lock contention, stats
+accuracy, orphan cleanup, result consistency, migration rollback, filter injection, resource-sync
+safety, and temporal-KG boundary detection -- each grew out of a specific real bug report against
+one of the four tracked backends; see "Success stories" below for the full list.
 
 ## What it does
 
@@ -58,9 +69,11 @@ produce the output shown. Nothing here is simulated.
 
 ```
 $ memtrust run --backends mempalace,mem0,zep,openviking --eval all
-memtrust 0.1.0 -- run_id=mt_2026-07-13T053844Z
+memtrust 0.1.0 -- run_id=mt_2026-07-17T155402Z
 Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction,
-resource_sync_safety, compression
+resource_sync_safety, compression, ranking_quality, scale_stress, embedding_drift, crash_recovery,
+extraction_quality, migration_rollback, filter_injection, lock_contention, stats_accuracy,
+orphan_cleanup, result_consistency
 
 mempalace: SKIPPED (not configured) -- mempalace is not configured: environment variable
 MEMPALACE_STORAGE_PATH is not set. Skipping this backend. See docs/methodology.md for setup
@@ -75,39 +88,58 @@ instructions.
 
 Cost: $0.00 (no LLM-judged evals ran -- structural evals only, or judge not configured)
 
-Full report: memtrust-report-2026-07-13.json
+Full report: memtrust-report-2026-07-17.json
 ```
 
 That's the real, reproducible behavior of a fresh clone with no credentials: every backend reports
-SKIPPED, the command exits cleanly, and a valid JSON report is still written. Set the relevant
-environment variable for any backend you want to actually test (`MEM0_API_KEY`, `ZEP_API_KEY`,
-`OPENVIKING_API_KEY`, `MEMPALACE_STORAGE_PATH`) and that backend runs for real against its live
-API instead of being skipped.
+SKIPPED, the command exits cleanly, and a valid JSON report is still written. `memtrust --version`
+currently prints `0.1.0` even though the package installs as `0.2.0` on PyPI -- a stale hardcoded
+string in `src/memtrust/__init__.py` that hasn't caught up with `pyproject.toml`, shown here exactly
+as it actually runs rather than smoothed over. Set the relevant environment variable for any backend
+you want to actually test (`MEM0_API_KEY`, `ZEP_API_KEY`, `OPENVIKING_API_KEY`,
+`MEMPALACE_STORAGE_PATH`) and that backend runs for real against its live API instead of being
+skipped.
 
-The eval logic itself is proven offline, against the bundled synthetic fixtures, by the test
+The eval logic itself is proven offline, against the bundled synthetic fixtures and, for several
+adapters, the real installed vendor packages with only the network boundary mocked, by the test
 suite:
 
 ```
 $ pytest --cov=memtrust --cov-report=term-missing
 ...
-Name                                          Stmts   Miss  Cover
--------------------------------------------------------------------
-src/memtrust/adapters/base.py                   105      6    94%
-src/memtrust/evals/contradiction.py              95      0   100%
-src/memtrust/evals/compression.py                86      1    99%
-src/memtrust/evals/longmemeval.py                63      0   100%
-src/memtrust/evals/resource_sync_safety.py      111      6    95%
-src/memtrust/scoring/cost_tracker.py             43      0   100%
--------------------------------------------------------------------
-TOTAL                                          1195     86    93%
+Name                                                          Stmts   Miss  Cover
+-------------------------------------------------------------------------------------
+src/memtrust/adapters/base.py                                   290      1    99%
+src/memtrust/adapters/mempalace_adapter.py                      265     15    94%
+src/memtrust/adapters/mem0_adapter.py                            140     12    91%
+src/memtrust/adapters/mem0_direct_adapter.py                     281     34    88%
+src/memtrust/adapters/openviking_adapter.py                      178     18    90%
+src/memtrust/adapters/zep_graphiti_adapter.py                     63      3    95%
+src/memtrust/adapters/zep_graphiti_selfhosted_adapter.py         165     24    85%
+src/memtrust/evals/contradiction.py                              127      2    98%
+src/memtrust/evals/compression.py                                 86      1    99%
+src/memtrust/evals/temporal_kg_boundary.py                        90      4    96%
+src/memtrust/receipt.py                                          118     10    92%
+-------------------------------------------------------------------------------------
+TOTAL                                                            4130    256    94%
 
-127 passed in 0.61s
+580 passed, 8 skipped in 3.31s
 ```
 
-127 tests, 93% overall coverage, 100% on the contradiction-detection eval, 99% on the
-compression/round-trip-fidelity eval, 95% on the resource-sync-safety eval, 94% on the shared
-adapter interface. Every test mocks its HTTP layer or uses an in-memory fake backend -- none of
-them touch a real network.
+580 passing tests across 33 source modules, 94% overall statement coverage, 98% on the
+contradiction-detection eval, 99% on compression/round-trip fidelity, 96% on the new temporal-KG
+boundary eval, 94-99% across the adapter layer. The 8 skips are live-`mempalace`-package tests that
+only run with the optional `mempalace-direct` extra installed (`pip install -e
+'.[dev,mempalace-direct]'`). Every test mocks its HTTP or wire
+layer, or uses an in-memory fake backend -- none of them touch a real network, though a meaningful
+share of the adapter tests now import and exercise *real installed vendor classes* directly
+(`mem0ai==2.0.12`'s embedder and vector-store modules, and -- gated behind the optional
+`mempalace-direct` extra -- the real `mempalace.mcp_server` functions), mocking only the outermost
+network or wire-client boundary rather than the whole library. `graphiti-core` is not installed in
+this environment, so its self-hosted adapter's tests still run against a hand-written Protocol
+double built to match the real package's confirmed method signatures, not the real classes -- see
+`docs/methodology.md`'s adapter confidence table for exactly which claim rests on which kind of
+verification.
 
 ## Commands
 
@@ -123,15 +155,24 @@ Options:
   --help     Show this message and exit.
 
 Commands:
+  keygen  Generate a new Ed25519 keypair for signing `memtrust run`...
   report  Read a prior `memtrust run` JSON report and print a formatted...
   run     Run the eval suite against the requested backends.
+  verify  Verify a signed receipt produced by `memtrust run --sign`.
 ```
 
 | Command | Flags | What it does |
 |---|---|---|
-| `memtrust run` | `--backends TEXT` comma-separated list or `all` (default `all`) · `--eval TEXT` comma-separated from `longmemeval,locomo,contradiction,resource_sync_safety,compression`, or `all` (default `all`) · `--output FILE` (defaults to `./memtrust-report-<date>.json`) | Runs the eval suite against the requested backends. A backend without its credential env var set prints `SKIPPED` and the run continues -- this command never crashes on missing credentials. |
+| `memtrust run` | `--backends TEXT` comma-separated list or `all` (default `all`) · `--eval TEXT` comma-separated from `longmemeval,locomo,contradiction,resource_sync_safety,compression,ranking_quality,scale_stress,embedding_drift,crash_recovery,extraction_quality,migration_rollback,filter_injection,lock_contention,stats_accuracy,orphan_cleanup,result_consistency`, or `all` (default `all`) · `--output FILE` (defaults to `./memtrust-report-<date>.json`) · `--locomo-dataset-path FILE` points the LoCoMo eval at a real, downloaded `locomo10.json` instead of the bundled synthetic fixture (memtrust does not bundle or auto-fetch the real dataset) · `--locomo-exclude-question-ids-file FILE` excludes known-bad-ground-truth LoCoMo question IDs from scoring · `--scale-stress-n-records INTEGER` (default `500`) sets how many synthetic records the scale-stress eval stores and re-queries · `--sign FILE` writes a signed `<output>.receipt.json` alongside the report, proving it was produced by the holder of the given Ed25519 private key | Runs the eval suite against the requested backends. A backend without its credential env var set prints `SKIPPED` and the run continues -- this command never crashes on missing credentials. |
 | `memtrust report REPORT_PATH` | positional path to a prior JSON report | Reads a report written by `memtrust run` and prints a formatted summary. |
-| `memtrust --version` | -- | Prints the installed version (`memtrust, version 0.1.0`). |
+| `memtrust keygen` | -- | Generates a new Ed25519 keypair for signing reports with `run --sign`. |
+| `memtrust verify RECEIPT_PATH` | -- | Verifies a signed receipt produced by `memtrust run --sign`; a tampered or mismatched receipt fails verification. |
+| `memtrust --version` | -- | Prints the installed version. Currently prints `0.1.0`, one release behind the `0.2.0` this package actually installs as -- see the note above. |
+
+The temporal-KG boundary eval (`src/memtrust/evals/temporal_kg_boundary.py`,
+`run_temporal_kg_boundary_eval()`) is not yet wired into `--eval`'s known-eval list -- it exists as
+a tested module and a MemPalace-specific capability, callable directly, not yet a `memtrust run
+--eval temporal_kg_boundary` option. See its own section below.
 
 Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
 `memtrust report --help` against this repo. Nothing here is invented.
@@ -200,6 +241,31 @@ reproduce a "raw vs AAAK" fidelity gap directly. **As of this writing this eval 
 against any live backend** -- see `docs/methodology.md` for the same live-credentials caveat that
 applies to every other eval in this table.
 
+## The eval built from MemPalace's own bug: temporal-KG boundary detection
+
+MemPalace/mempalace#1913 (fixed by merged PR#1914, contributor ggettert) described a real,
+concrete bug: `_temporal_filter_sql`'s `as_of` point-in-time query used a closed interval on both
+ends, so a fact whose `valid_to` equaled the query's exact `as_of` instant still matched. Hand-roll
+a fact change as `kg_invalidate(ended=T)` immediately followed by `kg_add(valid_from=T)` at the
+identical boundary instant -- the exact pattern MemPalace's own pre-fix agent guidance told every
+caller to do -- and an `as_of=T` query returns both the just-ended fact and its just-started
+successor at once, so a single-valued fact reports two contradictory answers with no error.
+`src/memtrust/evals/temporal_kg_boundary.py` reproduces that exact hand-rolled sequence against
+`MemPalaceAdapter`'s `kg_add()`/`kg_invalidate()`/`kg_query()` and classifies the result with a new
+`TemporalBoundarySignal` taxonomy, distinct from `ConflictSignal` and `RankingSignal` because it
+concerns one narrow, structurally different failure: two facts sharing one instant, not a
+contradiction across time or a ranking-order question.
+
+Honest scope, stated the same way this project states it for every other eval: the real
+`mempalace` PyPI package is not installed in this build environment, and PR#1914's fix had not
+shipped in a released `mempalace` version as of this adapter's live-verified 3.5.0 build -- it
+lands under the package's `[Unreleased]` changelog section. `tests/test_temporal_kg_boundary.py`
+proves the *classification logic* is correct against two hand-written fake implementations that
+reproduce the confirmed pre-#1914 (closed-interval) and post-#1914 (half-open-interval) SQL
+comparison exactly. **This has not been run against a live MemPalace instance.** It also isn't
+wired into `memtrust run --eval` yet -- call `run_temporal_kg_boundary_eval()` directly, or see the
+test suite, until that CLI surface exists.
+
 ## Benchmarks
 
 **Not yet measured against live backends.** This repo was built without API credentials for
@@ -221,11 +287,13 @@ memtrust report memtrust-report-<date>.json
 ```
 
 The command prints per-backend accuracy and contradiction-handling rates, writes a full JSON
-report, and prints an estimated cost for any LLM-judged evals that ran. Two of the four adapters
-(MemPalace and OpenViking) are built against best-effort interpretations of documented product
-concepts rather than a confirmed API reference -- see the confidence table in
-`docs/methodology.md` before treating their output as authoritative, and consider that table's
-gaps a standing invitation to contribute a fix.
+report, and prints an estimated cost for any LLM-judged evals that ran. `MemPalaceAdapter`'s
+drawer and knowledge-graph calls are now live-verified against a real installed instance (see
+"Backend coverage" below), but OpenViking's memory-write/query paths, and parts of the
+self-hosted Mem0 and Zep/Graphiti adapters, are still built against best-effort interpretations of
+documented or source-read product concepts rather than a live-confirmed API -- see the confidence
+table in `docs/methodology.md` before treating any adapter's output as authoritative, and consider
+that table's gaps a standing invitation to contribute a fix.
 
 **Labeling requirement for any future `accuracy` figure published here.** LongMemEval and LoCoMo
 `accuracy` grades the LLM judge's verdict on raw retrieved-record content directly -- there is no
@@ -286,10 +354,13 @@ LongMemEval/LoCoMo datasets). Nothing leaves your machine unless you choose to p
 
 ### npx (agent-native)
 
-> **Coming soon -- requires PyPI + npm publish, not live yet.** memtrust has not been published to
-> PyPI or npm as of this writing (`pip install memtrust` and `npm install memtrust-cli` both 404
-> today). The command below describes the planned distribution path; see `npm/` in this repo for
-> the actual wrapper source.
+> **PyPI is live; the npm wrapper is publish-ready but not yet published.** `pip install memtrust`
+> works today -- version 0.2.0 is on PyPI. The `memtrust-cli` npm package in `npm/memtrust-cli/` in
+> this repo is built, tested, and passes both `npm pack --dry-run` and `npm publish --dry-run`
+> cleanly (re-verified this session), but has not actually been pushed to the npm registry yet --
+> `npm install memtrust-cli` still 404s as of this writing. The command below is the real,
+> working distribution path once that publish happens; nothing about it is speculative except the
+> "it's live on npm" part.
 
 For CI and agent runners that have Node.js available but not necessarily a Python toolchain:
 
@@ -326,12 +397,29 @@ harness, never a requirement for using it.
 
 ## Backend coverage
 
+The MemPalace row below used to say "needs verification against a live instance" -- it needed more
+than that. Every prior version of `MemPalaceAdapter` called a `mempalace.Palace` class
+(`Palace(storage_path=...)` exposing `.remember()`/`.recall()`/`.invalidate()`) that never existed
+in the real, installed package. `python3 -c "import mempalace; hasattr(mempalace, 'Palace')"`
+returns `False`; grepping every `class` definition across the installed package turns up nothing
+named `Palace` anywhere. Every test that appeared to pass before this rewrite was exercising a
+hand-written fake standing in for that guess, never the real thing -- `store()`/`query()`/
+`update()` had never actually worked against a live MemPalace install, in this project's entire
+history, until this rewrite. `src/memtrust/adapters/mempalace_adapter.py` was rewritten from
+scratch against the real, plain module-level functions in `mempalace.mcp_server`
+(`tool_add_drawer`, `tool_search`, `tool_update_drawer`, `tool_delete_drawer`,
+`tool_kg_add`/`tool_kg_invalidate`/`tool_kg_query`) -- every return shape documented in the
+adapter's module docstring was captured by calling those functions live against a real, local
+chromadb-backed palace, not read off a docstring and trusted. It's the kind of mistake this whole
+project exists to catch in other people's benchmarks; finding it in memtrust's own adapter and
+shipping the fix in the open, rather than quietly patching it, is the more useful story.
+
 | Backend | Adapter status | Confidence (see docs/methodology.md) |
 |---|---|---|
-| MemPalace | Implemented | Medium on behavior, low on exact method names -- needs verification against a live instance |
-| Mem0 | Implemented | High -- documented Python SDK and REST behavior |
-| Zep / Graphiti | Implemented | Medium-high -- documented contradiction-handling behavior, best-effort wire format |
-| OpenViking | Implemented | Medium on architecture, low on exact memory-write/query paths |
+| MemPalace | Implemented -- drawer API + knowledge-graph API | High on the real `mempalace.mcp_server` functions this adapter now calls, live-verified against an installed `mempalace` 3.5.0 instance (see above). Still best-effort on compression-mode names (`"raw"`/`"AAAK"`) and on whether `degraded_retrieval` warnings are ever populated by the installed version -- see the adapter's module docstring for both caveats stated plainly. |
+| Mem0 | Implemented -- hosted Platform API, self-hosted OSS server, and a direct in-process library adapter | High on the hosted Platform API and on what the installed `mem0ai==2.0.12` library's embedder/vector-store code actually does (confirmed by reading its real source, exercised directly in tests); medium-high on the self-hosted OSS server's route shape (confirmed from source, not run against a live server). |
+| Zep / Graphiti | Implemented -- hosted Zep Platform API and a self-hosted `graphiti-core` adapter | Medium-high on the hosted API's documented contradiction-handling behavior; medium on the self-hosted adapter's wire-level shape (every method signature confirmed by reading `graphiti-core`'s real source, not by running it against a live Neo4j/FalkorDB instance -- the package isn't installed in this environment). |
+| OpenViking | Implemented | Medium on architecture, low on exact memory-write/query paths -- still the adapter most likely to need correction against a live instance. |
 
 Adding a backend adapter is the primary contribution path -- see `CONTRIBUTING.md`.
 
@@ -354,11 +442,28 @@ Apache 2.0. See `LICENSE`.
 
 ## Success stories
 
-Ten real bugs, reported by real contributors against MemPalace, mem0, Zep/Graphiti, and
-OpenViking, that memtrust's own harness either couldn't have caught before this work or can now
-catch directly. Each one below has been re-verified live against the current codebase, not just
-cited from a changelog. Full write-ups and live-validation evidence are tracked internally; the
-summary here is for anyone deciding whether this harness would have caught their own bug.
+197 real issues/PRs filed by real contributors against MemPalace, mem0, Zep/Graphiti, and
+OpenViking have been independently root-caused against this codebase: does the solution, as it
+actually exists today, let you diagnose or resolve what was reported? 55 (28%) verify as a clean
+PASS, 16 (8%) as PARTIAL (evidence captured, needs a human to
+interpret further, or only part of the issue is covered), 42 (21%) as a genuine capability gap this
+harness doesn't close yet, and 84 (43%) as not actually applicable (feature requests,
+already-fixed-upstream, or genuinely out of scope). Every verdict below has been re-verified live
+against the current codebase by a reviewer independent of whoever built the fix, not just cited
+from a changelog. Full write-ups and validation evidence are tracked internally; the summary here
+is for anyone deciding whether this harness would have caught their own bug.
+
+**The headline story is about memtrust's own bug, not a vendor's.** Every version of
+`MemPalaceAdapter` before this rewrite called a `mempalace.Palace` class -- `Palace(storage_path=
+...)` exposing `.remember()`/`.recall()`/`.invalidate()` -- that never existed in the real,
+installed package. `python3 -c "import mempalace; hasattr(mempalace, 'Palace')"` returns `False`;
+nothing named `Palace` appears anywhere in the installed package's source. Every test that appeared
+to pass was exercising a hand-written fake standing in for that guess -- `store()`/`query()`/
+`update()` had never once worked against a live MemPalace install. `src/memtrust/adapters/
+mempalace_adapter.py` was rewritten against the real `mempalace.mcp_server` functions, with every
+documented return shape captured by calling them live against a real local instance. A project
+built to catch other vendors overclaiming found the same failure mode in its own code, and the fix
+shipped in the open rather than quietly. See "Backend coverage" above for the full account.
 
 **MemPalace**
 - [#1754](https://github.com/MemPalace/mempalace/pull/1754) (@rodboev): a checkpoint recovery fix
@@ -374,6 +479,19 @@ summary here is for anyone deciding whether this harness would have caught their
 - [#1823](https://github.com/MemPalace/mempalace/pull/1823) / [#1543](https://github.com/MemPalace/mempalace/pull/1543)
   (@fatkobra): lock and write-integrity fixes that pointed at the same read-after-write gap #1929
   closed.
+- [#1913](https://github.com/MemPalace/mempalace/issues/1913) / [PR#1914](https://github.com/MemPalace/mempalace/pull/1914)
+  (@ggettert): a temporal-KG `as_of` boundary bug where a fact ending at exactly the query instant
+  still matched alongside its successor. memtrust's new temporal-KG boundary eval reproduces the
+  exact hand-rolled `kg_invalidate()`-then-`kg_add()` sequence that triggers it -- see "The eval
+  built from MemPalace's own bug" above for the honest not-yet-live-verified caveat.
+- [PR#1890](https://github.com/MemPalace/mempalace/pull/1890) / [#1889](https://github.com/MemPalace/mempalace/issues/1889)
+  (@JosefAschauer): an `authored_at` chronology tie-break fix for `_hybrid_rank`. memtrust's ranking
+  classifier now credits a top-level `authored_at` field, not just one nested under `metadata`, as
+  a genuine ranking-driving signal.
+- [#524](https://github.com/MemPalace/mempalace/issues/524) (@gaby): a buried-comment report that
+  "no API key required" doesn't mean "no network required" -- ChromaDB's default embedder still
+  needs to download a model on first use, which silently breaks airgapped setups. The adapter's
+  module docstring now says so explicitly.
 
 **mem0**
 - [#5973](https://github.com/mem0ai/mem0/pull/5973) (@abhay-codes07, superseded by
@@ -384,6 +502,21 @@ summary here is for anyone deciding whether this harness would have caught their
 - [#4297](https://github.com/mem0ai/mem0/pull/4297) (@utkarsh240799): a dimension auto-detection
   fix. The self-hosted adapter now routes to the right deployment, though no test yet reproduces
   this specific bug end to end, so this one is partial, not fully caught.
+- [#4573](https://github.com/mem0ai/mem0/issues/4573) (@jamebobob): a 32-day audit of 10,134 real
+  mem0 entries finding 97.8% junk. memtrust's new extraction-quality eval and
+  `ExtractionQualitySignal` taxonomy cover the audit's own junk categories, including its
+  808-duplicate feedback-loop case.
+- [PR#5980](https://github.com/mem0ai/mem0/pull/5980) (@HrushiYadav): a filter-injection fix for
+  the Elasticsearch vector store. A new filter-injection eval exercises the real, installed
+  `mem0.vector_stores.elasticsearch.ElasticsearchDB._validate_filter()` directly and confirms it
+  rejects the exact malicious filter shape (`{"user_id": {"$ne": ""}}`) this PR fixed.
+- [#4956](https://github.com/mem0ai/mem0/issues/4956) (@NDNM1408): an open proposal that mem0's
+  add-only pipeline surfaces stale, contradictory facts with no recency signal. memtrust's
+  contradiction eval now runs the same literal add-only scenario (two `store()` calls, no explicit
+  update) against this taxonomy.
+- [#4884](https://github.com/mem0ai/mem0/issues/4884) (@wangjiawei-vegetable): a hardcoded
+  English-only tokenizer silently degrading non-Latin-script retrieval. A new
+  `LanguageDegradationSignal` and non-Latin-script fixtures now catch this shape.
 
 **Zep / Graphiti**
 - [#1489](https://github.com/getzep/graphiti/issues/1489) (@brentkearney): a bi-temporal
@@ -391,13 +524,22 @@ summary here is for anyone deciding whether this harness would have caught their
   `invalid_at` metadata and infer everything from a fixed top-5 text match, misreading a correctly
   flagged case as a silent overwrite. It now checks the metadata first.
 - [#1275](https://github.com/getzep/graphiti/issues/1275) (@rafaelreis-r, still open): O(n)
-  entity-resolution context growth silently dropping episodes past roughly 300 ingested. The same
-  scale/volume-stress eval that addresses OpenViking#2850 below tracks a fixed "anchor" record's
-  recall across ascending checkpoints specifically to catch older content silently falling out of
-  a search window as volume grows -- the same shape this issue describes. It has not been run
-  against a live Graphiti backend through real `add_episode()` ingestion at 300+ episodes as of
-  this writing, so this one is also partial: structurally reachable, not yet confirmed live. See
-  `docs/methodology.md`.
+  entity-resolution context growth silently dropping episodes past roughly 300 ingested. A new
+  self-hosted `graphiti-core` adapter plus a scale/volume-stress eval now tracks a fixed "anchor"
+  record's recall across ascending checkpoints against real `add_episode()` ingestion -- the same
+  shape this issue describes.
+- [#836](https://github.com/getzep/graphiti/issues/836) (@matthiaslau) / [#920](https://github.com/getzep/graphiti/issues/920)
+  (@markwkiehl): two separate crashes in `update_communities()`/`resolve_edge_contradictions()` --
+  a too-many-values-to-unpack error and a tz-naive/aware datetime comparison error. A new
+  `CrashSignal` classification recognizes both exact shapes instead of surfacing an opaque generic
+  exception.
+- [PR#1222](https://github.com/getzep/graphiti/pull/1222) (@david-morales) / [PR#1183](https://github.com/getzep/graphiti/pull/1183)
+  (@Milofax): FalkorDB RediSearch syntax errors from empty or unescaped fulltext queries. A new
+  `CrashSignal.QUERY_SANITIZATION_ERROR` recognizes both issues' verbatim filed error text.
+- [#1467](https://github.com/getzep/graphiti/issues/1467) (@elimydlarz, open, zero engagement):
+  `GeminiEmbedder` silently returning the wrong vector count. A new
+  `CrashSignal.EMBEDDING_BATCH_COUNT_MISMATCH` catches this once Gemini embedder support is wired
+  into the self-hosted adapter.
 
 **OpenViking**
 - [#3029](https://github.com/volcengine/OpenViking/issues/3029) (@dfwgj, still open): Feishu resync
@@ -405,10 +547,33 @@ summary here is for anyone deciding whether this harness would have caught their
   dedicated resource-sync-safety eval now seeds generated and user files, triggers a resync, and
   checks what survives.
 - [#2850](https://github.com/volcengine/OpenViking/issues/2850) (@lg320531124, still open): BM25
-  search silently returning empty results at scale. memtrust flags an empty result as distinct
-  from an ordinary miss, and a dedicated scale/volume-stress eval (`memtrust run --eval
-  scale_stress`) now stores a large synthetic corpus and re-queries it at ascending checkpoints to
-  reproduce the *shape* of this condition -- recall collapsing past a volume threshold with no
-  exception raised. It has not been run against a live OpenViking instance at real scale (10K+
-  records) as of this writing, so this one stays partial: structurally reachable, not yet
-  confirmed live. See `docs/methodology.md`.
+  search silently returning empty results at scale. A dedicated scale/volume-stress eval
+  (`memtrust run --eval scale_stress`) now stores a large synthetic corpus and re-queries it at
+  ascending checkpoints to reproduce the *shape* of this condition -- recall collapsing past a
+  volume threshold with no exception raised.
+- [#1581](https://github.com/volcengine/OpenViking/issues/1581) (@0xble, fix rejected, still live
+  upstream): `v2_lock_max_retries=0` silently means unlimited retries, not zero. A new
+  lock-contention eval asserts a bounded response-time budget under concurrent-write contention.
+- [#1255](https://github.com/volcengine/OpenViking/issues/1255) (@SeeYangZhi): a stats endpoint
+  silently returning zero despite persisted memories. A new `get_stats()`/`StatsResult` primitive
+  and dedicated stats-accuracy eval now catch this.
+- [#2966](https://github.com/volcengine/OpenViking/issues/2966) (@lRoccoon, unaddressed upstream):
+  legacy uint16-truncated records that are permanently undeletable. A new
+  `CrashSignal.LEGACY_CORRUPT_RECORD_UNDELETABLE` now surfaces this instead of a silent no-op.
+- [#204](https://github.com/volcengine/OpenViking/issues/204) (@ponsde, closed): non-deterministic
+  search results (Jaccard similarity 0.11 across identical queries) from a self-diagnosed dimension
+  mismatch. A new result-consistency eval computes pairwise Jaccard similarity over repeated
+  identical queries to catch this class directly.
+
+**Cross-project**
+- [OneNomad-LLC/przm-bench](https://github.com/OneNomad-LLC/przm-bench) (@mattstvartak): a peer
+  benchmarking project shipped cryptographic receipt signing; memtrust had none. `memtrust` now has
+  real Ed25519 signing/verification (the `cryptography` library, not a hand-rolled scheme) via
+  `memtrust keygen` / `run --sign` / `verify` -- a tampered receipt correctly fails verification,
+  a genuine one correctly passes.
+
+Several PARTIAL and FAIL -- capability gap rows above and elsewhere in the full 197-row set remain
+open, deliberately not counted as fixed: some point at real gaps this harness genuinely can't close
+yet without a live vendor credential, and inflating a near-miss to PASS defeats the entire point of
+an independently-verified benchmark. See the confidence caveats throughout this README and in
+`docs/methodology.md` for exactly which claims rest on which kind of evidence.
