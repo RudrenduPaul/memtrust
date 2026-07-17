@@ -101,6 +101,119 @@ def test_run_surfaces_empty_or_lost_signal_in_json_report(
     assert all(c["records_empty"] for c in evals["locomo"]["cases"])
 
 
+def test_run_accepts_locomo_dataset_path_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """--locomo-dataset-path points `memtrust run` at a real, downloaded
+    locomo10.json-shaped file instead of the bundled synthetic fixture --
+    the CLI entry point for the mechanism `run_locomo(dataset_path=...)`
+    already exposed to Python callers but not to the CLI."""
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/",
+        json={"id": "mem-x"},
+        is_reusable=True,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/search/",
+        json={"results": [{"id": "mem-x", "memory": "some recalled content"}]},
+        is_reusable=True,
+    )
+
+    custom_dataset = tmp_path / "locomo10.json"
+    custom_dataset.write_text(
+        json.dumps(
+            {
+                "conversations": [
+                    {
+                        "conversation_id": "cli-custom-001",
+                        "speaker_a": "A",
+                        "speaker_b": "B",
+                        "session_1_date_time": "2026-01-01 00:00",
+                        "session_1": [{"speaker": "A", "text": "hello", "dia_id": "D1:1"}],
+                        "qa": [
+                            {
+                                "question": "Who said hello?",
+                                "answer": "A",
+                                "category": "single-hop",
+                                "evidence": ["D1:1"],
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mem0",
+            "--eval",
+            "locomo",
+            "--locomo-dataset-path",
+            str(custom_dataset),
+            "--output",
+            str(out_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    locomo_eval = data["results"]["mem0"]["evals"]["locomo"]
+    assert locomo_eval["dataset_path"] == str(custom_dataset)
+    assert len(locomo_eval["cases"]) == 1
+    assert locomo_eval["cases"][0]["conversation_id"] == "cli-custom-001"
+
+
+def test_run_rejects_missing_locomo_dataset_path(tmp_path: Path) -> None:
+    runner = CliRunner()
+    missing = tmp_path / "does_not_exist.json"
+    result = runner.invoke(
+        main,
+        ["run", "--eval", "locomo", "--locomo-dataset-path", str(missing)],
+    )
+    assert result.exit_code != 0
+    assert "does not exist" in result.output.lower() or "does_not_exist" in result.output
+
+
+def test_run_without_locomo_dataset_path_uses_bundled_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+) -> None:
+    """Omitting --locomo-dataset-path must not change existing behavior --
+    the bundled synthetic fixture still runs by default."""
+    from memtrust.evals.locomo import DEFAULT_FIXTURE_PATH
+
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/",
+        json={"id": "mem-x"},
+        is_reusable=True,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url="https://api.mem0.ai/v1/memories/search/",
+        json={"results": [{"id": "mem-x", "memory": "some recalled content"}]},
+        is_reusable=True,
+    )
+
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        ["run", "--backends", "mem0", "--eval", "locomo", "--output", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    assert data["results"]["mem0"]["evals"]["locomo"]["dataset_path"] == str(DEFAULT_FIXTURE_PATH)
+
+
 def test_run_rejects_unknown_backend() -> None:
     runner = CliRunner()
     result = runner.invoke(main, ["run", "--backends", "not-a-real-backend"])
