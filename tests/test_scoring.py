@@ -56,6 +56,67 @@ def test_cost_tracker_summary_lines_nonempty() -> None:
     assert any("deepseek-chat" in line for line in lines)
 
 
+# ---------------------------------------------------------------------------
+# CostTracker.record_embed_calls() / EmbedCallEntry -- vendor-side
+# embedder-call/cost attribution, distinct from record()'s judge-LLM
+# spend. See mem0_direct_adapter.py's _CountingEmbedder and
+# evals/embedder_cost.py (spike-spiegel-21, mem0ai/mem0#1900).
+# ---------------------------------------------------------------------------
+
+
+def test_cost_tracker_record_embed_calls_known_provider_pricing() -> None:
+    tracker = CostTracker()
+    entry = tracker.record_embed_calls(
+        "mem0_direct:store:s1", "openai", call_count=1, estimated_tokens=1_000_000
+    )
+    assert entry.cost_usd == pytest.approx(0.02)
+    assert entry.call_count == 1
+    assert tracker.total_embed_calls == 1
+    assert tracker.total_embed_cost_usd == pytest.approx(0.02)
+
+
+def test_cost_tracker_record_embed_calls_fastembed_is_genuinely_free() -> None:
+    tracker = CostTracker()
+    entry = tracker.record_embed_calls(
+        "mem0_direct:store:s1", "fastembed", call_count=3, estimated_tokens=5_000_000
+    )
+    assert entry.cost_usd == 0.0
+
+
+def test_cost_tracker_record_embed_calls_unknown_provider_uses_default_price() -> None:
+    tracker = CostTracker()
+    entry = tracker.record_embed_calls(
+        "x", "some-new-provider", call_count=1, estimated_tokens=1_000_000
+    )
+    assert entry.cost_usd == pytest.approx(0.10)
+
+
+def test_cost_tracker_embed_calls_accumulate_independently_of_judge_entries() -> None:
+    tracker = CostTracker()
+    tracker.record("judge-case", "deepseek-chat", 1000, 1000)
+    tracker.record_embed_calls("embed-1", "openai", call_count=2, estimated_tokens=2_000_000)
+    assert len(tracker.entries) == 1
+    assert len(tracker.embed_entries) == 1
+    assert tracker.total_embed_calls == 2
+    # The two spend categories never get merged into each other's totals.
+    assert tracker.total_cost_usd != tracker.total_embed_cost_usd
+
+
+def test_cost_tracker_summary_lines_includes_embed_call_line() -> None:
+    tracker = CostTracker()
+    tracker.record_embed_calls("x", "openai", call_count=4, estimated_tokens=4_000_000)
+    lines = tracker.summary_lines()
+    assert any("Vendor embedder calls" in line for line in lines)
+    assert any("openai" in line for line in lines)
+
+
+def test_cost_tracker_summary_lines_empty_when_no_entries_of_either_kind() -> None:
+    tracker = CostTracker()
+    lines = tracker.summary_lines()
+    assert len(lines) == 1
+    assert "$0.00" in lines[0]
+
+
 class _NonAtomicEntryList(list[CostEntry]):
     """Test double standing in for ``CostTracker.entries``.
 

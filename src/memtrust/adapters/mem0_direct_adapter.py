@@ -342,6 +342,8 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
+from types import TracebackType
 from typing import Any, Protocol
 
 from memtrust.adapters.base import (
@@ -358,6 +360,7 @@ from memtrust.adapters.base import (
     StoreResult,
     UpdateResult,
 )
+from memtrust.scoring.cost_tracker import CostTracker
 
 #: The four embedder providers mem0ai#5671 (aws_bedrock), #4711
 #: (fastembed), and #2304 (gemini, openai) concern. This adapter
@@ -419,6 +422,15 @@ class _MemoryProtocol(Protocol):
     """
 
     vector_store: Any
+    embedding_model: Any
+    """The real, installed `mem0.Memory`'s own embedder instance --
+    confirmed present by reading `mem0/memory/main.py` on the installed
+    `mem0ai==2.0.12` package (`self.embedding_model = EmbedderFactory
+    .create(...)` in `Memory.__init__`). Only read by `store()`'s
+    `_CountingEmbedder` wrapper below, which counts real vendor
+    embedder-API calls for cost attribution -- see
+    `scoring/cost_tracker.py`'s `EmbedCallEntry` and this module's "Vendor
+    embedder-call counting" section."""
 
     def add(
         self,
@@ -443,6 +455,78 @@ class _MemoryProtocol(Protocol):
     ) -> dict[str, object]: ...
 
     def delete(self, memory_id: str) -> object: ...
+
+
+class _CountingEmbedder(AbstractContextManager["_CountingEmbedder"]):
+    """Wraps a real, installed mem0 embedder instance's `embed()`/
+    `embed_batch()` methods for the duration of a single `store()` call,
+    counting vendor-side embedding-API calls and total input characters --
+    the primitive `scoring/cost_tracker.py`'s `EmbedCallEntry` needs. See
+    this module's "Vendor embedder-call counting" section.
+
+    Every mem0 embedder class this adapter wires up (`OpenAIEmbedding`,
+    `AWSBedrockEmbedding`, `GoogleGenAIEmbedding`, `FastEmbedEmbedding`)
+    subclasses `mem0.embeddings.base.EmbeddingBase`, which declares both
+    `embed(text, action=None)` and `embed_batch(texts, action=None)` --
+    confirmed by reading the installed `mem0ai==2.0.12` package's
+    `mem0/embeddings/base.py` and every concrete subclass directly. This
+    wrapper monkeypatches the two *instance* methods (not the class),
+    counts calls/characters, and restores the originals on `__exit__` --
+    counting is scoped to exactly one `store()` call's real embedding
+    activity, never leaking across calls or adapters sharing the same
+    underlying `mem0.Memory`.
+
+    This does NOT reproduce spike-spiegel-21's original mem0ai/mem0#1900
+    diff literally -- that PR targeted an older mem0 architecture (a
+    separate LLM-driven ADD/UPDATE/DELETE-decision pass reusing a
+    `new_memories_with_actions` embedding) that no longer exists in the
+    installed `mem0ai==2.0.12`'s "V3 PHASED BATCH PIPELINE" (confirmed by
+    reading `mem0/memory/main.py`'s `_add_to_vector_store()` directly: its
+    Phase 1 embeds only the incoming query text for a similarity search,
+    and Phase 3 unconditionally batch-embeds every LLM-extracted fact with
+    no code path that reuses Phase 1's embedding for unmodified content).
+    Same honest-substitution shape this adapter's own module docstring
+    already establishes for mem0ai/mem0#3558 (Kuzu) -- see
+    `evals/embedder_cost.py`'s module docstring for what this build
+    actually measures against the currently installed package instead.
+    """
+
+    def __init__(self, embedder: Any) -> None:
+        self._embedder = embedder
+        self.call_count = 0
+        self.total_chars = 0
+        self._orig_embed = getattr(embedder, "embed", None)
+        self._orig_embed_batch = getattr(embedder, "embed_batch", None)
+
+    def __enter__(self) -> _CountingEmbedder:
+        if self._orig_embed is not None:
+
+            def counting_embed(text: str, *args: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                self.total_chars += len(text) if isinstance(text, str) else 0
+                return self._orig_embed(text, *args, **kwargs)  # type: ignore[misc]
+
+            self._embedder.embed = counting_embed
+        if self._orig_embed_batch is not None:
+
+            def counting_embed_batch(texts: list[str], *args: Any, **kwargs: Any) -> Any:
+                self.call_count += 1
+                self.total_chars += sum(len(t) for t in texts if isinstance(t, str))
+                return self._orig_embed_batch(texts, *args, **kwargs)  # type: ignore[misc]
+
+            self._embedder.embed_batch = counting_embed_batch
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if self._orig_embed is not None:
+            self._embedder.embed = self._orig_embed
+        if self._orig_embed_batch is not None:
+            self._embedder.embed_batch = self._orig_embed_batch
 
 
 class Mem0DirectAdapter(MemoryBackendAdapter):
@@ -477,8 +561,19 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
         vector_store_config: dict[str, object] | None = None,
         graph_store_provider: str | None = None,
         custom_instructions: str | None = None,
+        cost_tracker: CostTracker | None = None,
         memory: _MemoryProtocol | None = None,
     ) -> None:
+        self._cost_tracker = cost_tracker
+        """Optional shared `CostTracker` this adapter reports vendor-side
+        embedder-call/cost attribution into (see `store()`'s
+        `_CountingEmbedder` usage and `scoring/cost_tracker.py`'s
+        `EmbedCallEntry`) -- `None` (the default) means "not tracked,"
+        matching every other optional-instrumentation default in this
+        codebase (e.g. `StoreResult.verified`'s `None`-means-"not
+        attempted" convention). Counting only actually happens when both
+        this is set AND `memory.embedding_model` is present -- see
+        `store()`."""
         if memory is not None:
             # Test-injection path: skip all env/credential resolution and
             # real mem0.Memory construction entirely. Mirrors
@@ -647,10 +742,27 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
                 # in base.py.
                 extraction_signal=ExtractionSignal.NOT_APPLICABLE,
             )
+        embedder = getattr(memory, "embedding_model", None)
+        counting = (
+            _CountingEmbedder(embedder)
+            if (embedder is not None and self._cost_tracker is not None)
+            else None
+        )
         try:
-            data = memory.add(content, user_id=session_id, metadata=metadata or {})
+            with counting or nullcontext():
+                data = memory.add(content, user_id=session_id, metadata=metadata or {})
         except Exception as exc:  # noqa: BLE001 - real vendor call, wrap uniformly
             raise BackendAPIError(self.name, str(exc)) from exc
+        if counting is not None and self._cost_tracker is not None:
+            # See scoring/cost_tracker.py's EMBEDDER_PRICING_PER_MILLION_TOKENS
+            # docstring for why this is a char/4 heuristic, not a real
+            # vendor-reported token count.
+            self._cost_tracker.record_embed_calls(
+                label=f"{self.name}:store:{session_id}",
+                provider=self._embedder_provider,
+                call_count=counting.call_count,
+                estimated_tokens=counting.total_chars // 4,
+            )
         memory_id = _extract_memory_id(data)
         # Same mem0ai/mem0#5178 gap this adapter's REST siblings in
         # mem0_adapter.py guard against -- Memory.add() can return without
