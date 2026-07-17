@@ -251,10 +251,12 @@ def test_report_command_rejects_invalid_json(tmp_path: Path) -> None:
 
 
 def test_version_flag() -> None:
+    from memtrust import __version__
+
     runner = CliRunner()
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "0.1.0" in result.output
+    assert __version__ in result.output
 
 
 def test_default_output_path_when_not_specified(
