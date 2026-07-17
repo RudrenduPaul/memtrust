@@ -13,7 +13,7 @@ a silent branch inside this one."* That is exactly what this file is.
 
 ## Why this adapter exists
 
-Five real, independently-verified graphiti-core bugs live entirely in the
+Seven real, independently-verified graphiti-core bugs live entirely in the
 self-hosted library layer that `ZepGraphitiAdapter` (hosted REST) cannot
 reach at all, because Zep Cloud's REST surface never exposes graphiti-core's
 internals to a caller:
@@ -85,15 +85,43 @@ internals to a caller:
     -- the FalkorDB driver was rewritten around a
     `graphiti_core/driver/falkordb/operations/` module structure that
     post-dates this bug report.
+  * **getzep/graphiti#1222** (closed, superseded by #1475): a query whose
+    sanitized/stopword-filtered token list comes back empty -- e.g. an
+    empty query string, the exact shape `explore_node` hits when called
+    with only a `node_uuid` and no `node_name` -- makes
+    `build_fulltext_query()` in `graphiti_core/driver/falkordb_driver.py`
+    append empty parentheses to the group filter, producing the invalid
+    RediSearch syntax `(@group_id:"...") ()`, raised as `RediSearch:
+    Syntax error at offset 22 near my_graph`. Confirmed via the PR's own
+    filed reproduction (`gh issue view 1222 --repo getzep/graphiti`,
+    fetched 2026-07-16); closed as a duplicate of #1475 ("taking as the
+    FalkorDB fulltext query-sanitization fix"), which is the PR that
+    actually closes this gap upstream, not #1222 itself.
+  * **getzep/graphiti#1183** (merged): before this fix, `sanitize()`'s
+    character-replacement map in the same `falkordb_driver.py` omitted
+    pipe (`|`), slash (`/`), and backslash (`\\`) -- episode text
+    containing those characters (e.g. `"install.sh | bash"`, the PR's own
+    reported production trigger) survived sanitization, tokenized on
+    whitespace into a stray `|` token, and got rejoined with `" | "` as a
+    RediSearch OR separator, producing an adjacent-pipe malformed query
+    (`"sh | | | bash"`) RediSearch rejects as `RediSearch: Syntax error at
+    offset 178 near sh`. Confirmed via the merged PR's own filed
+    reproduction and diff (`gh pr view 1183 --repo getzep/graphiti`,
+    fetched 2026-07-16): the fix added those three characters to
+    `sanitize()`'s map and filters empty tokens before pipe-joining in
+    `build_fulltext_query()`.
 
-None of the above five confirmations came from running graphiti-core
-against a live Neo4j or FalkorDB instance in this environment -- they came
+None of the above seven confirmations came from running graphiti-core
+against a live Neo4j or FalkorDB instance in this environment -- five came
 from fetching the real source files from `getzep/graphiti`'s `main` branch
 on GitHub (`raw.githubusercontent.com/getzep/graphiti/main/...`) during
-this build, 2026-07-16, and reading them directly. That is stronger
-evidence than documentation, but it is still a snapshot of an unpinned,
-moving branch, and it is not a substitute for exercising this adapter
-against a real deployment. See "What this adapter does NOT prove" below.
+this build, 2026-07-16, and reading them directly; #1222 and #1183 came
+from reading each issue/PR's own filed reproduction and diff via `gh issue
+view`/`gh pr view` the same day. That is stronger evidence than
+documentation, but it is still a snapshot of an unpinned, moving branch (or,
+for #1222/#1183, a point-in-time reading of the issue tracker), and it is
+not a substitute for exercising this adapter against a real deployment. See
+"What this adapter does NOT prove" below.
 
 ## Design: why a separate class/file, not a flag on ZepGraphitiAdapter
 
@@ -193,8 +221,25 @@ FalkorDB instance was started or reached during this build. That means:
     graphiti-core itself. It is a diagnostic classifier applied after the
     fact to whatever exception a live instance (if reached) raises, nothing
     more.
+  * `query()`'s `CrashSignal` classification (`CrashSignal
+    .QUERY_SANITIZATION_ERROR` for #1222's/#1183's shared "RediSearch:
+    Syntax error ..." shape -- same `_classify_crash()` and `CrashSignal`
+    referenced above) is unit-tested against fake clients that raise the
+    exact `RediSearch: Syntax error at offset N near ...` message strings
+    each PR's own filed reproduction reports (`gh issue view 1222`/
+    `gh pr view 1183 --repo getzep/graphiti`, fetched 2026-07-16), for
+    both an empty query string (#1222's trigger) and a query containing
+    pipe/slash characters (#1183's trigger). Same honesty caveat as the
+    `store()` bullet immediately above: this proves the classifier
+    recognizes the shared crash *shape* once a live FalkorDB instance has
+    already raised it, not that this adapter's own `query()` calls
+    actually trigger a RediSearch syntax error against a live instance --
+    the fixtures this adapter's own mocked test double uses never
+    exercise FalkorDB's real `sanitize()`/`build_fulltext_query()`
+    functions at all, the same limitation the `lucene_sanitize()` bullet
+    above already states for #1302.
 
-Anyone relying on this adapter to reproduce any of the five issues above
+Anyone relying on this adapter to reproduce any of the seven issues above
 against a real deployment should verify against a live Neo4j/FalkorDB
 instance first, exactly the same caveat docs/methodology.md already
 states for `Mem0SelfHostedAdapter`, `MemPalaceAdapter`, and
@@ -274,21 +319,32 @@ def _to_plain_dict(obj: object) -> dict[str, object]:
 
 def _classify_crash(exc: Exception) -> CrashSignal:
     """Pattern-match a caught vendor exception's type and message against
-    the two known graphiti-core crash shapes `CrashSignal` (base.py)
+    the three known graphiti-core crash shapes `CrashSignal` (base.py)
     documents, and fall back to `CrashSignal.UNKNOWN` for everything else.
 
-    This is deliberately narrow: it checks the exception's Python type
-    first (ValueError vs. TypeError), then a specific substring within
-    that type's message, so an unrelated ValueError (say, a malformed
-    UUID) or an unrelated TypeError (say, a wrong-argument-count bug) is
-    never miscategorized as getzep/graphiti#836 or #920. Matching a
-    substring of `str(exc)` is the only surface available here -- once a
-    vendor library has already raised, this adapter has no access to the
-    original traceback's source location, only what the exception itself
-    reports. See CrashSignal's docstring in base.py for the full honesty
-    caveat: this recognizes a known crash *shape*, it does not prove (or
-    require) that the crash occurred at the exact upstream line this
-    adapter's module docstring cites.
+    This is deliberately narrow: the first two checks look at the
+    exception's Python type first (ValueError vs. TypeError), then a
+    specific substring within that type's message, so an unrelated
+    ValueError (say, a malformed UUID) or an unrelated TypeError (say, a
+    wrong-argument-count bug) is never miscategorized as getzep/graphiti
+    #836 or #920. Matching a substring of `str(exc)` is the only surface
+    available here -- once a vendor library has already raised, this
+    adapter has no access to the original traceback's source location,
+    only what the exception itself reports. See CrashSignal's docstring in
+    base.py for the full honesty caveat: this recognizes a known crash
+    *shape*, it does not prove (or require) that the crash occurred at the
+    exact upstream line this adapter's module docstring cites.
+
+    The third check (RediSearch `Syntax error`, getzep/graphiti#1222/
+    #1183) is message-only, with no `isinstance` gate: the real exception
+    FalkorDB's RediSearch fulltext-query path raises is typically a
+    `redis`-client `ResponseError`, and this adapter deliberately does not
+    import the optional `redis`/`falkordb` packages just to `isinstance`-
+    check against them (see `_get_client()` above -- graphiti-core's
+    FalkorDB extra is optional and may not be installed). Requiring both
+    "redisearch" and "syntax error" as substrings (not "syntax error"
+    alone) keeps this from ever matching an unrelated Python `SyntaxError`
+    or a different vendor's syntax-error message.
     """
     message = str(exc).lower()
     if isinstance(exc, ValueError) and "values to unpack" in message:
@@ -302,6 +358,15 @@ def _classify_crash(exc: Exception) -> CrashSignal:
         # getzep/graphiti#920: comparing a tz-naive stored timestamp
         # against a tz-aware datetime in edge-contradiction resolution.
         return CrashSignal.TYPE_COMPARISON_ERROR
+    if "redisearch" in message and "syntax error" in message:
+        # getzep/graphiti#1222 (empty sanitized query -> "(@group_id:...)
+        # ()") / #1183 (unescaped |, /, \ in episode text -> an empty
+        # token between RediSearch OR-pipe delimiters) -- both raise the
+        # identical "RediSearch: Syntax error at offset N near ..." shape
+        # from FalkorDB's fulltext-query path. See CrashSignal
+        # .QUERY_SANITIZATION_ERROR's docstring in base.py for the full
+        # citation trail.
+        return CrashSignal.QUERY_SANITIZATION_ERROR
     return CrashSignal.UNKNOWN
 
 
@@ -482,6 +547,19 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
         BM25 ranking degradation; against the mocked test double used in
         this repo's own test suite, the sanitizer never runs at all -- see
         module docstring's "What this adapter does NOT prove."
+
+        Note on getzep/graphiti#1222/#1183 (RediSearch `Syntax error`):
+        unlike #1302 above, this adapter DOES classify this crash shape --
+        see `_classify_crash()` below and `CrashSignal
+        .QUERY_SANITIZATION_ERROR` in base.py. A single `except Exception`
+        handler (rather than store()'s `(ValueError, TypeError)`
+        pre-filter) is the right shape here: the real exception FalkorDB's
+        RediSearch fulltext-query path raises for this bug class is
+        neither a `ValueError` nor a `TypeError`, so narrowing the catch
+        by type first -- the way store() does for #836/#920 -- would skip
+        right past it. `_classify_crash()` itself still falls back to
+        `CrashSignal.UNKNOWN` for anything that doesn't match a known
+        shape, same convention store() uses.
         """
         del mode
         timer = self._timed()
@@ -489,7 +567,7 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
         try:
             edges = asyncio.run(client.search(query, group_ids=[session_id], num_results=top_k))
         except Exception as exc:  # noqa: BLE001 - vendor call, wrap uniformly
-            raise BackendAPIError(self.name, str(exc)) from exc
+            raise BackendAPIError(self.name, str(exc), crash_signal=_classify_crash(exc)) from exc
 
         records: list[MemoryRecord] = []
         any_invalidated = False

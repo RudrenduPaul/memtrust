@@ -1510,6 +1510,58 @@ class _TypeComparisonErrorGraphitiClient:
         pass
 
 
+class _EmptyQuerySanitizationErrorGraphitiClient:
+    """`search()` raises the exact RediSearch `Syntax error` shape
+    getzep/graphiti#1222's own filed reproduction reports (`gh issue view
+    1222 --repo getzep/graphiti`): an empty (or all-stopword) query string
+    makes `build_fulltext_query()` in `falkordb_driver.py` append empty
+    parentheses to the group filter -- `(@group_id:"my_graph") ()` -- which
+    FalkorDB's RediSearch engine rejects with this exact message. The real
+    exception FalkorDB raises here is a `redis`-client `ResponseError`;
+    this test double raises a plain `Exception` carrying the real message
+    text instead of importing `redis` (an optional dependency scoped to
+    the `mem0-direct` extras group only, per pyproject.toml -- this file's
+    own tests must keep working with no vendor package installed at all),
+    matching `_classify_crash()`'s message-only, non-`isinstance` match
+    for this shape."""
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise Exception("RediSearch: Syntax error at offset 22 near my_graph")
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
+class _PipeSlashSanitizationErrorGraphitiClient:
+    """`search()` raises the exact RediSearch `Syntax error` shape
+    getzep/graphiti#1183's own filed reproduction reports (`gh pr view
+    1183 --repo getzep/graphiti`): episode text containing an unescaped
+    pipe (e.g. `"install.sh | bash"`) survives `sanitize()` (before that
+    PR's fix), tokenizes into a stray `|`, and gets rejoined as an empty
+    token between RediSearch OR-pipe delimiters -- `"sh | | | bash"` --
+    which FalkorDB's RediSearch engine rejects with this exact message.
+    Same "plain Exception, not a real redis import" reasoning as
+    `_EmptyQuerySanitizationErrorGraphitiClient` above."""
+
+    async def add_episode(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+    async def search(self, *args: Any, **kwargs: Any) -> list[Any]:
+        raise Exception("RediSearch: Syntax error at offset 178 near sh")
+
+    async def remove_episode(self, episode_uuid: str) -> None:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
 def test_graphiti_selfhosted_configured_via_falkordb_url_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1720,6 +1772,35 @@ def test_classify_crash_unrelated_type_error_is_unknown() -> None:
     assert _classify_crash(TypeError("unsupported operand type(s)")) == CrashSignal.UNKNOWN
 
 
+def test_classify_crash_empty_query_redisearch_syntax_error_matches_1222_shape() -> None:
+    # getzep/graphiti#1222's exact filed reproduction message: an empty
+    # sanitized query produces "(@group_id:...) ()", which RediSearch
+    # rejects with this message shape.
+    assert (
+        _classify_crash(Exception("RediSearch: Syntax error at offset 22 near my_graph"))
+        == CrashSignal.QUERY_SANITIZATION_ERROR
+    )
+
+
+def test_classify_crash_pipe_slash_redisearch_syntax_error_matches_1183_shape() -> None:
+    # getzep/graphiti#1183's exact filed reproduction message: an
+    # unescaped pipe in episode text produces an empty token between
+    # RediSearch OR-pipe delimiters, rejected with this message shape.
+    assert (
+        _classify_crash(Exception("RediSearch: Syntax error at offset 178 near sh"))
+        == CrashSignal.QUERY_SANITIZATION_ERROR
+    )
+
+
+def test_classify_crash_redisearch_message_requires_both_substrings() -> None:
+    # A generic Python SyntaxError (or any message containing only "syntax
+    # error" without "redisearch") must NOT be miscategorized as
+    # QUERY_SANITIZATION_ERROR -- both substrings are required so this
+    # never fires on an unrelated syntax error from a different source.
+    assert _classify_crash(Exception("Syntax error near token")) == CrashSignal.UNKNOWN
+    assert _classify_crash(Exception("RediSearch: connection refused")) == CrashSignal.UNKNOWN
+
+
 def test_graphiti_selfhosted_store_classifies_836_unpack_error() -> None:
     """A fake client raising getzep/graphiti#836's exact ValueError shape
     is classified as CrashSignal.UNPACK_ERROR on the raised
@@ -1748,6 +1829,47 @@ def test_graphiti_selfhosted_store_classifies_generic_failure_as_unknown() -> No
     adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=_BrokenGraphitiClient())
     with pytest.raises(BackendAPIError) as exc_info:
         adapter.store("session-1", "content")
+    assert exc_info.value.crash_signal == CrashSignal.UNKNOWN
+
+
+def test_graphiti_selfhosted_query_classifies_1222_empty_query_syntax_error() -> None:
+    """query() -- previously never classified crashes at all, unlike
+    store() -- now recognizes getzep/graphiti#1222's exact RediSearch
+    `Syntax error` shape (empty sanitized query -> "(@group_id:...) ()")
+    and attaches CrashSignal.QUERY_SANITIZATION_ERROR to the raised
+    BackendAPIError instead of leaving crash_signal unset/None."""
+    adapter = ZepGraphitiSelfHostedAdapter(
+        graphiti_client=_EmptyQuerySanitizationErrorGraphitiClient()
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.query("session-1", "")
+    assert exc_info.value.crash_signal == CrashSignal.QUERY_SANITIZATION_ERROR
+
+
+def test_graphiti_selfhosted_query_classifies_1183_pipe_slash_syntax_error() -> None:
+    """Same query()-classification wiring as the #1222 test above, for
+    getzep/graphiti#1183's distinct trigger: episode/query text containing
+    unescaped pipe/slash characters producing the identical RediSearch
+    `Syntax error` message shape via a different upstream root cause."""
+    adapter = ZepGraphitiSelfHostedAdapter(
+        graphiti_client=_PipeSlashSanitizationErrorGraphitiClient()
+    )
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.query("session-1", "install.sh | bash")
+    assert exc_info.value.crash_signal == CrashSignal.QUERY_SANITIZATION_ERROR
+
+
+def test_graphiti_selfhosted_query_classifies_generic_failure_as_unknown() -> None:
+    """A fake client's search() raising an unrelated RuntimeError still
+    raises BackendAPIError (existing behavior, unchanged) but now carries
+    an explicit crash_signal=CrashSignal.UNKNOWN -- proving query()'s new
+    classification distinguishes an unrelated failure from both #1222/
+    #1183's QUERY_SANITIZATION_ERROR shape above and from the unrelated
+    #836/#920 shapes store() classifies, not just a blanket "anything
+    non-empty counts as classified."""
+    adapter = ZepGraphitiSelfHostedAdapter(graphiti_client=_BrokenGraphitiClient())
+    with pytest.raises(BackendAPIError) as exc_info:
+        adapter.query("session-1", "q")
     assert exc_info.value.crash_signal == CrashSignal.UNKNOWN
 
 
