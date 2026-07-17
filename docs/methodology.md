@@ -18,6 +18,7 @@ This matters because it changes what a number *means*.
 | Contradiction-detection eval | Yes, one vendor API key | No LLM judge involved -- classification is done by direct substring comparison against the known fixture values (see below), which is cheaper and more auditable than an LLM judge for this specific eval. |
 | Compression/round-trip-fidelity eval | Yes, one vendor API key (more if the backend declares more than one `supported_modes` entry) | No LLM judge involved -- fidelity is scored by a direct, deterministic text-similarity ratio against the literal stored content (see below). **Has not been run against any live backend as of this writing.** |
 | Ranking-Quality eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct comparison of returned record order against per-record metadata values and known insertion order (see below). **Has not been run against any live backend as of this writing.** |
+| Extraction-Quality-at-Scale eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct substring check of query() responses against each case's `should_be_stored` ground truth, plus a store/query/re-store/query record-count comparison for the feedback-loop cases (see below). **Has not been run against any live backend, and has never been run at anything close to jamebobob's real 10,134-entry scale -- this eval's own unit tests only prove its classification logic is correct against hand-written fake adapters, see below.** |
 | Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
@@ -267,6 +268,53 @@ To use it:
   this change, since `supports_resource_sync` is currently only `True` on `OpenVikingAdapter`. See
   CONTRIBUTING.md.
 
+### MemTrust Extraction-Quality-at-Scale Eval (original)
+
+- **Not derived from any published dataset.** Built to close a gap none of the other evals in
+  this repo can express: every one of them presupposes a single, specific stored fact (one that
+  gets contradicted, one whose order matters, one whose write path corrupts it, one file among a
+  known set that a resync might delete). None of them asks the corpus-scale question -- across
+  many independently stored items, does the backend retain content it should never have kept in
+  the first place, and does re-storing previously-recalled content silently create duplicates.
+- **Origin: mem0ai/mem0#4573** (GitHub user jamebobob). A 32-day real production audit found
+  97.8% of 10,134 stored mem0 entries were junk the extraction pipeline should never have
+  persisted: boot-file restating (~52.7% -- the agent's own startup/config text re-stored as if it
+  were a new memory every session), cron/heartbeat noise (~11.5% -- routine liveness-check output
+  with no durable content), system dumps (~8.2% -- raw tracebacks/error payloads), and
+  hallucinated profiles (~5.2% -- attributes about the user the model invented, never actually
+  stated). jamebobob also documented a feedback-loop case: a single hallucinated memory, once
+  recalled back into an agent's context, got re-extracted and re-stored as "new" input, and that
+  one re-store fanned out into 808 duplicate records, not one.
+- **Fixture:** `tests/fixtures/extraction_quality_cases.json` -- 15 hand-written `cases` (12 junk,
+  3 valid-content controls) covering every one of jamebobob's real junk categories
+  (`boot_file_restating`, `cron_heartbeat_noise`, `system_dump`, `hallucinated_profile`, plus an
+  `other_junk` catch-all) each carrying a `should_be_stored` ground-truth label memtrust itself
+  assigns and no adapter ever sees, and a separate `feedback_loop_cases` array (2 cases) that
+  reproduces jamebobob's exact store-recall-re-store mechanism at small scale.
+- **ExtractionQualitySignal is a distinct taxonomy from ConflictSignal, RankingSignal, and
+  CorruptionSignal, not a variant of any of them.** Defined in `src/memtrust/adapters/base.py`.
+  `classify_extraction_case()` in `src/memtrust/evals/extraction_quality.py` never trusts a
+  backend's own claims about what it stored -- it stores the seed content, queries it back, and
+  checks the actual retrieved text (case-insensitive substring match) against the case's
+  ground-truth label, the same convention `evals/contradiction.py`'s `classify_case` established
+  for its own value checks.
+- **Honest limitation -- read this before trusting a junk-retention number.** Every fake adapter
+  this eval's own test suite (`tests/test_evals.py`) runs against is hand-written to model one of
+  two behaviors: "retains everything indiscriminately" (matching mem0's real reported behavior per
+  jamebobob's audit) or "filters by a category tag the eval itself passes in `store()`'s
+  metadata" (a stand-in for "a backend with *some* extraction-quality gate," not a claim about any
+  real vendor's actual LLM-driven extraction pipeline -- no adapter in this repo talks to a live
+  one). **This eval and its fixture prove the classification logic is correct against those fakes.
+  Neither has been run against a live mem0 instance, and neither has been run at anything close to
+  jamebobob's real 10,000+ entry scale.** A `junk_retained_rate` this eval reports today is a
+  statement about a harness now capable of measuring the shape of jamebobob's failure if pointed at
+  a real backend, not a reproduction of the 97.8%/808 figures themselves.
+- **Extending this eval:** adding more cases means adding entries to the fixture file with the
+  same `case_id`/`session_id`/`query`/`content`/`category`/`should_be_stored` shape (for `cases`)
+  or `case_id`/`session_id`/`seed_content`/`unique_marker`/`recall_query` shape (for
+  `feedback_loop_cases`). Every case needs its own unique `session_id` so cases never contaminate
+  each other's query results. See CONTRIBUTING.md.
+
 ## Resource-Sync-Safety scoring logic
 
 Implemented in `src/memtrust/evals/resource_sync_safety.py`, function `classify_resource_sync_file()`,
@@ -402,6 +450,57 @@ a live palace's write path, not a black-box query-response inference -- and this
 query-response-only view would, on its own, only ever justify the weaker claim above. A
 `MISSING_ORDERING_KEY` result is a strong prompt to go verify the stronger claim by inspecting the
 backend's actual ingest/write path (as #1733 did), not proof of it by itself.
+
+## Extraction-quality scoring logic
+
+Implemented in `src/memtrust/evals/extraction_quality.py`, functions `classify_extraction_case()`
+and `classify_feedback_loop_case()`.
+
+**Per-case classification (`classify_extraction_case()`).** For every case in the fixture's
+`cases` array:
+
+1. Store the case's `content` via `adapter.store(session_id, content, metadata={"category":
+   category})`.
+2. Query once via `adapter.query(session_id, query, top_k=10)`.
+3. Check whether `content` appears as a case-insensitive substring anywhere in the joined text of
+   the returned records.
+
+| Ground truth | Retrieved? | Verdict |
+|---|---|---|
+| `should_be_stored=True` (valid content) | Yes | **RETAINED_VALID** -- good outcome |
+| `should_be_stored=True` | No | **LOST_VALID** -- an overly aggressive filter (or an unrelated write-path bug) dropped content that should have been kept |
+| `should_be_stored=False` (junk) | Yes | **RETAINED_JUNK** -- the backend has no effective extraction-quality gate, or its gate missed this item. This is the exact failure mode jamebobob's audit measured at 97.8% against real mem0 |
+| `should_be_stored=False` | No | **REJECTED_JUNK** -- good outcome |
+
+`junk_retained_rate` and `valid_lost_rate` are scored independently and neither is meaningful
+alone: a backend that discards everything scores a perfect 0% `junk_retained_rate` while failing
+every real user, which is exactly what `valid_lost_rate` exists to catch.
+
+**Feedback-loop classification (`classify_feedback_loop_case()`).** For every case in the
+fixture's `feedback_loop_cases` array:
+
+1. Store `seed_content` once.
+2. Query via `recall_query` and count returned records whose content contains `unique_marker`
+   (`records_after_first_store` -- expected to be exactly 1 for a backend that neither drops nor
+   duplicates a fresh write).
+3. Re-store that same recalled text as a second, independent `store()` call -- simulating an agent
+   recalling content into its context and an extraction pipeline re-ingesting it as if it were new
+   input.
+4. Query again and re-count matching records (`records_after_second_store`).
+
+A single re-store legitimately adds at most one new matching record (zero if the backend dedups).
+Growth beyond `records_after_first_store + 1` is unexpected duplication:
+
+| Observed growth | Verdict |
+|---|---|
+| `records_after_second_store <= records_after_first_store + 1` | **NO_UNEXPECTED_GROWTH** -- good outcome |
+| `records_after_second_store > records_after_first_store + 1` | **FEEDBACK_LOOP_DUPLICATE** -- the generalized shape of jamebobob's exact 808-duplicate finding, where one re-extracted recall fanned out into hundreds of stored copies instead of one |
+
+**Honest limitation.** Both classification functions above are exercised end-to-end only against
+this repo's own hand-written fake adapters (`tests/test_evals.py`'s
+`NoExtractionGateFakeAdapter`, `GatedExtractionFakeAdapter`, and
+`FeedbackLoopDuplicatingFakeAdapter`), never against a live backend. See the "Honest limitation"
+paragraph in the Extraction-Quality-at-Scale Eval section above for the full caveat.
 
 ## LLM-judge prompt template
 
