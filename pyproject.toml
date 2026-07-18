@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "memtrust"
+name = "memtrust-cli"
 version = "0.3.0"
 description = "Independent, reproducible benchmark harness for agent-memory backends"
 readme = "README.md"
