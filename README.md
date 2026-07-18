@@ -1,3 +1,10 @@
+# memtrust -- renamed to memtrust-cli
+
+**This PyPI package has been renamed.** Install [`memtrust-cli`](https://pypi.org/project/memtrust-cli/)
+instead: `pip install memtrust-cli`. This package will not receive further updates.
+
+---
+
 # memtrust
 
 Standardized, reproducible benchmarks for agent-memory backends, run against the vendors, not
