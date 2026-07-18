@@ -6,10 +6,10 @@ published by them.
 [![CI](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/LICENSE)
 [![Version](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/pyproject.toml)
-[![PyPI](https://img.shields.io/badge/pypi-memtrust-blue.svg)](https://pypi.org/project/memtrust/)
+[![PyPI](https://img.shields.io/badge/pypi-memtrust--cli-blue.svg)](https://pypi.org/project/memtrust-cli/)
 
 ```bash
-pip install memtrust
+pip install memtrust-cli
 memtrust run --backends mempalace,mem0,zep,openviking --eval all
 ```
 
@@ -322,7 +322,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install memtrust
+      - run: pip install memtrust-cli
       - run: memtrust run --backends mempalace,mem0,zep,openviking --eval all --output leaderboard/data.json
         env:
           MEM0_API_KEY: ${{ secrets.MEM0_API_KEY }}
@@ -354,7 +354,7 @@ LongMemEval/LoCoMo datasets). Nothing leaves your machine unless you choose to p
 
 ### npx (agent-native)
 
-> **PyPI is live; the npm wrapper is publish-ready but not yet published.** `pip install memtrust`
+> **PyPI is live; the npm wrapper is publish-ready but not yet published.** `pip install memtrust-cli`
 > works today -- version 0.2.0 is on PyPI. The `memtrust-cli` npm package in `npm/memtrust-cli/` in
 > this repo is built, tested, and passes both `npm pack --dry-run` and `npm publish --dry-run`
 > cleanly (re-verified this session), but has not actually been pushed to the npm registry yet --
@@ -577,3 +577,4 @@ open, deliberately not counted as fixed: some point at real gaps this harness ge
 yet without a live vendor credential, and inflating a near-miss to PASS defeats the entire point of
 an independently-verified benchmark. See the confidence caveats throughout this README and in
 `docs/methodology.md` for exactly which claims rest on which kind of evidence.
+
