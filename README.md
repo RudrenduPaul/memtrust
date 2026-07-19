@@ -13,6 +13,8 @@ pip install memtrust-cli
 memtrust run --backends mempalace,mem0,zep,openviking --eval all
 ```
 
+![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](docs/demo.gif)
+
 (For contributing to this repo instead of just running it, see [Development](#development) --
 `pip install -e ".[dev]"` from a clone.)
 
@@ -24,7 +26,7 @@ memtrust run --backends mempalace,mem0,zep,openviking --eval all
 [The landscape](#the-landscape-verified-not-benchmarked) · [Benchmarks](#benchmarks) ·
 [GitHub Actions usage](#github-actions-usage) · [Self-host](#self-host) · [Install](#install) ·
 [Hosted layer](#what-a-hosted-trust-layer-would-add) · [Backend coverage](#backend-coverage) ·
-[Development](#development) · [License](#license) · [Success stories](#success-stories)
+[Development](#development) · [FAQ](#faq) · [License](#license) · [Success stories](#success-stories)
 
 ## Why this exists
 
@@ -176,6 +178,8 @@ a tested module and a MemPalace-specific capability, callable directly, not yet 
 
 Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
 `memtrust report --help` against this repo. Nothing here is invented.
+
+![Terminal recording of memtrust keygen generating an Ed25519 keypair, memtrust run --sign producing a signed receipt from a real run, and memtrust verify confirming the receipt's signature is valid.](docs/usage.gif)
 
 ## How this differs from trusting a vendor's own numbers
 
@@ -435,6 +439,76 @@ pip-audit
 
 `.pre-commit-config.yaml` wires ruff and mypy into `pre-commit` if you'd rather run these on every
 commit than remember to run them by hand.
+
+## FAQ
+
+**What is memtrust, and what actually makes it different from reading a vendor's own benchmark
+page?** It's a CLI harness that runs the same evals (LongMemEval, LoCoMo, and 14 others registered
+in `--eval`, including a contradiction-detection eval none of the four tracked backends publish a
+number for) against MemPalace, Mem0, Zep/Graphiti, and OpenViking, and prints the raw output rather
+than a curated summary. The differentiator isn't a proprietary scoring model; it's that nobody
+outside the vendor had previously run the same test, the same way, against every option, with the
+full methodology published alongside the code that produced it (`docs/methodology.md`). See "Why
+this exists" above for the MemPalace LongMemEval overclaim (mempalace/mempalace#27) that motivated
+the project.
+
+**Does memtrust support my platform, and what happens if it doesn't?** The npm wrapper
+(`memtrust-cli`) ships six platform-specific optional-dependency packages --
+`@memtrust-cli/darwin-x64`, `@memtrust-cli/darwin-arm64`, `@memtrust-cli/linux-x64`,
+`@memtrust-cli/linux-arm64`, `@memtrust-cli/win32-x64`, and `@memtrust-cli/win32-arm64` -- each
+bundling a verified `uv` binary for that exact platform (`npm/memtrust-cli/bin/memtrust.js`).
+`npm install` picks whichever one matches `process.platform`/`process.arch` at install time. On an
+unsupported combination (32-bit x86, or any platform outside that list), the wrapper exits with a
+clear `no prebuilt uv binary available for <platform>/<arch>` error instead of a silent failure. The
+underlying `memtrust` PyPI package itself only requires Python 3.11+, so `pip install memtrust-cli`
+remains the fallback path on any platform the npm wrapper doesn't cover.
+
+**Do I need a Python toolchain installed to use memtrust?** Not if you go through the npm wrapper.
+`npx memtrust-cli run ...` runs `uv tool run --from memtrust==<pinned version> memtrust <args>` under
+the hood, and `uv` provisions its own isolated Python interpreter and installs the exact pinned
+`memtrust` release from PyPI on first use, caching it after that. If you already have Python 3.11+,
+`pip install memtrust-cli` (the PyPI package name) works directly with no Node.js involved.
+
+**How does memtrust compare to a general-purpose LLM eval framework like RAGAS?** RAGAS evaluates
+RAG pipelines and other LLM applications with objective metrics and synthetic test-data generation;
+it has no memory-backend adapter abstraction and no eval built around a fact contradicting an
+earlier one, because that's not the problem it's built to solve. memtrust is narrower on purpose: it
+only tracks four named agent-memory backends and its non-recall evals (contradiction detection,
+compression/round-trip fidelity, temporal-KG boundary detection) exist specifically to test claims
+those four backends make about themselves. If you need broad RAG or prompt-evaluation coverage,
+RAGAS or a similar framework is the right tool; if you need to check whether a memory backend
+silently drops or overwrites a contradicted fact, memtrust is the one built for that question.
+
+**Why does `memtrust --version` print a version that doesn't match what pip says I installed?**
+This is a real, currently open limitation, not a hypothetical one -- installing `memtrust-cli` from
+PyPI into a clean virtualenv and running `pip show memtrust-cli` reports `0.3.0`, but
+`memtrust --version` prints `0.0.0+unknown`. The CLI's version string isn't reading the installed
+package metadata correctly. Until it's fixed, use `pip show memtrust-cli` (or
+`python3 -c "import importlib.metadata as m; print(m.version('memtrust-cli'))"`) to check what's
+actually installed, not the CLI's own `--version` output.
+
+**Has memtrust actually been run against a live memory backend, or is this all synthetic?** Both,
+and the README doesn't blur the line. The eval logic itself is proven against bundled synthetic
+fixtures and, for several adapters, real installed vendor packages with only the network boundary
+mocked (see the pytest coverage table above). But no eval in this repo has been run against a live
+MemPalace, Mem0, Zep, or OpenViking backend with real credentials as of this writing -- the
+"Benchmarks" section above states that directly rather than publishing a placeholder number. The
+"Backend coverage" table gives a per-adapter confidence level (high/medium/low) for exactly this
+reason; run it yourself against your own credentials to get a live-verified number.
+
+**Can I use memtrust commercially, and does it require attribution?** Yes. It's licensed under
+Apache License 2.0 (see `LICENSE`), which permits commercial use, modification, and distribution,
+and requires you to preserve the license and copyright notice and to note any changes you make to
+the code. It does not require you to open-source your own product just because you depend on
+memtrust.
+
+**How do I get real accuracy numbers instead of the "not yet measured" placeholder?** Set the
+credential environment variable for whichever backend you want to test
+(`MEMPALACE_STORAGE_PATH`, `MEM0_API_KEY`, `ZEP_API_KEY`, `OPENVIKING_API_KEY`, plus
+`MEMTRUST_JUDGE_API_KEY` for LLM-judged evals like LongMemEval and LoCoMo), then run
+`memtrust run --backends <name> --eval all` and `memtrust report <output-file>`. A backend with no
+credential configured prints `SKIPPED` and the run still completes and writes a valid JSON report --
+see "What it does" and "Benchmarks" above for the exact commands.
 
 ## License
 
