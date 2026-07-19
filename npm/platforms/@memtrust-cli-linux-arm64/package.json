@@ -1,6 +1,6 @@
 {
   "name": "@memtrust-cli/linux-arm64",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Linux arm64 binary for memtrust's npx wrapper. Bundles a genuine, SHA-256-verified copy of Astral's uv (github.com/astral-sh/uv), dual-licensed MIT OR Apache-2.0, fetched from uv's own GitHub release 0.11.28 at publish time. Not affiliated with or endorsed by Astral Software Inc.",
   "os": ["linux"],
   "cpu": ["arm64"],
