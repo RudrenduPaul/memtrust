@@ -3,6 +3,38 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-07-20
+
+### Fixed
+
+- `memtrust --version` always printed `0.0.0+unknown`, even when properly installed,
+  because `src/memtrust/__init__.py` read `importlib.metadata.version("memtrust")`
+  instead of `version("memtrust-cli")`, the actual installed distribution name. Now
+  reads the correct key and matches `pip show memtrust-cli`.
+- The Python sdist ballooned to 142MB because `npm/platforms/*/bin/` (locally-staged
+  `uv` binaries used to build the npm platform packages, ~350MB across 6 platforms)
+  was untracked and ungitignored, so hatchling's default sdist inclusion swept it in.
+  Excluded via `.gitignore` and an explicit `[tool.hatch.build.targets.sdist]` exclude.
+- `Mem0DirectAdapter` now passes `is_reasoning_model=True` to work around a real
+  `mem0ai==2.0.12` bug: its default LLM model (`gpt-5-mini`) is not recognized by its
+  own reasoning-model detection (which checks for the different string
+  `gpt-5o-mini`), so every LLM-based extraction call sent `temperature=0.1` to a model
+  that only accepts the API default, 400ing on every call out of the box for anyone
+  with just `OPENAI_API_KEY` set.
+
+### Added
+
+- `temporal_kg_boundary` is now wired into `memtrust run --eval`, gated to the
+  `mempalace` backend (reports `not_applicable` against any other backend).
+- First live benchmark result: `mem0_direct` (self-hosted `mem0ai`, local Qdrant,
+  OpenAI embeddings/extraction) run against `contradiction`, `compression`, and
+  `extraction_quality`. See README.md's "Benchmarks" section for the numbers.
+
+### Changed
+
+- `pyproject.toml`: `Development Status :: 4 - Beta` (was Alpha), expanded PyPI
+  keywords, refreshed description.
+
 ## [0.3.0] - 2026-07-17
 
 ### Changed
