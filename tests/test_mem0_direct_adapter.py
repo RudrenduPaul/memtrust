@@ -1142,6 +1142,54 @@ def test_real_memory_config_accepts_and_stores_custom_instructions(
 
 
 # ---------------------------------------------------------------------------
+# Real-package regression: the installed mem0ai==2.0.12's own default LLM
+# model ("gpt-5-mini", set in mem0/llms/openai.py) is not recognized by its
+# own reasoning-model name heuristic (mem0/llms/base.py's `reasoning_models`
+# set contains "gpt-5o-mini", a different string), so a fresh install with
+# only OPENAI_API_KEY set sends `temperature=0.1` to a model that only
+# accepts the API default and 400s on every call. See module docstring's
+# "Default LLM extraction is broken out of the box" section for the full
+# finding this pins.
+# ---------------------------------------------------------------------------
+
+
+def test_config_dict_sets_is_reasoning_model_to_work_around_mem0s_broken_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MEM0_DIRECT_EMBEDDER_PROVIDER", "fastembed")
+    monkeypatch.setenv("MEM0_DIRECT_VECTOR_STORE_URL", "redis://localhost:6379")
+
+    adapter = Mem0DirectAdapter()
+
+    assert adapter._config_dict["llm"] == {  # type: ignore[comparison-overlap]
+        "provider": "openai",
+        "config": {"is_reasoning_model": True},
+    }
+
+
+def test_real_openai_llm_omits_temperature_when_is_reasoning_model_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercises the actual installed `mem0.llms.openai.OpenAILLM` and
+    `mem0.configs.llms.openai.OpenAIConfig` classes directly with exactly
+    the `"llm"` config shape `Mem0DirectAdapter._config_dict` produces --
+    proving the workaround genuinely stops mem0's real `_get_supported_params`
+    from including `temperature` for its own default model, not just that
+    the config dict looks right in isolation.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-not-a-real-key")
+
+    from mem0.llms.openai import OpenAILLM
+
+    llm = OpenAILLM(config={"is_reasoning_model": True})
+
+    assert llm.config.model == "gpt-5-mini"
+    params = llm._get_supported_params(messages=[{"role": "user", "content": "hi"}])
+    assert "temperature" not in params
+    assert "max_tokens" not in params
+
+
+# ---------------------------------------------------------------------------
 # Real-package regression: mem0ai/mem0#4297 (embedding-dimension mismatch).
 # Exercises the actual installed mem0.vector_stores.qdrant.Qdrant and
 # mem0.configs.vector_stores.qdrant.QdrantConfig classes directly (mocking

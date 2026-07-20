@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memtrust-cli"
-version = "0.3.1"
-description = "Independent, reproducible benchmark harness for agent-memory backends"
+version = "0.3.2"
+description = "Independent, reproducible benchmark harness for agent-memory backends (MemPalace, Mem0, Zep/Graphiti, OpenViking): runs LongMemEval, LoCoMo, contradiction-detection, and a dozen other evals against all four and publishes the raw logs, not vendor-curated numbers."
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
@@ -13,9 +13,13 @@ authors = [
     { name = "Rudrendu Paul" },
     { name = "Sourav Nandy" },
 ]
-keywords = ["llm", "agent", "memory", "benchmark", "eval", "evaluation"]
+keywords = [
+    "agent-memory", "benchmark", "mem0", "mempalace", "zep", "graphiti",
+    "longmemeval", "locomo", "contradiction-detection", "llm-eval",
+    "memory-backend", "reproducible-benchmark", "ai-agents", "llm-memory",
+]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
@@ -107,6 +111,18 @@ memtrust = "memtrust.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memtrust"]
+
+[tool.hatch.build.targets.sdist]
+# Without an explicit exclude, hatchling's sdist sweeps in every file in
+# the project directory that .gitignore doesn't exclude -- including
+# npm/platforms/*/bin/'s locally-downloaded uv binaries (~50-70MB each
+# across 6 platforms) whenever a contributor has them staged locally for
+# an npm publish, ballooning the Python sdist to 100MB+ for a package
+# that ships none of that. Excluded explicitly here (belt-and-suspenders
+# on top of the .gitignore entry) so the sdist stays reproducible
+# regardless of what a given contributor's working tree happens to have
+# staged locally.
+exclude = ["npm/platforms/*/bin"]
 
 [tool.ruff]
 line-length = 100

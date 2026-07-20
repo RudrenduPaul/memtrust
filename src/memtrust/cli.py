@@ -29,6 +29,7 @@ from rich.table import Table
 from memtrust import __version__
 from memtrust.adapters import ADAPTER_REGISTRY
 from memtrust.adapters.base import BackendNotConfiguredError, MemoryBackendAdapter
+from memtrust.adapters.mempalace_adapter import MemPalaceAdapter
 from memtrust.evals.compression import CompressionEvalResult, run_compression_eval
 from memtrust.evals.contradiction import ContradictionEvalResult, run_contradiction_eval
 from memtrust.evals.crash_recovery import CrashRecoveryEvalResult, run_crash_recovery_eval
@@ -55,6 +56,10 @@ from memtrust.evals.scale_stress import (
     run_scale_stress_eval,
 )
 from memtrust.evals.stats_accuracy import StatsAccuracyEvalResult, run_stats_accuracy_eval
+from memtrust.evals.temporal_kg_boundary import (
+    TemporalKGBoundaryEvalResult,
+    run_temporal_kg_boundary_eval,
+)
 from memtrust.receipt import (
     PUBLIC_KEY_ENV_VAR,
     ReceiptError,
@@ -96,6 +101,7 @@ ALL_EVALS = [
     "stats_accuracy",
     "orphan_cleanup",
     "result_consistency",
+    "temporal_kg_boundary",
 ]
 
 
@@ -452,6 +458,28 @@ def _serialize_eval_result(result: object) -> dict[str, Any]:
                     "signal": str(c.signal),
                     "average_jaccard": c.average_jaccard,
                     "n_successful_runs": c.n_successful_runs,
+                    "error": c.error,
+                }
+                for c in result.case_results
+            ],
+        }
+    if isinstance(result, TemporalKGBoundaryEvalResult):
+        return {
+            "backend": result.backend_name,
+            "double_count_rate": result.double_count_rate,
+            "clean_rate": result.clean_rate,
+            "not_applicable_rate": result.not_applicable_rate,
+            "self_report_agreement_rate": result.self_report_agreement_rate,
+            "n_cases": len(result.case_results),
+            "cases": [
+                {
+                    "case_id": c.case.case_id,
+                    "signal": str(c.signal),
+                    "adapter_reported_signal": str(c.adapter_reported_signal)
+                    if c.adapter_reported_signal is not None
+                    else None,
+                    "objects_at_boundary": c.objects_at_boundary,
+                    "self_report_agrees": c.self_report_agrees,
                     "error": c.error,
                 }
                 for c in result.case_results
@@ -868,6 +896,36 @@ def run(
                 )
             else:
                 console.print("    N/A (no scoreable cases)")
+
+        if "temporal_kg_boundary" in eval_names:
+            console.print(f"  Running Temporal-KG Boundary against {backend_name}...")
+            if isinstance(adapter, MemPalaceAdapter):
+                tkgb_result = run_temporal_kg_boundary_eval(adapter)
+                backend_report["evals"]["temporal_kg_boundary"] = _serialize_eval_result(
+                    tkgb_result
+                )
+                dcr = tkgb_result.double_count_rate
+                if dcr is not None:
+                    console.print(
+                        f"    double-count: {dcr:.1%}  clean: {tkgb_result.clean_rate:.1%}"
+                        f"  self-report-agreement: {tkgb_result.self_report_agreement_rate:.1%}"
+                    )
+                else:
+                    console.print("    N/A (no scoreable cases)")
+            else:
+                # Only MemPalaceAdapter wires the kg_add/kg_invalidate/kg_query
+                # primitives this eval calls -- see temporal_kg_boundary.py's
+                # module docstring. Reported the same way resource_sync_safety
+                # reports its own backend-specific skip, above.
+                console.print(
+                    "    N/A (only applies to the mempalace backend, not "
+                    f"{backend_name})"
+                )
+                backend_report["evals"]["temporal_kg_boundary"] = {
+                    "status": "not_applicable",
+                    "reason": f"temporal_kg_boundary only applies to the mempalace backend, "
+                    f"not {backend_name}",
+                }
 
         report["results"][backend_name] = backend_report
         close = getattr(adapter, "close", None)

@@ -26,3 +26,9 @@ node_modules/
 .claude/
 uv.lock
 memtrust-report-*.json
+
+# Locally-downloaded uv binaries staged into the npm platform packages
+# before `npm publish` -- real binaries, ~50-70MB each across 6 platforms,
+# never meant to be committed or swept into the Python sdist. See
+# npm/platforms/*/README.md for how each one is populated at publish time.
+npm/platforms/*/bin/

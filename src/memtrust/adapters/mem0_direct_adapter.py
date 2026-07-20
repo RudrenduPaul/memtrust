@@ -307,6 +307,50 @@ disagree. `query()` also accepts an optional `threshold` keyword argument,
 forwarded straight
 through to the real `Memory.search()`.
 
+## Default LLM extraction is broken out of the box (mem0ai==2.0.12)
+
+`Memory.from_config()` builds an LLM client for the `"llm"` config key
+whenever the caller doesn't set one -- and until this adapter started
+setting one explicitly, that meant relying on the installed package's own
+defaults, which are broken for the median case: an operator who has only
+set `OPENAI_API_KEY`, exactly the minimum viable setup the `Configuration`
+section above documents.
+
+Confirmed by reading the installed `mem0ai==2.0.12` source directly:
+
+  * `mem0/llms/openai.py::OpenAILLM.__init__` falls back to
+    `self.config.model = "gpt-5-mini"` whenever no model is configured.
+  * `mem0/llms/base.py::LLMBase._is_reasoning_model` decides whether to
+    send `temperature`/`top_p`/`max_tokens` at all, via a hardcoded set:
+    `{"o1", "o1-preview", "o3-mini", "o3", "gpt-5", "gpt-5o", "gpt-5o-mini",
+    "gpt-5o-micro"}`, plus an `o1-`/`o3-` prefix match. `"gpt-5-mini"` --
+    the actual default model string set two files away -- is not in that
+    set and matches neither prefix (`"gpt-5o-mini"` is a different string
+    from `"gpt-5-mini"`).
+  * `BaseLlmConfig.temperature` defaults to `0.1`. Because the
+    reasoning-model check above never fires for the real default model,
+    `generate_response()` sends `temperature=0.1` on every call.
+  * `gpt-5-mini` is a real OpenAI reasoning-tier model that only accepts
+    the API's default temperature (`1`) and rejects any other value with
+    a `400 Unsupported value: 'temperature' does not support 0.1 with
+    this model` error.
+
+Net effect: a fresh install with nothing but `OPENAI_API_KEY` set fails
+every single LLM-based fact-extraction call. `contradiction`,
+`compression`, and `extraction_quality` all still complete -- mem0
+catches and logs the extraction failure rather than raising -- but every
+scoreable case comes back empty, which this project's evals report as
+`N/A (no scoreable cases)` rather than a real result.
+
+This adapter works around it the way `BaseLlmConfig`'s own docstring
+says a caller should for a model its name heuristic can't classify: pass
+`is_reasoning_model=True` explicitly in the `"llm"` config's `config`
+dict, which `LLMBase._is_reasoning_model` checks *before* falling back to
+the name heuristic. This doesn't change which model mem0 calls -- still
+whatever mem0 itself defaults to, currently `gpt-5-mini` -- it only fixes
+which request parameters get sent for it. No upstream mem0ai issue filed
+for this specific mismatch as of this writing.
+
 ## Custom fact-extraction prompt passthrough
 
 `Mem0DirectAdapter.__init__` accepts an optional `custom_instructions`
@@ -687,6 +731,15 @@ class Mem0DirectAdapter(MemoryBackendAdapter):
                 "provider": resolved_vector_store_provider,
                 "config": built_vector_store_config,
             },
+            # Works around the installed package's own default-model /
+            # reasoning-model-detection mismatch -- see this module's
+            # "Default LLM extraction is broken out of the box" section
+            # above for the exact mem0ai==2.0.12 source citations. Setting
+            # `is_reasoning_model` explicitly does not pin a model; mem0
+            # still chooses its own default (`gpt-5-mini` as of this
+            # writing) -- this only fixes which request parameters get
+            # sent to it.
+            "llm": {"provider": "openai", "config": {"is_reasoning_model": True}},
             # `MemoryConfig.custom_instructions` (mem0/configs/base.py) is
             # the real, current top-level key -- mem0 renamed the field
             # from `custom_fact_extraction_prompt` to `custom_instructions`

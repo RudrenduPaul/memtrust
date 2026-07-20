@@ -12,7 +12,13 @@ import pytest
 from click.testing import CliRunner
 from pytest_httpx import HTTPXMock
 
-from memtrust.cli import ALL_EVALS, main
+from memtrust.adapters.base import TemporalBoundarySignal
+from memtrust.cli import ALL_EVALS, _serialize_eval_result, main
+from memtrust.evals.temporal_kg_boundary import (
+    TemporalKGBoundaryCase,
+    TemporalKGBoundaryCaseResult,
+    TemporalKGBoundaryEvalResult,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -294,6 +300,94 @@ def test_run_resource_sync_safety_skips_cleanly_for_unsupported_backend(
     assert rss["skipped"] is True
     assert rss["user_file_deletion_rate"] is None
     assert rss["n_files"] == 0
+
+
+def test_temporal_kg_boundary_registered_in_eval_list() -> None:
+    assert "temporal_kg_boundary" in ALL_EVALS
+
+
+def test_run_temporal_kg_boundary_skips_cleanly_with_no_credentials(tmp_path: Path) -> None:
+    """No backend is configured at all (the autouse fixture above clears
+    every credential env var), so this never reaches the eval-dispatch
+    code path -- exercises the CLI's "unknown eval name" contract in
+    reverse: temporal_kg_boundary must be a recognized eval name that
+    still exits 0 and reports every backend SKIPPED, same as `--eval all`
+    does above."""
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        ["run", "--backends", "all", "--eval", "temporal_kg_boundary", "--output", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "SKIPPED" in result.output
+    data = json.loads(out_path.read_text())
+    for backend_result in data["results"].values():
+        assert backend_result["status"] == "skipped"
+
+
+def test_run_temporal_kg_boundary_not_applicable_for_non_mempalace_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mem0 has no kg_add/kg_invalidate/kg_query primitives (only
+    MemPalaceAdapter wires them -- see temporal_kg_boundary.py's module
+    docstring), so this exercises the CLI's backend-specific
+    not-applicable path, mirroring
+    test_run_resource_sync_safety_skips_cleanly_for_unsupported_backend
+    above."""
+    monkeypatch.setenv("MEM0_API_KEY", "test-key")
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        ["run", "--backends", "mem0", "--eval", "temporal_kg_boundary", "--output", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    tkgb = data["results"]["mem0"]["evals"]["temporal_kg_boundary"]
+    assert tkgb["status"] == "not_applicable"
+
+
+def test_serialize_eval_result_handles_temporal_kg_boundary_result() -> None:
+    """`_serialize_eval_result` raises `TypeError` for any result type it
+    has no explicit branch for (see its final `raise` line) -- this pins
+    that a real `TemporalKGBoundaryEvalResult`, the type
+    `run_temporal_kg_boundary_eval()` actually returns when run against a
+    configured `mempalace` backend, has one. Without this branch, `memtrust
+    run --backends mempalace --eval temporal_kg_boundary` would crash the
+    instant a real MemPalace backend is configured, a path
+    test_run_temporal_kg_boundary_not_applicable_for_non_mempalace_backend
+    above does not exercise."""
+    case = TemporalKGBoundaryCase(
+        case_id="tc-1",
+        subject="agent",
+        predicate="uses_model",
+        old_object="claude-opus-4-7",
+        new_object="claude-opus-4-8",
+        seed_valid_from="2026-05-01T00:00:00Z",
+        boundary="2026-06-02T12:00:00Z",
+    )
+    result = TemporalKGBoundaryEvalResult(
+        backend_name="mempalace",
+        case_results=[
+            TemporalKGBoundaryCaseResult(
+                case=case,
+                signal=TemporalBoundarySignal.DOUBLE_COUNT,
+                adapter_reported_signal=TemporalBoundarySignal.CLEAN,
+                objects_at_boundary=["claude-opus-4-7", "claude-opus-4-8"],
+            )
+        ],
+    )
+
+    serialized = _serialize_eval_result(result)
+
+    assert serialized["backend"] == "mempalace"
+    assert serialized["double_count_rate"] == 1.0
+    assert serialized["n_cases"] == 1
+    assert serialized["cases"][0]["case_id"] == "tc-1"
+    assert serialized["cases"][0]["signal"] == "double_count"
+    assert serialized["cases"][0]["adapter_reported_signal"] == "clean"
+    assert serialized["cases"][0]["self_report_agrees"] is False
 
 
 def test_run_against_configured_backend_full_flow(

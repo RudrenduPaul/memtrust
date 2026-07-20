@@ -3,7 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("memtrust")
+    __version__ = version("memtrust-cli")
 except PackageNotFoundError:
     # Not installed at all (e.g. importing directly from a raw source
     # checkout with no `pip install -e .` run) -- there is no installed
