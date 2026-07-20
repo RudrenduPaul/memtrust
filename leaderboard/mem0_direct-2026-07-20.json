@@ -1,0 +1,300 @@
+{
+  "run_id": "mt_2026-07-20T210918Z",
+  "memtrust_version": "0.3.1",
+  "timestamp": "2026-07-20T21:09:18.498137+00:00",
+  "backends_requested": [
+    "mem0_direct"
+  ],
+  "evals_requested": [
+    "contradiction",
+    "compression",
+    "extraction_quality"
+  ],
+  "results": {
+    "mem0_direct": {
+      "status": "configured",
+      "evals": {
+        "contradiction": {
+          "backend": "mem0_direct",
+          "dataset_path": "/Users/Rudrendu/All Mac/project-code/VS_Code/oss-repos/memtrust/tests/fixtures/contradiction_cases.json",
+          "flagged_rate": 0.0,
+          "silent_overwrite_rate": 1.0,
+          "served_stale_rate": 0.0,
+          "not_applicable_rate": 0.0,
+          "empty_or_lost_rate": 0.0,
+          "n_cases": 7,
+          "cases": [
+            {
+              "case_id": "mt-contra-001",
+              "subject": "meeting time",
+              "signal": "silent_overwrite",
+              "adapter_reported_signal": "not_applicable",
+              "error": null
+            },
+            {
+              "case_id": "mt-contra-002",
+              "subject": "dietary restriction",
+              "signal": "silent_overwrite",
+              "adapter_reported_signal": "not_applicable",
+              "error": null
+            },
+            {
+              "case_id": "mt-contra-003",
+              "subject": "project deadline",
+              "signal": "silent_overwrite",
+              "adapter_reported_signal": "not_applicable",
+              "error": null
+            },
+            {
+              "case_id": "mt-contra-004",
+              "subject": "home address",
+              "signal": "silent_overwrite",
+              "adapter_reported_signal": "not_applicable",
+              "error": null
+            },
+            {
+              "case_id": "mt-contra-005",
+              "subject": "team lead",
+              "signal": "silent_overwrite",
+              "adapter_reported_signal": "not_applicable",
+              "error": null
+            },
+            {
+              "case_id": "mt-contra-006",
+              "subject": "order tracking status",
+              "signal": "silent_overwrite",
+              "adapter_reported_signal": "not_applicable",
+              "error": null
+            },
+            {
+              "case_id": "mt-contra-007",
+              "subject": "escalation priority",
+              "signal": "silent_overwrite",
+              "adapter_reported_signal": "not_applicable",
+              "error": null
+            }
+          ]
+        },
+        "compression": {
+          "backend": "mem0_direct",
+          "dataset_path": "/Users/Rudrendu/All Mac/project-code/VS_Code/oss-repos/memtrust/tests/fixtures/compression_cases.json",
+          "modes": [
+            "default"
+          ],
+          "mean_fidelity_by_mode": {
+            "default": 0.31581654974020446
+          },
+          "fidelity_drop_pp": null,
+          "mode_results": {
+            "default": {
+              "mean_fidelity": 0.31581654974020446,
+              "n_cases": 5,
+              "n_scored": 5,
+              "cases": [
+                {
+                  "case_id": "mt-compress-001",
+                  "mode": "default",
+                  "fidelity_score": 0.432,
+                  "content_length": 32,
+                  "retrieved_length": 93,
+                  "retrieved_content": "User has a meeting scheduled at 2:00 PM on Friday, July 24, 2026, as stated on July 20, 2026.",
+                  "error": null
+                },
+                {
+                  "case_id": "mt-compress-002",
+                  "mode": "default",
+                  "fidelity_score": 0.24014336917562723,
+                  "content_length": 448,
+                  "retrieved_length": 110,
+                  "retrieved_content": "User's dog Baxter is a three-year-old golden retriever and a regular family companion who lives with the user.",
+                  "error": null
+                },
+                {
+                  "case_id": "mt-compress-003",
+                  "mode": "default",
+                  "fidelity_score": 0.3277310924369748,
+                  "content_length": 133,
+                  "retrieved_length": 105,
+                  "retrieved_content": "User made a caf\u00e9 purchase on July 20, 2026 with a receipt total of $42.17, which included 8.5% sales tax.",
+                  "error": null
+                },
+                {
+                  "case_id": "mt-compress-004",
+                  "mode": "default",
+                  "fidelity_score": 0.4968553459119497,
+                  "content_length": 178,
+                  "retrieved_length": 140,
+                  "retrieved_content": "User's Q3 budget includes an Engineering line item of $128,450.00, listed alongside Marketing, Ops, and Contingency as other Q3 allocations.",
+                  "error": null
+                },
+                {
+                  "case_id": "mt-compress-005",
+                  "mode": "default",
+                  "fidelity_score": 0.08235294117647059,
+                  "content_length": 7,
+                  "retrieved_length": 163,
+                  "retrieved_content": "On 2026-07-20 the user sent a single-word message reading \"Baxter\"; it is recorded exactly as provided (unclear whether this is a name, label, or other reference).",
+                  "error": null
+                }
+              ]
+            }
+          }
+        },
+        "extraction_quality": {
+          "backend": "mem0_direct",
+          "dataset_path": "/Users/Rudrendu/All Mac/project-code/VS_Code/oss-repos/memtrust/tests/fixtures/extraction_quality_cases.json",
+          "junk_retained_rate": 0.0,
+          "junk_rejected_rate": 1.0,
+          "valid_retained_rate": 0.0,
+          "valid_lost_rate": 1.0,
+          "feedback_loop_duplicate_rate": 0.0,
+          "n_cases": 15,
+          "n_feedback_loop_cases": 2,
+          "cases": [
+            {
+              "case_id": "mt-extract-001",
+              "category": "boot_file_restating",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-002",
+              "category": "boot_file_restating",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-003",
+              "category": "boot_file_restating",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-004",
+              "category": "boot_file_restating",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-005",
+              "category": "cron_heartbeat_noise",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-006",
+              "category": "cron_heartbeat_noise",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-007",
+              "category": "system_dump",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-008",
+              "category": "system_dump",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-009",
+              "category": "hallucinated_profile",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-010",
+              "category": "hallucinated_profile",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-011",
+              "category": "other_junk",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-012",
+              "category": "other_junk",
+              "should_be_stored": false,
+              "signal": "rejected_junk",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-013",
+              "category": "valid_content",
+              "should_be_stored": true,
+              "signal": "lost_valid",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-014",
+              "category": "valid_content",
+              "should_be_stored": true,
+              "signal": "lost_valid",
+              "retrieved": false,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-015",
+              "category": "valid_content",
+              "should_be_stored": true,
+              "signal": "lost_valid",
+              "retrieved": false,
+              "error": null
+            }
+          ],
+          "feedback_loop_cases": [
+            {
+              "case_id": "mt-extract-fb-001",
+              "signal": "no_unexpected_growth",
+              "records_after_first_store": 0,
+              "records_after_second_store": 0,
+              "error": null
+            },
+            {
+              "case_id": "mt-extract-fb-002",
+              "signal": "no_unexpected_growth",
+              "records_after_first_store": 1,
+              "records_after_second_store": 1,
+              "error": null
+            }
+          ]
+        }
+      }
+    }
+  },
+  "cost": {
+    "total_usd": 0,
+    "total_input_tokens": 0,
+    "total_output_tokens": 0
+  }
+}

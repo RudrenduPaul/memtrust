@@ -1,8 +1,8 @@
 {
-  "_schema_note": "This file documents the shape `memtrust run` output maps into for the static leaderboard site. The entries below are an EXAMPLE / SCHEMA REFERENCE, not measured results -- no live vendor API keys were available when this repo was built. Run `memtrust run --backends mempalace,mem0,zep,openviking --eval all` yourself and replace this file with real output to populate a live leaderboard. See docs/methodology.md and the README's Benchmarks section.",
-  "example_data": true,
-  "generated_at": null,
-  "memtrust_version": "0.1.0",
+  "_schema_note": "This file is the shape `memtrust run` output maps into for the static leaderboard site. One real entry exists (mem0_direct, populated from an actual live run -- see leaderboard/mem0_direct-2026-07-20.json for the full raw report). The other four are still schema placeholders: no live vendor API keys were available for them when this repo was built. Run `memtrust run --backends mempalace,mem0,zep,openviking --eval all` yourself with real credentials to populate them. See docs/methodology.md and the README's Benchmarks section.",
+  "example_data": false,
+  "generated_at": "2026-07-20T21:09:18Z",
+  "memtrust_version": "0.3.2",
   "backends": [
     {
       "name": "mempalace",
@@ -28,7 +28,22 @@
         "served_stale_rate": null,
         "not_applicable_rate": null
       },
-      "last_run": null
+      "last_run": null,
+      "note": "Mem0's hosted Platform API, not yet run live. See mem0_direct below for the self-hosted mem0ai library instead -- a different deployment mode of the same project, not a substitute for this row."
+    },
+    {
+      "name": "mem0_direct",
+      "status": "measured",
+      "longmemeval_accuracy": null,
+      "locomo_accuracy": null,
+      "contradiction": {
+        "flagged_rate": 0.0,
+        "silent_overwrite_rate": 1.0,
+        "served_stale_rate": 0.0,
+        "not_applicable_rate": 0.0
+      },
+      "last_run": "2026-07-20",
+      "note": "Self-hosted mem0ai OSS library run in-process via Mem0DirectAdapter, backed by a local Qdrant instance and the OpenAI API -- not Mem0's hosted Platform API (see the mem0 row above). longmemeval_accuracy/locomo_accuracy are null because those evals weren't run this pass; compression and extraction_quality results (not in this schema) are in leaderboard/mem0_direct-2026-07-20.json and README.md's Benchmarks section."
     },
     {
       "name": "zep",

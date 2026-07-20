@@ -307,6 +307,10 @@ mem0_direct: configured, running evals...
 Cost: $0.00 (no LLM-judged evals ran -- structural evals only, or judge not configured)
 ```
 
+The full raw report is committed at `leaderboard/mem0_direct-2026-07-20.json`, and `leaderboard/data.json`
+carries the contradiction numbers into the static leaderboard site (`mempalace`/`mem0`/`zep`/`openviking`
+still show `not_measured` there; `mem0_direct` is the one real row).
+
 What that means case by case, not just the percentage:
 
 - **Contradiction detection, 7/7 cases: every contradicting fact silently overwrote the old one.**

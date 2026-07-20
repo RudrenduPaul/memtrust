@@ -4,11 +4,14 @@ This document is the source of truth for how memtrust scores agent-memory backen
 decision, a prompt, or a dataset choice is not written down here, it should not be trusted and it
 should not ship. Every claim in the README traces back to something on this page.
 
-Last updated: 2026-07-17, adding the Scale/Volume-Stress eval, the embedding-drift/
-consistency eval (volcengine/OpenViking#1523), the Crash-Recovery eval
-(volcengine/OpenViking#2644), the Extraction-Quality-at-Scale eval (mem0ai/mem0#4573), the
-Lock-Contention/Hang-Detection eval (volcengine/OpenViking#1581), and the Stats/Dashboard-Accuracy
-eval (volcengine/OpenViking#1255).
+Last updated: 2026-07-20, adding the Temporal-KG-Boundary eval (MemPalace/mempalace#1913, now
+wired into `memtrust run --eval`), the Resource-Sync-Safety eval's row in the table below (it
+previously had a full section but no summary-table row), and the first live benchmark result
+(`mem0_direct`, self-hosted `mem0ai`, contradiction/compression/extraction-quality). Prior update,
+2026-07-17: the Scale/Volume-Stress eval, the embedding-drift/consistency eval
+(volcengine/OpenViking#1523), the Crash-Recovery eval (volcengine/OpenViking#2644), the
+Extraction-Quality-at-Scale eval (mem0ai/mem0#4573), the Lock-Contention/Hang-Detection eval
+(volcengine/OpenViking#1581), and the Stats/Dashboard-Accuracy eval (volcengine/OpenViking#1255).
 
 ## What requires a live vendor API key, and what runs fully offline
 
@@ -22,13 +25,15 @@ This matters because it changes what a number *means*.
 | Contradiction-detection eval | Yes, one vendor API key | No LLM judge involved -- classification is done by direct substring comparison against the known fixture values (see below), which is cheaper and more auditable than an LLM judge for this specific eval. **Has now been run against a live backend**: `mem0_direct` (self-hosted `mem0ai`, in-process, backed by local Qdrant + OpenAI), 7/7 cases -- see below for the full result. |
 | Compression/round-trip-fidelity eval | Yes, one vendor API key (more if the backend declares more than one `supported_modes` entry) | No LLM judge involved -- fidelity is scored by a direct, deterministic text-similarity ratio against the literal stored content (see below). **Has now been run against a live backend**: `mem0_direct` (self-hosted `mem0ai`, in-process, backed by local Qdrant + OpenAI, single synthetic `"default"` mode since it declares no `supported_modes`), 5 cases, mean fidelity 31.6% -- see below for the full result. |
 | Ranking-Quality eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct comparison of returned record order against per-record metadata values and known insertion order (see below). **Has not been run against any live backend as of this writing.** |
+| Resource-Sync-Safety eval | Yes, one vendor API key, for a backend that also sets `supports_resource_sync = True` | No LLM judge involved -- classification cross-checks path listing before/after a triggered resync against an independent `query()` call (see below). This eval CAN technically run against `openviking` (the one adapter with `supports_resource_sync = True`) with real credentials configured. **Has not been run against any live backend as of this writing.** |
 | Scale/Volume-Stress eval | Yes, one vendor API key, to reach a real backend at all -- but see the honest limitation below, this has only ever been run against fake in-memory adapters so far | No LLM judge involved -- classification is a direct comparison of re-query recall at small vs. large synthetic-corpus checkpoints (see below). **Has not been run against any live backend at real scale (10K+ records / 300+ episodes) as of this writing; `pytest`'s coverage is entirely against fake adapters engineered to model the two motivating bug shapes.** |
 | Embedding-Drift/Consistency eval | Technically yes, one vendor API key, but see the caveat below | No LLM judge involved -- classification is a direct before/after retrievability comparison across two store() calls tagged with different fixture-level embedding-model labels (see below). **Structurally cannot be adapter-native against any backend in this repo, live or not**: no adapter's query() response exposes per-record embedding-model/dimension metadata (`MemoryRecord.embedding_model`/`embedding_dims`, both default `None` everywhere), so a live run would only ever observe whatever this eval's own fixture-level store()/query() sequence happens to trigger in a real backend's actual (unknown to this harness) internal embedding pipeline -- it would not be able to attribute a result to the real bug with the same confidence the fake-adapter unit tests can. Every test covering this eval's classification logic runs against fake, in-memory adapters purpose-built to reproduce (or avoid) the exact volcengine/OpenViking#1523 bug shape. **Has not been run against any live backend as of this writing.** |
 | Crash-Recovery eval | **No -- cannot run against any live backend at all, by design.** | This eval requires `MemoryBackendAdapter.supports_crash_recovery_simulation = True`, and no adapter in this repo sets it to `True` -- every real adapter is a pure HTTP client with zero ability to start, kill, or restart a live vendor server process. It only ever runs against a purpose-built in-memory fake adapter and reports SKIPPED for every real backend (`mempalace`, `mem0`, `zep`, `openviking`). See below and CONTRIBUTING.md for what would be required to close this gap for real. |
 | Extraction-Quality-at-Scale eval | Yes, one vendor API key | No LLM judge involved -- classification is a direct substring check of query() responses against each case's `should_be_stored` ground truth, plus a store/query/re-store/query record-count comparison for the feedback-loop cases (see below). **Has now been run against a live backend**: `mem0_direct` (self-hosted `mem0ai`, in-process, backed by local Qdrant + OpenAI), 15 cases (12 junk, all correctly rejected; 3 valid, all lost on retrieval) -- see below for the full result. It has still never been run at anything close to jamebobob's real 10,134-entry scale. |
 | Lock-Contention/Hang-Detection eval | Yes, one vendor API key, for a backend that also sets `supports_resource_sync = True` -- but see the honest limitation below | No LLM judge involved -- classification is a direct wall-clock response-time-budget check across concurrent store() calls against the same `resource_path` (see below). This eval CAN technically run against `openviking` (the one adapter with `supports_resource_sync = True`) with real credentials configured, unlike Crash-Recovery -- it needs no process-lifecycle control, only ordinary concurrent HTTP calls. **Has not been run against any live backend as of this writing; `pytest`'s coverage is entirely against a fake adapter engineered to model volcengine/OpenViking#1581's exact "0 means unlimited retries" shape.** |
 | Stats/Dashboard-Accuracy eval | Yes, one vendor API key, for a backend that also sets `supports_stats = True` | No LLM judge involved -- classification is a direct comparison of `get_stats()`'s self-reported count against an independently verified count from ordinary query() calls (see below). **Has not been run against any live backend as of this writing; `pytest`'s coverage is entirely against fake adapters engineered to reproduce (and avoid) volcengine/OpenViking#1255's exact "stats endpoint always reports zero despite verified data" shape.** |
-| Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. No live calls of any kind. |
+| Temporal-KG-Boundary eval | Yes, `MEMPALACE_STORAGE_PATH`, and only against `mempalace` -- no other adapter wires `kg_add()`/`kg_invalidate()`/`kg_query()` | No LLM judge involved -- classification is a direct comparison of distinct object values returned at the boundary instant (see below). **Has not been run against any live backend as of this writing; `pytest`'s coverage is entirely against two from-scratch fakes engineered to reproduce the pre-#1914 and post-#1914 `_temporal_filter_sql` comparison exactly.** Wired into `memtrust run --eval temporal_kg_boundary` as of 0.3.2; reports `not_applicable` against any backend other than `mempalace`. |
+| Leaderboard site (`leaderboard/`) | No | Static HTML reading a checked-in `data.json`. One real row (`mem0_direct`) as of 2026-07-20; the rest are still schema placeholders. |
 
 **No number in this repo's README or leaderboard was produced by simulating a vendor response.**
 Every accuracy or conflict-rate figure comes from either (a) an actual HTTP call to the named
@@ -683,6 +688,61 @@ To use it:
   real adapter gaining a genuine stats endpoint means implementing `get_stats()` and setting
   `supports_stats = True` on it -- this eval's own logic needs no changes. See CONTRIBUTING.md.
 
+### MemTrust Temporal-KG-Boundary Eval (original)
+
+- **Not derived from any published dataset.** Every other eval in this repo treats a single
+  `store()`/`query()` call, or a small sequence of them, as the unit of observation. This eval is
+  the only one that exercises `MemPalaceAdapter`'s knowledge-graph primitives
+  (`kg_add()`/`kg_invalidate()`/`kg_query()`) at all.
+- **Origin: MemPalace/mempalace#1913, fixed by merged PR#1914** (contributor ggettert).
+  `_temporal_filter_sql`'s `as_of` point-in-time query used a *closed* interval on both ends
+  (`valid_from <= as_of AND valid_to >= as_of`), so a fact whose `valid_to` equaled the query's
+  exact `as_of` instant still matched. Hand-roll a fact change as `kg_invalidate(ended=T)`
+  immediately followed by `kg_add(valid_from=T)` at the identical boundary instant -- the exact
+  pattern MemPalace's own pre-fix `PALACE_PROTOCOL` agent guidance told every caller to do -- and
+  an `as_of=T` query returned both the just-ended fact and its just-started successor at once, so a
+  single-valued predicate (`uses_model` in this eval's default case) reported two contradictory
+  values simultaneously with no error or warning. PR#1914's real fix switched the upper-bound
+  comparison to strict (`valid_to > as_of`), a half-open interval: a fact that ends exactly at the
+  query instant no longer matches, so only its successor does.
+- **Design.** `run_temporal_kg_boundary_eval()` runs, per case: `kg_add(subject, predicate,
+  old_object, valid_from=seed_valid_from)` to seed the fact being superseded; `kg_invalidate(
+  subject, predicate, old_object, ended=boundary)` to end it at a known instant; `kg_add(subject,
+  predicate, new_object, valid_from=boundary)`, the hand-rolled handover sharing the exact same
+  boundary instant as the invalidate call; then `kg_query(subject, as_of=boundary,
+  direction="outgoing")` to query at that exact shared instant. `classify_temporal_kg_boundary_case()`
+  then independently re-derives the verdict straight from the raw `KGFact` list the query returned
+  (filtered to `direction="outgoing"` and the case's exact `subject`/`predicate`) -- never trusting
+  `query_result.boundary_signal`, the adapter's own self-report, on its own. Zero or one distinct
+  `object` value returned classifies as `CLEAN` (or `NOT_APPLICABLE` if nothing matched at all);
+  two or more distinct values classifies as `DOUBLE_COUNT`, the literal #1913 shape.
+- **Default fixture: one case, randomized subject per run.** `default_cases()` (in
+  `evals/temporal_kg_boundary.py`) ships a single case (`claude-opus-4-7` superseded by
+  `claude-opus-4-8` on the `uses_model` predicate) with a `uuid4`-suffixed subject rather than a
+  fixed literal one -- the real MemPalace KG store is one fixed, environment-global file with no
+  per-run isolation (see `mempalace_adapter.py`'s module docstring), so a fixed subject would make
+  this case's assertions invalid against any prior run's leftover facts.
+- **Honest scope, stated the same way this project states it for every other eval.** The real
+  `mempalace` PyPI package is not installed in this build environment, and PR#1914's fix had not
+  shipped in a released `mempalace` version as of `MemPalaceAdapter`'s live-verified 3.5.0 build --
+  it lands under the package's `[Unreleased]` changelog section. `tests/test_temporal_kg_boundary.py`
+  proves the *classification logic* is correct against two from-scratch fake `_MCPToolsProtocol`
+  implementations that reproduce the confirmed pre-#1913-fix (closed-interval) and post-fix
+  (half-open-interval) `_temporal_filter_sql` comparison exactly -- not against a live MemPalace
+  instance running either version. **This eval has never been run against a live MemPalace
+  instance**, and as of this writing no live result exists for it (see the "What requires a live
+  vendor API key" table above and README.md's "Benchmarks" section, whose one live result is from
+  `mem0_direct`, a different backend, not `mempalace`).
+- **Wired into the CLI as of 0.3.2, gated to the `mempalace` backend.** `memtrust run --eval
+  temporal_kg_boundary` (`src/memtrust/cli.py`) checks `isinstance(adapter, MemPalaceAdapter)`
+  before calling `run_temporal_kg_boundary_eval()`; against any other backend it reports
+  `not_applicable` rather than raising, the same convention `resource_sync_safety` uses for
+  backends without `supports_resource_sync`.
+- **Extending this eval:** adding more cases means adding entries to `default_cases()` (or passing
+  a custom `cases` list to `run_temporal_kg_boundary_eval()`) with the same six fields. Running it
+  for real requires a live, configured `mempalace` backend with `MEMPALACE_STORAGE_PATH` set --
+  this eval's own logic needs no changes to do that; see CONTRIBUTING.md.
+
 ## Resource-Sync-Safety scoring logic
 
 Implemented in `src/memtrust/evals/resource_sync_safety.py`, function `classify_resource_sync_file()`,
@@ -1074,6 +1134,55 @@ the two apart.
 independently obtained counts against `tests/test_stats_accuracy.py::StatsUndercountingFakeAdapter`
 (the bug shape) and `StatsAccurateFakeAdapter` (the negative control). It has not been run against
 a live OpenViking instance. See the "What requires a live vendor API key" table above.
+
+## Temporal-KG-boundary scoring logic
+
+Implemented in `src/memtrust/evals/temporal_kg_boundary.py`, function
+`classify_temporal_kg_boundary_case()`, called from `run_temporal_kg_boundary_eval()`. Only
+`MemPalaceAdapter` wires the `kg_add()`/`kg_invalidate()`/`kg_query()` primitives this eval calls;
+the CLI reports `not_applicable` for any other backend rather than running it. For every case:
+
+1. `kg_add(subject, predicate, old_object, valid_from=seed_valid_from)` -- seed the fact this case
+   will supersede.
+2. `kg_invalidate(subject, predicate, old_object, ended=boundary)` -- end it at a known instant.
+3. `kg_add(subject, predicate, new_object, valid_from=boundary)` -- the hand-rolled handover,
+   sharing the exact same boundary instant as step 2.
+4. `kg_query(subject, as_of=boundary, direction="outgoing")` -- query at the exact shared instant.
+5. Filter the returned `KGFact` list to `direction="outgoing"` and this case's exact
+   `subject`/`predicate` (defensive filtering, since `kg_query()` was already called with
+   `direction="outgoing"` -- but this eval doesn't assume the vendor response never carries an
+   unrelated fact).
+
+Classification, from the distinct `object` values among the filtered facts:
+
+| Condition | Signal |
+|---|---|
+| No matching facts returned | **NOT_APPLICABLE** |
+| Exactly one distinct object | **CLEAN** -- the fixed, half-open PR#1914 contract: a fact whose `valid_to` equals the query instant is correctly excluded |
+| Two or more distinct objects | **DOUBLE_COUNT** -- the exact MemPalace/mempalace#1913 shape: a fact ending exactly at the query instant and its successor starting at that same instant were both returned |
+
+`TemporalKGBoundaryCaseResult.self_report_agrees` additionally compares this independently-derived
+`signal` against `query_result.boundary_signal` (`adapter_reported_signal`, kept for
+comparison/transparency only) -- a low `self_report_agreement_rate` would mean
+`MemPalaceAdapter._classify_boundary_signal()`'s own self-classification has a bug, a finding
+distinct from whether the backend itself double-counts.
+
+**Why this doesn't just trust `kg_query()`'s own self-reported `boundary_signal`.** The same
+"never trust a single self-report" principle every eval in this package follows (see
+`evals/crash_recovery.py`'s `raw_store_contains()` cross-check, `evals/stats_accuracy.py`'s
+independent `query()`-based count): an adapter's own classification of its query response could
+itself be wrong, independent of whether the underlying backend has the #1913 bug. Only recomputing
+the verdict from the raw fact list can tell the two failure modes apart.
+
+**Honest limitation.** This eval, as shipped, proves one thing: *the classification logic
+correctly separates "exactly one object at the boundary instant" from "two or more objects at the
+boundary instant," given a raw `KGFact` list.* It has been proven against two from-scratch fake
+`_MCPToolsProtocol` implementations in `tests/test_temporal_kg_boundary.py` that reproduce the
+confirmed pre-#1914 (closed-interval) and post-#1914 (half-open-interval) `_temporal_filter_sql`
+comparison exactly -- not a real backend. It does **not**, and as of this writing cannot, prove
+that any real MemPalace instance currently has the #1913 bug, ever had it, or would produce
+`DOUBLE_COUNT` if actually queried. This eval has never been run against a live MemPalace
+instance. See the "What requires a live vendor API key" table above.
 
 ## LLM-judge prompt template
 
