@@ -3,6 +3,21 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- `npm/memtrust-cli/package.json`'s `optionalDependencies` pinned the 6 platform packages
+  (`@memtrust-cli/darwin-x64` etc.) to an exact `0.1.0`, which had already drifted from the
+  actually-published `0.1.1` -- `npm install` still resolved fine (npm falls back to the latest
+  version satisfying the range, and `0.1.0` alone is a valid, satisfiable exact version, just not
+  the newest one), but any future platform-binary patch release would keep silently going stale
+  the same way. Changed to `^0.1.1` so patch releases of the platform packages resolve
+  automatically. This is a source-only fix as of this entry: it lands the next time `memtrust-cli`
+  itself gets bumped and republished (its own npm version stays pinned to whatever `memtrust`
+  version is live on PyPI -- see `bin/memtrust.js`'s module comment -- so this can't ship as a
+  patch to the already-published `0.3.2` without a matching new PyPI release).
+
 ## [0.3.2] - 2026-07-20
 
 ### Fixed

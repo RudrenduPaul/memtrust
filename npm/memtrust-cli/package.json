@@ -16,11 +16,11 @@
   "bugs": "https://github.com/RudrenduPaul/memtrust/issues",
   "keywords": ["llm", "agent", "memory", "benchmark", "eval", "evaluation", "uv"],
   "optionalDependencies": {
-    "@memtrust-cli/darwin-x64": "0.1.0",
-    "@memtrust-cli/darwin-arm64": "0.1.0",
-    "@memtrust-cli/linux-x64": "0.1.0",
-    "@memtrust-cli/linux-arm64": "0.1.0",
-    "@memtrust-cli/win32-x64": "0.1.0",
-    "@memtrust-cli/win32-arm64": "0.1.0"
+    "@memtrust-cli/darwin-x64": "^0.1.1",
+    "@memtrust-cli/darwin-arm64": "^0.1.1",
+    "@memtrust-cli/linux-x64": "^0.1.1",
+    "@memtrust-cli/linux-arm64": "^0.1.1",
+    "@memtrust-cli/win32-x64": "^0.1.1",
+    "@memtrust-cli/win32-arm64": "^0.1.1"
   }
 }
