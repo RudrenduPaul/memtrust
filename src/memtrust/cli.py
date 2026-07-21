@@ -71,8 +71,8 @@ from memtrust.receipt import (
 from memtrust.scoring.cost_tracker import CostTracker
 from memtrust.scoring.llm_judge import LLMJudge
 
-#: Explicit width rather than relying on terminal auto-detection -- with 16
-#: evals now registered, the `report` table has 18 columns; under a
+#: Explicit width rather than relying on terminal auto-detection -- with 17
+#: evals now registered, the `report` table has many columns; under a
 #: non-tty runner (tests, CI logs) rich's default-width fallback wraps
 #: cell text across lines, which is cosmetic in a real terminal but breaks
 #: substring assertions on rendered output. A fixed wide width keeps
@@ -918,8 +918,7 @@ def run(
                 # module docstring. Reported the same way resource_sync_safety
                 # reports its own backend-specific skip, above.
                 console.print(
-                    "    N/A (only applies to the mempalace backend, not "
-                    f"{backend_name})"
+                    f"    N/A (only applies to the mempalace backend, not {backend_name})"
                 )
                 backend_report["evals"]["temporal_kg_boundary"] = {
                     "status": "not_applicable",
