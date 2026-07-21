@@ -562,10 +562,12 @@ distribution name is installed. `memtrust --version` now matches `pip show` unde
 name.
 
 **Can I `pip install memtrust` instead of `memtrust-cli`?** Yes -- `memtrust` is a real, separate
-PyPI package, kept at the same version as `memtrust-cli` on every release, publishing the identical
-source. It exists because the npm wrapper's `bin/memtrust.js` pins `uv tool run --from
-memtrust==<version>` (not `memtrust-cli`), so a working `npx memtrust-cli` depends on the
-`memtrust` name staying live and in sync. `memtrust-cli` is the name to lead with in new
+PyPI package, publishing the identical source and currently in sync with `memtrust-cli`'s version.
+That sync is a manual release step, not an automated guarantee (see CONTRIBUTING.md's Release
+process for exactly how, and why it has drifted stale before) -- so "currently in sync" is the
+honest framing, not "always in sync." It exists because the npm wrapper's `bin/memtrust.js` pins
+`uv tool run --from memtrust==<version>` (not `memtrust-cli`), so a working `npx memtrust-cli`
+depends on the `memtrust` name staying live and in sync. `memtrust-cli` is the name to lead with in new
 documentation, since the `-cli` suffix makes it unambiguous as a CLI tool at a glance; `memtrust`
 is a legitimate, supported install path, not a typo or a squatted name.
 
