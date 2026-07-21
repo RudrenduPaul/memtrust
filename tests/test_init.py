@@ -18,6 +18,26 @@ from typing import NoReturn
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_real_version_after_reload() -> object:
+    """`importlib.reload()` mutates the real, live `memtrust` module object
+    in place -- `monkeypatch`'s own teardown only undoes the
+    `importlib.metadata.version` patch, it does not know the reload already
+    baked a fake `__version__` into the shared module singleton, so without
+    this fixture a test in this file leaves `memtrust.__version__` wrong for
+    every test that runs afterward in the same pytest process (confirmed:
+    `test_cli.py::test_version_flag` fails when run after this file, passes
+    in isolation). Captures the real value before the test, restores it
+    unconditionally after -- independent of monkeypatch's own teardown
+    order, since it does not rely on triggering another reload to fix it.
+    """
+    import memtrust
+
+    real_version = memtrust.__version__
+    yield
+    memtrust.__version__ = real_version
+
+
 def _reload_memtrust_with_patched_version(
     monkeypatch: pytest.MonkeyPatch, fake_version: object
 ) -> str:

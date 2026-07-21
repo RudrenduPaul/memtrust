@@ -11,9 +11,11 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 from pytest_httpx import HTTPXMock
+from test_temporal_kg_boundary import _RealSemanticsFakeKGTools
 
 from memtrust.adapters.base import TemporalBoundarySignal
-from memtrust.cli import ALL_EVALS, _serialize_eval_result, main
+from memtrust.adapters.mempalace_adapter import MemPalaceAdapter
+from memtrust.cli import ADAPTER_REGISTRY, ALL_EVALS, _serialize_eval_result, main
 from memtrust.evals.temporal_kg_boundary import (
     TemporalKGBoundaryCase,
     TemporalKGBoundaryCaseResult,
@@ -388,6 +390,56 @@ def test_serialize_eval_result_handles_temporal_kg_boundary_result() -> None:
     assert serialized["cases"][0]["signal"] == "double_count"
     assert serialized["cases"][0]["adapter_reported_signal"] == "clean"
     assert serialized["cases"][0]["self_report_agrees"] is False
+
+
+def test_run_temporal_kg_boundary_end_to_end_against_configured_mempalace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `not_applicable`/no-credentials tests above only exercise the
+    SKIP paths -- neither ever reaches the `isinstance(adapter,
+    MemPalaceAdapter)` branch that actually calls
+    `run_temporal_kg_boundary_eval()` for real. This drives that branch
+    for real: injects `MemPalaceAdapter(mcp_tools=...)` with the same
+    closed-interval fake `test_temporal_kg_boundary.py` uses to reproduce
+    the real MemPalace/mempalace#1913 bug shape, so the eval's actual
+    classification logic runs end to end through the CLI, not a
+    hand-built result."""
+    case = TemporalKGBoundaryCase(
+        case_id="cli-e2e-1",
+        subject="cli-e2e-subject",
+        predicate="uses_model",
+        old_object="claude-opus-4-7",
+        new_object="claude-opus-4-8",
+        seed_valid_from="2026-05-01T00:00:00Z",
+        boundary="2026-06-02T12:00:00Z",
+    )
+    adapter = MemPalaceAdapter(mcp_tools=_RealSemanticsFakeKGTools(boundary_mode="closed"))
+    monkeypatch.setitem(ADAPTER_REGISTRY, "mempalace", lambda: adapter)
+    monkeypatch.setattr(
+        "memtrust.evals.temporal_kg_boundary.default_cases",
+        lambda *args, **kwargs: [case],
+    )
+
+    runner = CliRunner()
+    out_path = tmp_path / "report.json"
+    result = runner.invoke(
+        main,
+        [
+            "run",
+            "--backends",
+            "mempalace",
+            "--eval",
+            "temporal_kg_boundary",
+            "--output",
+            str(out_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(out_path.read_text())
+    tkgb = data["results"]["mempalace"]["evals"]["temporal_kg_boundary"]
+    assert tkgb["double_count_rate"] == 1.0
+    assert tkgb["cases"][0]["signal"] == "double_count"
 
 
 def test_run_against_configured_backend_full_flow(

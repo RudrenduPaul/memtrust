@@ -503,7 +503,13 @@ def main() -> None:
     "eval_arg",
     default="all",
     show_default=True,
-    help=f"Comma-separated eval list ({','.join(ALL_EVALS)}), or 'all'.",
+    # ", ".join, not ",".join -- click's --help text wrapper only breaks
+    # lines on whitespace, so a bare comma-joined list with no spaces
+    # wraps mid-word (e.g. "longmemeval,locom" / "o,contradiction,...").
+    # The parser itself (_resolve_eval_names) already .strip()s each
+    # token, so accepting "a, b" on the command line still works too --
+    # this only changes what gets displayed, not what's parsed.
+    help=f"Comma-separated eval list ({', '.join(ALL_EVALS)}), or 'all'.",
 )
 @click.option(
     "--output",
