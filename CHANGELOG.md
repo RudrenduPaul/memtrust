@@ -3,20 +3,42 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.3.3] - 2026-07-21
 
 ### Fixed
 
+- **`memtrust --version` was still broken on the `memtrust` mirror package.** 0.3.2's fix
+  hardcoded the distribution-name lookup to `"memtrust-cli"`, which fixed that package but broke
+  `pip install memtrust` the same way in reverse: that environment has no `memtrust-cli` entry in
+  its own installed-package metadata, so the lookup always missed and fell through to
+  `0.0.0+unknown` again. `src/memtrust/__init__.py` now tries `memtrust-cli` first, falls back to
+  `memtrust`, and only reports `0.0.0+unknown` if neither distribution name is installed.
+  Independently reproduced against a clean `pip install memtrust==0.3.2` before this fix.
+- `memtrust run --help`'s `--eval` flag description was a hand-maintained string literal that had
+  drifted out of sync with the real `ALL_EVALS` list -- it was still missing `temporal_kg_boundary`
+  even though the eval itself worked correctly. Now generated directly from `ALL_EVALS`, so it
+  can't drift again.
 - `npm/memtrust-cli/package.json`'s `optionalDependencies` pinned the 6 platform packages
   (`@memtrust-cli/darwin-x64` etc.) to an exact `0.1.0`, which had already drifted from the
-  actually-published `0.1.1` -- `npm install` still resolved fine (npm falls back to the latest
-  version satisfying the range, and `0.1.0` alone is a valid, satisfiable exact version, just not
-  the newest one), but any future platform-binary patch release would keep silently going stale
-  the same way. Changed to `^0.1.1` so patch releases of the platform packages resolve
-  automatically. This is a source-only fix as of this entry: it lands the next time `memtrust-cli`
-  itself gets bumped and republished (its own npm version stays pinned to whatever `memtrust`
-  version is live on PyPI -- see `bin/memtrust.js`'s module comment -- so this can't ship as a
-  patch to the already-published `0.3.2` without a matching new PyPI release).
+  actually-published `0.1.1`. Changed to `^0.1.1` so patch releases of the platform packages
+  resolve automatically instead of drifting stale again.
+- CI had been failing on every push since the 0.3.2 commit (`ruff format --check` alone, every
+  other job green) -- only `ruff check` had been run locally, not the separate formatting check.
+- README.md's "Success stories" section cited MemPalace/mempalace#524 (@gaby) as the source of a
+  ChromaDB-network-dependency finding. That citation was fabricated: the real issue #524 is
+  titled "Remove Baldfaced Lies Please," filed by a different user, about unrelated content, and
+  no user named "gaby" has filed anything in that repository. The underlying technical claim
+  (documented separately in `mempalace_adapter.py`'s own module docstring) is real; the citation
+  attributing it to a specific reported issue was not. Removed the bullet. Every other citation in
+  the section (~32 across MemPalace, mem0, Zep/Graphiti, OpenViking, and one cross-project
+  citation) was independently re-verified against the live GitHub API and confirmed accurate.
+- README.md's pasted `pytest --cov` output and coverage table were stale relative to the actual
+  test suite (585 passed / 93% vs. the real 589 passed / 93%); refreshed, and the table now notes
+  explicitly that it's an 11-of-33-module excerpt rather than implying completeness.
+- README.md's mem0#4884 success-story bullet credited `LanguageDegradationSignal` without
+  disclosing that eval isn't wired into `memtrust run --eval` (it's `Mem0DirectAdapter`-specific,
+  requiring `query(explain=True)`) -- added the same honest not-yet-wired-in caveat this project
+  uses for every other eval in the same situation.
 
 ## [0.3.2] - 2026-07-20
 

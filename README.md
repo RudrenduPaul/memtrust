@@ -81,7 +81,7 @@ produce the output shown. Nothing here is simulated.
 
 ```
 $ memtrust run --backends mempalace,mem0,zep,openviking --eval all
-memtrust 0.3.2 -- run_id=mt_2026-07-20T231956Z
+memtrust 0.3.3 -- run_id=mt_2026-07-21T004232Z
 Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction,
 resource_sync_safety, compression, ranking_quality, scale_stress, embedding_drift, crash_recovery,
 extraction_quality, migration_rollback, filter_injection, lock_contention, stats_accuracy,
@@ -105,7 +105,7 @@ Full report: memtrust-report-2026-07-20.json
 
 That's the real, reproducible behavior of a fresh clone with no credentials: every backend reports
 SKIPPED, the command exits cleanly, and a valid JSON report is still written. `memtrust --version`
-now correctly prints `0.3.2`, matching `pip show memtrust-cli`. Earlier releases printed
+now correctly prints `0.3.3`, matching `pip show memtrust-cli`. Earlier releases printed
 `0.0.0+unknown` even when properly installed, because `src/memtrust/__init__.py` read
 `importlib.metadata.version("memtrust")` while the installed distribution is actually named
 `memtrust-cli` -- kept in the FAQ below for the record rather than deleted, since silently erasing
@@ -120,7 +120,7 @@ suite:
 
 ```
 $ pytest --cov=memtrust --cov-report=term-missing
-...
+... (33 module rows total; the 11 most relevant to this README are shown below)
 Name                                                          Stmts   Miss  Cover
 -------------------------------------------------------------------------------------
 src/memtrust/adapters/base.py                                   305     16    95%
@@ -132,17 +132,21 @@ src/memtrust/adapters/zep_graphiti_adapter.py                     63      3    9
 src/memtrust/adapters/zep_graphiti_selfhosted_adapter.py         161     24    85%
 src/memtrust/evals/contradiction.py                              127      2    98%
 src/memtrust/evals/compression.py                                 86      1    99%
-src/memtrust/evals/temporal_kg_boundary.py                        90      4    96%
+src/memtrust/evals/temporal_kg_boundary.py                        90      3    97%
 src/memtrust/receipt.py                                          118     10    92%
 -------------------------------------------------------------------------------------
-TOTAL                                                            4142    279    93%
+TOTAL                                                            4147    276    93%
 
-585 passed, 8 skipped in 3.51s
+589 passed, 8 skipped in 3.57s
 ```
 
-585 passing tests across 33 source modules, 93% overall statement coverage, 98% on the
-contradiction-detection eval, 99% on compression/round-trip fidelity, 96% on the temporal-KG
-boundary eval, 88-95% across the adapter layer. The 8 skips are live-`mempalace`-package tests that
+This is an excerpt, not the full table -- the weakest-covered module in the repo,
+`evals/mempalace_metadata_scale.py` (70%), isn't one of the 11 shown above; run the command
+yourself for the complete per-module breakdown.
+
+589 passing tests across 33 source modules, 93% overall statement coverage, 98% on the
+contradiction-detection eval, 99% on compression/round-trip fidelity, 97% on the temporal-KG
+boundary eval, 85-95% across the adapter layer. The 8 skips are live-`mempalace`-package tests that
 only run with the optional `mempalace-direct` extra installed (`pip install -e
 '.[dev,mempalace-direct]'`). Every test mocks its HTTP or wire
 layer, or uses an in-memory fake backend -- none of them touch a real network, though a meaningful
@@ -181,7 +185,7 @@ Commands:
 | `memtrust report REPORT_PATH` | positional path to a prior JSON report | Reads a report written by `memtrust run` and prints a formatted summary. |
 | `memtrust keygen` | -- | Generates a new Ed25519 keypair for signing reports with `run --sign`. |
 | `memtrust verify RECEIPT_PATH` | -- | Verifies a signed receipt produced by `memtrust run --sign`; a tampered or mismatched receipt fails verification. |
-| `memtrust --version` | -- | Prints the installed version (currently `0.3.2`). |
+| `memtrust --version` | -- | Prints the installed version (currently `0.3.3`). |
 
 Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
 `memtrust report --help` against this repo. Nothing here is invented.
@@ -548,8 +552,22 @@ installed?** This was a real, shipped bug through 0.3.1, not a hypothetical one:
 correct version, but `memtrust --version` printed `0.0.0+unknown` regardless, because
 `src/memtrust/__init__.py` read `importlib.metadata.version("memtrust")` -- the wrong distribution
 name -- instead of `version("memtrust-cli")`, the name the package is actually installed under.
-Fixed in 0.3.2; `memtrust --version` now reads the correct metadata key and matches `pip show
-memtrust-cli`.
+0.3.2's fix was itself incomplete: it hardcoded the lookup to `"memtrust-cli"`, which broke the
+separate `memtrust` mirror package (see "Can I `pip install memtrust` instead of
+`memtrust-cli`?" below) the same way in reverse -- a `pip install memtrust` environment has no
+`memtrust-cli` entry in its own installed-package metadata at all, so the lookup always missed and
+fell through to the same `0.0.0+unknown` fallback. Fixed for real in 0.3.3: the lookup now tries
+`memtrust-cli` first, falls back to `memtrust`, and only reports `0.0.0+unknown` if neither
+distribution name is installed. `memtrust --version` now matches `pip show` under either package
+name.
+
+**Can I `pip install memtrust` instead of `memtrust-cli`?** Yes -- `memtrust` is a real, separate
+PyPI package, kept at the same version as `memtrust-cli` on every release, publishing the identical
+source. It exists because the npm wrapper's `bin/memtrust.js` pins `uv tool run --from
+memtrust==<version>` (not `memtrust-cli`), so a working `npx memtrust-cli` depends on the
+`memtrust` name staying live and in sync. `memtrust-cli` is the name to lead with in new
+documentation, since the `-cli` suffix makes it unambiguous as a CLI tool at a glance; `memtrust`
+is a legitimate, supported install path, not a typo or a squatted name.
 
 **Has memtrust actually been run against a live memory backend, or is this all synthetic?** Both,
 and the README doesn't blur the line. The eval logic itself is proven against bundled synthetic
@@ -628,10 +646,6 @@ shipped in the open rather than quietly. See "Backend coverage" above for the fu
   (@JosefAschauer): an `authored_at` chronology tie-break fix for `_hybrid_rank`. memtrust's ranking
   classifier now credits a top-level `authored_at` field, not just one nested under `metadata`, as
   a genuine ranking-driving signal.
-- [#524](https://github.com/MemPalace/mempalace/issues/524) (@gaby): a buried-comment report that
-  "no API key required" doesn't mean "no network required" -- ChromaDB's default embedder still
-  needs to download a model on first use, which silently breaks airgapped setups. The adapter's
-  module docstring now says so explicitly.
 
 **mem0**
 - [#5973](https://github.com/mem0ai/mem0/pull/5973) (@abhay-codes07, superseded by
@@ -656,7 +670,13 @@ shipped in the open rather than quietly. See "Backend coverage" above for the fu
   update) against this taxonomy.
 - [#4884](https://github.com/mem0ai/mem0/issues/4884) (@wangjiawei-vegetable): a hardcoded
   English-only tokenizer silently degrading non-Latin-script retrieval. A new
-  `LanguageDegradationSignal` and non-Latin-script fixtures now catch this shape.
+  `LanguageDegradationSignal` and non-Latin-script fixtures now catch this shape --
+  `Mem0DirectAdapter`-specific (it reads `query(explain=True)`'s real per-result diagnostic
+  fields, a capability only that adapter exposes) and, like `embedder_cost.py`'s cost-attribution
+  eval and `episode_temporal_leak.py`'s Graphiti-specific eval, not yet wired into `memtrust run
+  --eval`'s general list; call `run_language_degradation_eval()` directly, or see the
+  `test_query_language_degradation_*` tests in `tests/test_mem0_direct_adapter.py`, until that CLI
+  surface exists.
 
 **Zep / Graphiti**
 - [#1489](https://github.com/getzep/graphiti/issues/1489) (@brentkearney): a bi-temporal

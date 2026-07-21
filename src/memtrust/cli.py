@@ -503,13 +503,7 @@ def main() -> None:
     "eval_arg",
     default="all",
     show_default=True,
-    help=(
-        "Comma-separated eval list (longmemeval,locomo,contradiction,"
-        "resource_sync_safety,compression,ranking_quality,scale_stress,"
-        "embedding_drift,crash_recovery,extraction_quality,"
-        "migration_rollback,filter_injection,lock_contention,stats_accuracy,"
-        "orphan_cleanup,result_consistency), or 'all'."
-    ),
+    help=f"Comma-separated eval list ({','.join(ALL_EVALS)}), or 'all'.",
 )
 @click.option(
     "--output",
