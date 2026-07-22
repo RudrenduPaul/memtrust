@@ -1,6 +1,6 @@
 {
   "name": "memtrust-cli",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "npx-runnable wrapper for the memtrust agent-memory benchmark harness. Bootstraps a verified copy of Astral's uv to fetch and run memtrust from PyPI -- no Python toolchain to provision by hand.",
   "bin": { "memtrust-cli": "bin/memtrust.js", "memtrust": "bin/memtrust.js" },
   "files": ["bin/", "LICENSE", "README.md"],
