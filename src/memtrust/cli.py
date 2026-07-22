@@ -959,13 +959,21 @@ def run(
 
 @main.command()
 @click.argument("report_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-def report(report_path: Path) -> None:
+@click.option("--json", "json_mode", is_flag=True, default=False, help="Print the parsed report as JSON instead of a formatted summary.")
+def report(report_path: Path, json_mode: bool) -> None:
     """Read a prior `memtrust run` JSON report and print a formatted summary."""
     try:
         data = json.loads(report_path.read_text())
     except json.JSONDecodeError as exc:
-        console.print(f"[red]Could not parse {report_path} as JSON: {exc}[/red]")
+        if json_mode:
+            print(json.dumps({"ok": False, "error": f"Could not parse {report_path} as JSON: {exc}"}))
+        else:
+            console.print(f"[red]Could not parse {report_path} as JSON: {exc}[/red]")
         sys.exit(1)
+
+    if json_mode:
+        print(json.dumps(data, default=str))
+        return
 
     console.print(f"[bold]memtrust report[/bold] -- run_id={data.get('run_id', 'unknown')}")
     console.print(f"Generated: {data.get('timestamp', 'unknown')}\n")
@@ -1224,7 +1232,8 @@ def keygen(private_key_path: Path, public_key_path: Path, force: bool) -> None:
         "Never taken from the receipt file itself: a receipt cannot vouch for its own key."
     ),
 )
-def verify(receipt_path: Path, public_key_path: Path | None) -> None:
+@click.option("--json", "json_mode", is_flag=True, default=False, help="Print the verification result as JSON instead of formatted text.")
+def verify(receipt_path: Path, public_key_path: Path | None, json_mode: bool) -> None:
     """Verify a signed receipt produced by `memtrust run --sign`.
 
     Proves exactly two things when valid: the receipt's payload has not
@@ -1239,8 +1248,25 @@ def verify(receipt_path: Path, public_key_path: Path | None) -> None:
     try:
         result = verify_receipt_file(receipt_path, public_key_path=public_key_path)
     except ReceiptError as exc:
-        console.print(f"[red]Could not verify: {exc}[/red]")
+        if json_mode:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+        else:
+            console.print(f"[red]Could not verify: {exc}[/red]")
         sys.exit(1)
+
+    if json_mode:
+        print(
+            json.dumps(
+                {
+                    "valid": result.valid,
+                    "reason": result.reason,
+                    "embedded_key_matches_trusted_key": result.embedded_key_matches_trusted_key,
+                }
+            )
+        )
+        if not result.valid:
+            sys.exit(1)
+        return
 
     color = "green" if result.valid else "red"
     console.print(f"[{color}]valid: {result.valid}[/{color}]")
