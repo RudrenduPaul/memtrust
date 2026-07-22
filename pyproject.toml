@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memtrust-cli"
-version = "0.3.3"
+version = "0.3.4"
 description = "Independent, reproducible benchmark harness for agent-memory backends (MemPalace, Mem0, Zep/Graphiti, OpenViking): runs LongMemEval, LoCoMo, contradiction-detection, and a dozen other evals against all four and publishes the raw logs, not vendor-curated numbers."
 readme = "README.md"
 license = { text = "Apache-2.0" }
