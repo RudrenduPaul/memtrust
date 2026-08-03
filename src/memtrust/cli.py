@@ -959,14 +959,21 @@ def run(
 
 @main.command()
 @click.argument("report_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
-@click.option("--json", "json_mode", is_flag=True, default=False, help="Print the parsed report as JSON instead of a formatted summary.")
+@click.option(
+    "--json",
+    "json_mode",
+    is_flag=True,
+    default=False,
+    help="Print the parsed report as JSON instead of a formatted summary.",
+)
 def report(report_path: Path, json_mode: bool) -> None:
     """Read a prior `memtrust run` JSON report and print a formatted summary."""
     try:
         data = json.loads(report_path.read_text())
     except json.JSONDecodeError as exc:
         if json_mode:
-            print(json.dumps({"ok": False, "error": f"Could not parse {report_path} as JSON: {exc}"}))
+            error_msg = f"Could not parse {report_path} as JSON: {exc}"
+            print(json.dumps({"ok": False, "error": error_msg}))
         else:
             console.print(f"[red]Could not parse {report_path} as JSON: {exc}[/red]")
         sys.exit(1)
@@ -1232,7 +1239,13 @@ def keygen(private_key_path: Path, public_key_path: Path, force: bool) -> None:
         "Never taken from the receipt file itself: a receipt cannot vouch for its own key."
     ),
 )
-@click.option("--json", "json_mode", is_flag=True, default=False, help="Print the verification result as JSON instead of formatted text.")
+@click.option(
+    "--json",
+    "json_mode",
+    is_flag=True,
+    default=False,
+    help="Print the verification result as JSON instead of formatted text.",
+)
 def verify(receipt_path: Path, public_key_path: Path | None, json_mode: bool) -> None:
     """Verify a signed receipt produced by `memtrust run --sign`.
 
