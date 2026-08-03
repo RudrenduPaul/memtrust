@@ -6,7 +6,7 @@ real failure modes — silent write loss, contradiction handling, ranking degrad
 
 This package does not implement memtrust itself. It bootstraps a genuine, SHA-256-verified copy of
 [Astral's `uv`](https://github.com/astral-sh/uv) for your platform, then uses it to fetch and run
-the real `memtrust` package from PyPI — no separate Python toolchain to install by hand.
+the real `memtrust-cli` package from PyPI — no separate Python toolchain to install by hand.
 
 ## Usage
 
@@ -21,8 +21,8 @@ npm install -g memtrust-cli
 memtrust --help
 ```
 
-The first run downloads `memtrust` from PyPI via `uv tool run --from memtrust memtrust` and caches
-it; subsequent runs reuse the cache.
+The first run downloads `memtrust-cli` from PyPI via `uv tool run --from memtrust-cli memtrust` and
+caches it; subsequent runs reuse the cache.
 
 ## Supported platforms
 
@@ -32,7 +32,7 @@ in automatically via `optionalDependencies`.
 ## Links
 
 - memtrust: https://github.com/RudrenduPaul/memtrust
-- memtrust on PyPI: https://pypi.org/project/memtrust/
+- memtrust-cli on PyPI: https://pypi.org/project/memtrust-cli/
 - uv (bundled bootstrap tool, not affiliated with or endorsed by Astral Software Inc.): https://github.com/astral-sh/uv
 
 ## License

@@ -3,6 +3,34 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **`npx memtrust-cli` was broken end-to-end for every user, on every platform.**
+  `npm/memtrust-cli/bin/memtrust.js` pinned `uv tool run --from memtrust==<version>`, fetching a
+  PyPI project literally named `memtrust`. That project has never been published --
+  `pypi.org/pypi/memtrust/json` returns a plain 404, and `pip install memtrust` fails with "No
+  matching distribution found for memtrust" -- so every `npx memtrust-cli` invocation failed with
+  `uv`'s "memtrust was not found in the package registry" error, independently reproduced live.
+  The wrapper now pins `--from memtrust-cli==<version>` instead: `memtrust-cli` is the real,
+  published PyPI project, and it already registers a `memtrust` console-script entry point, so the
+  fix required no new publish. Independently re-verified: `uv tool run --from
+  memtrust-cli==0.3.4 memtrust --help` succeeds.
+- README.md's FAQ claimed `pip install memtrust` was a real, separate, "currently in sync" PyPI
+  package. Corrected to state plainly that no such project is published, per the same live check
+  above. `npm/memtrust-cli/README.md`'s own "Links" section pointed at
+  `https://pypi.org/project/memtrust/`, itself a 404; corrected to the real `memtrust-cli` PyPI
+  project page. `src/memtrust/__init__.py`'s comment and `CONTRIBUTING.md`'s Release process
+  section repeated the same false premise (a second PyPI project requiring a manual publish every
+  release); both corrected -- there is one published PyPI project, not two.
+- README.md's two embedded demo GIFs (`docs/demo.gif`, `docs/usage.gif`) used relative paths,
+  which resolve fine on GitHub but render as a broken image on PyPI's rendered project page
+  (PyPI's markdown renderer does not rewrite relative paths against the source repo; confirmed
+  live -- the relative path resolves to PyPI's HTML app shell, not the image, at that surface's
+  base URL). Switched both to absolute `raw.githubusercontent.com` URLs, which resolve identically
+  on every surface (GitHub, PyPI, and anywhere else the README is mirrored).
+
 ## [0.3.3] - 2026-07-21
 
 ### Fixed

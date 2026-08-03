@@ -14,7 +14,7 @@ pip install memtrust-cli
 memtrust run --backends mempalace,mem0,zep,openviking --eval all
 ```
 
-![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](docs/demo.gif)
+![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/demo.gif)
 
 (For contributing to this repo instead of just running it, see [Development](#development) --
 `pip install -e ".[dev]"` from a clone.)
@@ -190,7 +190,7 @@ Commands:
 Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
 `memtrust report --help` against this repo. Nothing here is invented.
 
-![Terminal recording of memtrust keygen generating an Ed25519 keypair, memtrust run --sign producing a signed receipt from a real run, and memtrust verify confirming the receipt's signature is valid.](docs/usage.gif)
+![Terminal recording of memtrust keygen generating an Ed25519 keypair, memtrust run --sign producing a signed receipt from a real run, and memtrust verify confirming the receipt's signature is valid.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/usage.gif)
 
 ## How this differs from trusting a vendor's own numbers
 
@@ -444,16 +444,17 @@ for a zero-install first run. Once installed, the package also exposes the short
 command as a second `bin` alias -- matching the underlying Python CLI's own command name -- so you
 are not stuck typing `memtrust-cli` for every subsequent invocation; `memtrust run ...` works too.
 
-This is not a zero-dependency install: `npx memtrust-cli` still fetches `memtrust` from PyPI on
+This is not a zero-dependency install: `npx memtrust-cli` still fetches `memtrust-cli` from PyPI on
 first use. What it removes is no Python toolchain to provision by hand -- `npx memtrust-cli`
 handles the interpreter and package fetch for you via a bundled, verified copy of Astral's
 [`uv`](https://github.com/astral-sh/uv). Each platform package bundles a genuine, SHA-256-verified
 copy of `uv`'s own GitHub release binary (fetched at npm package-publish time, never at end-user
-install time), and its `bin` shim runs `uv tool run --from memtrust==<pinned version> memtrust
+install time), and its `bin` shim runs `uv tool run --from memtrust-cli==<pinned version> memtrust
 <args>`, which transparently bootstraps a Python interpreter and installs that exact pinned
-`memtrust` release from PyPI, caching it after the first run. The npm package is pinned to its own
-version -- bump `npm/memtrust-cli/package.json`'s version when a new PyPI release ships, and every
-subsequent install resolves to that exact release, not whatever happens to be newest at run time.
+`memtrust-cli` release from PyPI, caching it after the first run. The npm package is pinned to its
+own version -- bump `npm/memtrust-cli/package.json`'s version when a new PyPI release ships, and
+every subsequent install resolves to that exact release, not whatever happens to be newest at run
+time.
 
 ## What a hosted trust layer would add
 
@@ -531,10 +532,11 @@ underlying `memtrust` PyPI package itself only requires Python 3.11+, so `pip in
 remains the fallback path on any platform the npm wrapper doesn't cover.
 
 **Do I need a Python toolchain installed to use memtrust?** Not if you go through the npm wrapper.
-`npx memtrust-cli run ...` runs `uv tool run --from memtrust==<pinned version> memtrust <args>` under
-the hood, and `uv` provisions its own isolated Python interpreter and installs the exact pinned
-`memtrust` release from PyPI on first use, caching it after that. If you already have Python 3.11+,
-`pip install memtrust-cli` (the PyPI package name) works directly with no Node.js involved.
+`npx memtrust-cli run ...` runs `uv tool run --from memtrust-cli==<pinned version> memtrust <args>`
+under the hood, and `uv` provisions its own isolated Python interpreter and installs the exact
+pinned `memtrust-cli` release from PyPI on first use, caching it after that. If you already have
+Python 3.11+, `pip install memtrust-cli` (the PyPI package name) works directly with no Node.js
+involved.
 
 **How does memtrust compare to a general-purpose LLM eval framework like RAGAS?** RAGAS evaluates
 RAG pipelines and other LLM applications with objective metrics and synthetic test-data generation;
@@ -552,24 +554,25 @@ installed?** This was a real, shipped bug through 0.3.1, not a hypothetical one:
 correct version, but `memtrust --version` printed `0.0.0+unknown` regardless, because
 `src/memtrust/__init__.py` read `importlib.metadata.version("memtrust")` -- the wrong distribution
 name -- instead of `version("memtrust-cli")`, the name the package is actually installed under.
-0.3.2's fix was itself incomplete: it hardcoded the lookup to `"memtrust-cli"`, which broke the
-separate `memtrust` mirror package (see "Can I `pip install memtrust` instead of
-`memtrust-cli`?" below) the same way in reverse -- a `pip install memtrust` environment has no
-`memtrust-cli` entry in its own installed-package metadata at all, so the lookup always missed and
-fell through to the same `0.0.0+unknown` fallback. Fixed for real in 0.3.3: the lookup now tries
-`memtrust-cli` first, falls back to `memtrust`, and only reports `0.0.0+unknown` if neither
-distribution name is installed. `memtrust --version` now matches `pip show` under either package
-name.
+0.3.2's fix was itself incomplete: it hardcoded the lookup to `"memtrust-cli"`, which would have
+broken a `memtrust`-named mirror install the same way in reverse -- an environment with only a
+`memtrust`-named distribution installed has no `memtrust-cli` entry in its own installed-package
+metadata at all, so the lookup would always miss and fall through to the same `0.0.0+unknown`
+fallback. Fixed for real in 0.3.3: the lookup now tries `memtrust-cli` first, falls back to
+`memtrust`, and only reports `0.0.0+unknown` if neither distribution name is installed. That
+fallback is defensive, not evidence a `memtrust`-named PyPI project exists today -- see "Can I
+`pip install memtrust` instead of `memtrust-cli`?" below for the current, corrected answer.
 
-**Can I `pip install memtrust` instead of `memtrust-cli`?** Yes -- `memtrust` is a real, separate
-PyPI package, publishing the identical source and currently in sync with `memtrust-cli`'s version.
-That sync is a manual release step, not an automated guarantee (see CONTRIBUTING.md's Release
-process for exactly how, and why it has drifted stale before) -- so "currently in sync" is the
-honest framing, not "always in sync." It exists because the npm wrapper's `bin/memtrust.js` pins
-`uv tool run --from memtrust==<version>` (not `memtrust-cli`), so a working `npx memtrust-cli`
-depends on the `memtrust` name staying live and in sync. `memtrust-cli` is the name to lead with in new
-documentation, since the `-cli` suffix makes it unambiguous as a CLI tool at a glance; `memtrust`
-is a legitimate, supported install path, not a typo or a squatted name.
+**Can I `pip install memtrust` instead of `memtrust-cli`?** No, not currently -- this README
+previously claimed a separate `memtrust`-named PyPI project existed in sync with `memtrust-cli`.
+That was checked live against `pypi.org/pypi/memtrust/json` and it returns a plain 404: no project
+named `memtrust` has ever been published. `pip install memtrust` fails with "No matching
+distribution found for memtrust." `memtrust-cli` is the one real, published PyPI name; use that.
+(`src/memtrust/__init__.py` still has a defensive fallback that would also read a `memtrust`-named
+distribution's version if one were ever installed locally -- e.g. from a local build -- but that
+is unrelated to whether a `memtrust` project is live on PyPI, which it is not.) The npm wrapper's
+`bin/memtrust.js` now pins `uv tool run --from memtrust-cli==<version>` for the same reason, so
+`npx memtrust-cli` no longer depends on a `memtrust`-named PyPI project existing at all.
 
 **Has memtrust actually been run against a live memory backend, or is this all synthetic?** Both,
 and the README doesn't blur the line. The eval logic itself is proven against bundled synthetic
