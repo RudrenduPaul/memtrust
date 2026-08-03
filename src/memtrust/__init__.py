@@ -2,12 +2,15 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-# This package is published on PyPI under two distribution names kept in
-# lockstep: `memtrust-cli` (canonical) and a mirror literally named
-# `memtrust` (which the npm wrapper's `bin/memtrust.js` pins its `uv tool
-# run --from` call to -- see CONTRIBUTING.md's Release process section).
-# Hardcoding a single name here previously broke the mirror install: a
-# `pip install memtrust` environment has no `memtrust-cli` entry in its
+# This package is published on PyPI as `memtrust-cli` (canonical, the only
+# name this project actually publishes -- see CONTRIBUTING.md's Release
+# process section). A `memtrust`-named PyPI project does not currently
+# exist (verified live: pypi.org/pypi/memtrust/json returns 404); the
+# `memtrust` lookup below is a defensive fallback only, for the rare case
+# of a local/manual install under that distribution name, not evidence
+# such a project is published. Hardcoding a single name here previously
+# broke that fallback case: an environment with only a `memtrust`-named
+# distribution installed has no `memtrust-cli` entry in its
 # installed-package metadata at all, so `version("memtrust-cli")` always
 # raised PackageNotFoundError and silently fell through to the
 # "not installed" fallback below, even though the package genuinely was

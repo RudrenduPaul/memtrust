@@ -111,42 +111,42 @@ conversion (or a second loader function) is needed.
 
 ## Release process
 
-There are three packages, not one, and CI only automates one of them. Missing any of the other two
-silently breaks something for someone -- this is written down because it has already happened.
+There are two packages, not one, and CI only automates one of them. Missing the other silently
+breaks something for someone -- this is written down because it has already happened.
+
+*(Earlier versions of this section described a third, separate PyPI project literally named
+`memtrust` that the npm wrapper's `uv tool run --from` call was pinned to, requiring a manual
+publish every release. That project was never actually published -- `pypi.org/pypi/memtrust/json`
+returns a plain 404 -- which meant `npx memtrust-cli` was broken end-to-end for every user until
+`npm/memtrust-cli/bin/memtrust.js` was repointed at the real `memtrust-cli` PyPI project, which
+already registers a `memtrust` console-script entry point. There is no separate mirror package to
+publish anymore; don't reintroduce one without first confirming a project by that name is actually
+live on PyPI.)*
 
 1. Bump the version in `pyproject.toml` (and `npm/memtrust-cli/package.json` in the same PR if a
-   matching npm publish is planned -- see step 4).
+   matching npm publish is planned -- see step 3).
 2. Before pushing, run the full local check list: `ruff check .`, `ruff format --check .` (a
    separate step from `ruff check` -- CI fails on formatting alone even when linting passes),
    `mypy --strict src/memtrust`, `pytest --cov=memtrust --cov-report=term-missing
    --cov-fail-under=80`, `pip-audit`.
-3. **PyPI has two packages kept in lockstep, and CI only publishes one of them.**
-   `.github/workflows/publish-pypi.yml` (triggered by a GitHub Release) publishes whatever
-   `pyproject.toml`'s `[project].name` currently says -- `memtrust-cli`, the canonical name. The
-   separate mirror package literally named `memtrust` (which `npm/memtrust-cli/bin/memtrust.js`
-   pins its `uv tool run --from` call to) has no CI automation at all and must be published
-   manually every release: temporarily set `name = "memtrust"` in `pyproject.toml`, `uv build && uv
-   publish`, then revert the name back to `memtrust-cli`. Skipping this step doesn't break
-   `memtrust-cli`'s own release, but it does mean the npm wrapper starts fetching a stale PyPI
-   version the next time someone bumps `npm/memtrust-cli/package.json` without also doing this.
-4. **npm publish is also manual, and its own version must exactly match the PyPI release it
-   pins to.** `npm/memtrust-cli/package.json`'s version is not independent -- `bin/memtrust.js`
-   reads it directly to build `uv tool run --from memtrust==<that version>`, so bumping the npm
-   package's version without a matching live PyPI `memtrust` release (step 3) breaks the wrapper
-   for every subsequent install. Publish PyPI first, confirm both `memtrust-cli` and `memtrust`
-   are live (`pip index versions memtrust-cli`, or the PyPI JSON API if the simple index is
-   lagging), then `npm publish npm/memtrust-cli --access public`.
-5. **Building the sdist from a working tree that has locally-downloaded platform binaries staged
+3. **npm publish is manual, and its own version must exactly match the PyPI release it pins to.**
+   `npm/memtrust-cli/package.json`'s version is not independent -- `bin/memtrust.js` reads it
+   directly to build `uv tool run --from memtrust-cli==<that version>`, so bumping the npm
+   package's version without a matching live PyPI `memtrust-cli` release breaks the wrapper for
+   every subsequent install. Publish PyPI first (via `.github/workflows/publish-pypi.yml`, or
+   confirm it's live with `pip index versions memtrust-cli` if the simple index is lagging), then
+   `npm publish npm/memtrust-cli --access public`.
+4. **Building the sdist from a working tree that has locally-downloaded platform binaries staged
    for npm publish will silently balloon it.** If `npm/platforms/*/bin/` has real `uv` binaries in
    it (staged for an npm publish, ~50-70MB each across 6 platforms), `pyproject.toml`'s
    `[tool.hatch.build.targets.sdist]` exclude should already keep them out -- but if that exclude
    is ever removed, `uv build`'s sdist output size is the tripwire: it should be a few MB, not
    100MB+.
-6. The 6 `@memtrust-cli/<platform>` packages have their own independent version numbers, not tied
+5. The 6 `@memtrust-cli/<platform>` packages have their own independent version numbers, not tied
    to `memtrust-cli`'s. `npm/memtrust-cli/package.json`'s `optionalDependencies` should use a caret
    range (`^0.1.1`, not an exact `0.1.0`) so a platform-package patch release resolves
    automatically instead of drifting stale again.
-7. Create the GitHub Release last, after both registries are confirmed live -- this is what
+6. Create the GitHub Release last, after both registries are confirmed live -- this is what
    triggers `publish-pypi.yml`. If `memtrust-cli` was already published manually before the
    Release exists (e.g. to unblock testing), that workflow run will fail with a harmless
    "File already exists" 400 from PyPI -- expected, not a regression, since the file it's trying
