@@ -7,6 +7,7 @@ against the vendors, not by them.
 [![CI](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/LICENSE)
 [![PyPI Version](https://img.shields.io/pypi/v/memtrust-cli)](https://pypi.org/project/memtrust-cli/)
+[![npm Version](https://img.shields.io/npm/v/memtrust-cli)](https://www.npmjs.com/package/memtrust-cli)
 [![PyPI](https://img.shields.io/badge/pypi-memtrust--cli-blue.svg)](https://pypi.org/project/memtrust-cli/)
 
 ```bash
@@ -105,7 +106,7 @@ Full report: memtrust-report-2026-07-20.json
 
 That's the real, reproducible behavior of a fresh clone with no credentials: every backend reports
 SKIPPED, the command exits cleanly, and a valid JSON report is still written. `memtrust --version`
-now correctly prints `0.3.3`, matching `pip show memtrust-cli`. Earlier releases printed
+now correctly prints the installed version, matching `pip show memtrust-cli`. Earlier releases printed
 `0.0.0+unknown` even when properly installed, because `src/memtrust/__init__.py` read
 `importlib.metadata.version("memtrust")` while the installed distribution is actually named
 `memtrust-cli` -- kept in the FAQ below for the record rather than deleted, since silently erasing
@@ -185,7 +186,7 @@ Commands:
 | `memtrust report REPORT_PATH` | positional path to a prior JSON report | Reads a report written by `memtrust run` and prints a formatted summary. |
 | `memtrust keygen` | -- | Generates a new Ed25519 keypair for signing reports with `run --sign`. |
 | `memtrust verify RECEIPT_PATH` | -- | Verifies a signed receipt produced by `memtrust run --sign`; a tampered or mismatched receipt fails verification. |
-| `memtrust --version` | -- | Prints the installed version (currently `0.3.3`). |
+| `memtrust --version` | -- | Prints the installed version. |
 
 Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
 `memtrust report --help` against this repo. Nothing here is invented.
@@ -549,19 +550,20 @@ RAGAS or a similar framework is the right tool; if you need to check whether a m
 silently drops or overwrites a contradicted fact, memtrust is the one built for that question.
 
 **Why did `memtrust --version` used to print a version that didn't match what pip said I
-installed?** This was a real, shipped bug through 0.3.1, not a hypothetical one: installing
+installed?** This was a real, shipped bug in an early release, not a hypothetical one: installing
 `memtrust-cli` from PyPI into a clean virtualenv and running `pip show memtrust-cli` reported the
 correct version, but `memtrust --version` printed `0.0.0+unknown` regardless, because
 `src/memtrust/__init__.py` read `importlib.metadata.version("memtrust")` -- the wrong distribution
 name -- instead of `version("memtrust-cli")`, the name the package is actually installed under.
-0.3.2's fix was itself incomplete: it hardcoded the lookup to `"memtrust-cli"`, which would have
-broken a `memtrust`-named mirror install the same way in reverse -- an environment with only a
-`memtrust`-named distribution installed has no `memtrust-cli` entry in its own installed-package
-metadata at all, so the lookup would always miss and fall through to the same `0.0.0+unknown`
-fallback. Fixed for real in 0.3.3: the lookup now tries `memtrust-cli` first, falls back to
-`memtrust`, and only reports `0.0.0+unknown` if neither distribution name is installed. That
-fallback is defensive, not evidence a `memtrust`-named PyPI project exists today -- see "Can I
-`pip install memtrust` instead of `memtrust-cli`?" below for the current, corrected answer.
+The first attempted fix was itself incomplete: it hardcoded the lookup to `"memtrust-cli"`, which
+would have broken a `memtrust`-named mirror install the same way in reverse -- an environment with
+only a `memtrust`-named distribution installed has no `memtrust-cli` entry in its own
+installed-package metadata at all, so the lookup would always miss and fall through to the same
+`0.0.0+unknown` fallback. Fixed for real in the following release: the lookup now tries
+`memtrust-cli` first, falls back to `memtrust`, and only reports `0.0.0+unknown` if neither
+distribution name is installed. That fallback is defensive, not evidence a `memtrust`-named PyPI
+project exists today -- see "Can I `pip install memtrust` instead of `memtrust-cli`?" below for
+the current, corrected answer.
 
 **Can I `pip install memtrust` instead of `memtrust-cli`?** No, not currently -- this README
 previously claimed a separate `memtrust`-named PyPI project existed in sync with `memtrust-cli`.
