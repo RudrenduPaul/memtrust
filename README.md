@@ -1,14 +1,14 @@
 # memtrust
 
-Agent memory backends each publish their own benchmark numbers, on different tests, measured
-different ways. memtrust runs the same evals against all four and publishes the raw logs. Run
-against the vendors, not by them.
-
 [![CI](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/LICENSE)
 [![PyPI Version](https://img.shields.io/pypi/v/memtrust-cli)](https://pypi.org/project/memtrust-cli/)
 [![npm Version](https://img.shields.io/npm/v/memtrust-cli)](https://www.npmjs.com/package/memtrust-cli)
 [![PyPI](https://img.shields.io/badge/pypi-memtrust--cli-blue.svg)](https://pypi.org/project/memtrust-cli/)
+
+Agent memory backends each publish their own benchmark numbers, on different tests, measured
+different ways. memtrust runs the same evals against all four and publishes the raw logs. Run
+against the vendors, not by them.
 
 ![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/demo.gif)
 
@@ -295,8 +295,11 @@ comparison exactly. **This has not been run against a live MemPalace instance.**
 not yet measured against a live backend -- see "Backend coverage" below for the confidence level
 on each adapter. Mem0 has one real result, produced against the actual `mem0ai` OSS library
 running self-hosted -- in-process, via `Mem0DirectAdapter`, backed by a local Qdrant instance and
-the OpenAI API for embeddings and extraction -- not against Mem0's hosted Platform API. Keep that
-distinction in mind before reading this as a claim about the hosted product.
+the OpenAI API for embeddings and extraction.
+
+> [!NOTE]
+> This result is from the self-hosted `mem0ai` OSS library, not Mem0's hosted Platform API. Don't
+> read it as a claim about the hosted product.
 
 ```
 $ export MEM0_DIRECT_EMBEDDER_PROVIDER=openai
@@ -339,9 +342,12 @@ What that means case by case, not just the percentage:
   also dropped -- stored but never came back on retrieval. The valid-side sample is small (n=3);
   treat this as a signal worth digging into further, not a settled number.
 
-**A real bug this run surfaced in mem0ai itself, not in memtrust.** Getting any of the numbers
-above required a fix first: a fresh `mem0ai==2.0.12` install with nothing but `OPENAI_API_KEY` set
-fails every single LLM-based extraction call, out of the box, for anyone. mem0's own default model
+> [!WARNING]
+> A real bug this run surfaced in mem0ai itself, not in memtrust: a fresh `mem0ai==2.0.12` install
+> with nothing but `OPENAI_API_KEY` set fails every single LLM-based extraction call, out of the
+> box, for anyone.
+
+Getting any of the numbers above required a fix first. mem0's own default model
 (`mem0/llms/openai.py`: `self.config.model = "gpt-5-mini"`) is a reasoning-tier model that only
 accepts the API's default temperature, but mem0's own reasoning-model detection
 (`mem0/llms/base.py`'s `reasoning_models` set) checks for the string `"gpt-5o-mini"`, not
