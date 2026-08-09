@@ -10,12 +10,12 @@ against the vendors, not by them.
 [![npm Version](https://img.shields.io/npm/v/memtrust-cli)](https://www.npmjs.com/package/memtrust-cli)
 [![PyPI](https://img.shields.io/badge/pypi-memtrust--cli-blue.svg)](https://pypi.org/project/memtrust-cli/)
 
+![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/demo.gif)
+
 ```bash
 pip install memtrust-cli
 memtrust run --backends mempalace,mem0,zep,openviking --eval all
 ```
-
-![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/demo.gif)
 
 (For contributing to this repo instead of just running it, see [Development](#development) --
 `pip install -e ".[dev]"` from a clone.)
