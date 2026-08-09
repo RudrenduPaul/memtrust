@@ -160,6 +160,8 @@ double built to match the real package's confirmed method signatures, not the re
 `docs/methodology.md`'s adapter confidence table for exactly which claim rests on which kind of
 verification.
 
+![Terminal recording of memtrust run against all four tracked backends with zero credentials configured, showing every backend report SKIPPED and a valid JSON report still get written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-1-zero-credentials.gif)
+
 ## Commands
 
 ```
@@ -190,6 +192,8 @@ Commands:
 
 Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
 `memtrust report --help` against this repo. Nothing here is invented.
+
+![Terminal recording walking the full memtrust CLI surface: memtrust --help, then each subcommand's own --help output for run, report, keygen, and verify.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-3-cli-surface.gif)
 
 ![Terminal recording of memtrust keygen generating an Ed25519 keypair, memtrust run --sign producing a signed receipt from a real run, and memtrust verify confirming the receipt's signature is valid.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/usage.gif)
 
@@ -282,6 +286,8 @@ reproduce the confirmed pre-#1914 (closed-interval) and post-#1914 (half-open-in
 comparison exactly. **This has not been run against a live MemPalace instance.** It is wired into
 `memtrust run --eval temporal_kg_boundary` (see "Commands" above); against any backend other than
 `mempalace`, it reports `not_applicable` rather than an error.
+
+![Terminal recording of the temporal-KG boundary test suite running against the hand-written pre-#1914 and post-#1914 fakes, classifying the closed-interval boundary bug and confirming the fix's half-open-interval behavior.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-4-temporal-kg-tests.gif)
 
 ## Benchmarks
 
@@ -486,6 +492,8 @@ adapter's module docstring was captured by calling those functions live against 
 chromadb-backed palace, not read off a docstring and trusted. It's the kind of mistake this whole
 project exists to catch in other people's benchmarks; finding it in memtrust's own adapter and
 shipping the fix in the open, rather than quietly patching it, is the more useful story.
+
+![Terminal recording discovering that mempalace.Palace never existed in the installed package and walking the real mempalace.mcp_server functions that MemPalaceAdapter now calls instead.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-2-fictional-api-discovery.gif)
 
 | Backend | Adapter status | Confidence (see docs/methodology.md) |
 |---|---|---|
