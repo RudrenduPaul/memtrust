@@ -6,6 +6,8 @@
 [![npm Version](https://img.shields.io/npm/v/memtrust-cli)](https://www.npmjs.com/package/memtrust-cli)
 [![PyPI](https://img.shields.io/badge/pypi-memtrust--cli-blue.svg)](https://pypi.org/project/memtrust-cli/)
 
+<a href="https://www.producthunt.com/products/memtrust?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-memtrust" target="_blank" rel="noopener noreferrer"><img alt="memtrust - The benchmark vendors don't run on themselves | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1219788&theme=light"></a>
+
 Agent memory backends each publish their own benchmark numbers, on different tests, measured
 different ways. memtrust runs the same evals against all four and publishes the raw logs. Run
 against the vendors, not by them.
