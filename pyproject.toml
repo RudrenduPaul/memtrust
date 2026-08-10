@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "memtrust-cli"
-version = "0.3.4"
+version = "0.3.6"
 description = "Independent, reproducible benchmark harness for agent-memory backends (MemPalace, Mem0, Zep/Graphiti, OpenViking): runs LongMemEval, LoCoMo, contradiction-detection, and a dozen other evals against all four and publishes the raw logs, not vendor-curated numbers."
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -104,6 +104,13 @@ mem0-direct = [
 mempalace-direct = [
     "mempalace>=3.0.0,<4.0",
 ]
+# MCP server wrapper (src/memtrust/mcp_server.py): exposes memtrust's
+# `run` subcommand as a single stdio MCP tool. Kept as an optional group,
+# not a core dependency, since most memtrust installs (plain CLI usage,
+# CI) never touch MCP at all.
+mcp = [
+    "mcp[cli]>=1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/RudrenduPaul/memtrust"
@@ -113,6 +120,7 @@ Issues = "https://github.com/RudrenduPaul/memtrust/issues"
 
 [project.scripts]
 memtrust = "memtrust.cli:main"
+memtrust-mcp = "memtrust.mcp_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/memtrust"]
