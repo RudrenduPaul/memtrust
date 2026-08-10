@@ -203,6 +203,42 @@ Every line above came straight from running `memtrust --help`, `memtrust run --h
 
 ![Terminal recording of memtrust keygen generating an Ed25519 keypair, memtrust run --sign producing a signed receipt from a real run, and memtrust verify confirming the receipt's signature is valid.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/usage.gif)
 
+## MCP Server
+
+memtrust ships a [Model Context Protocol](https://modelcontextprotocol.io) server so an AI agent
+(Claude, Cursor, or any MCP-compatible client) can run a memory-backend benchmark directly, without
+a human invoking the CLI by hand.
+
+Install the extra:
+
+```bash
+pip install "memtrust-cli[mcp]"
+```
+
+Add it to your MCP client's config (for Claude Desktop, `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "memtrust": {
+      "command": "uvx",
+      "args": ["--from", "memtrust-cli", "memtrust-mcp"]
+    }
+  }
+}
+```
+
+The server exposes one tool, `run`, that shells out to `memtrust run` with the given arguments
+(memtrust has no `--json` flag, so the wrapper writes to a private temp `--output` file and reads
+it back) and returns the parsed JSON report:
+
+```
+run(["--backends", "mempalace", "--eval", "stats_accuracy"])
+```
+
+Transport is stdio, so there is nothing to host: the MCP client spawns the server as a local
+subprocess. Source: [`src/memtrust/mcp_server.py`](src/memtrust/mcp_server.py).
+
 ## How this differs from trusting a vendor's own numbers
 
 Every backend memtrust tracks publishes its own benchmark numbers. None of them publish the same
