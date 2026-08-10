@@ -1,0 +1,35 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.RudrenduPaul/memtrust",
+  "description": "Independent, reproducible benchmark harness for agent-memory backends.",
+  "repository": {
+    "url": "https://github.com/RudrenduPaul/memtrust",
+    "source": "github"
+  },
+  "version": "0.3.6",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "memtrust-cli",
+      "version": "0.3.6",
+      "runtimeHint": "uvx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--from",
+          "value": "memtrust-cli"
+        }
+      ],
+      "packageArguments": [
+        {
+          "type": "positional",
+          "valueHint": "script_name",
+          "value": "memtrust-mcp"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
