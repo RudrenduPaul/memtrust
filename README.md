@@ -49,7 +49,7 @@ not MemPalace's own architecture. A "lossless" compression claim (the "AAAK" mod
 LongMemEval score from 96.6% to 84.2% in practice, a 12.4 percentage point gap. Two internal pull
 requests attempting to fix the reporting problem, #433 and #729, were both closed without merging
 on April 12, 2026 -- #729 within seven minutes of being opened. As of this writing, the issue has
-233 thumbs-up reactions and 39 comments.
+232 thumbs-up reactions and 39 comments.
 
 None of that means MemPalace, or any other backend, doesn't work. It means nobody outside the
 vendor had run the same test, the same way, against every option, and published the raw logs.
@@ -88,7 +88,7 @@ produce the output shown. Nothing here is simulated.
 
 ```
 $ memtrust run --backends mempalace,mem0,zep,openviking --eval all
-memtrust 0.3.3 -- run_id=mt_2026-07-21T004232Z
+memtrust 0.3.4 -- run_id=mt_2026-08-04T061759Z
 Backends: mempalace, mem0, zep, openviking   Evals: longmemeval, locomo, contradiction,
 resource_sync_safety, compression, ranking_quality, scale_stress, embedding_drift, crash_recovery,
 extraction_quality, migration_rollback, filter_injection, lock_contention, stats_accuracy,
@@ -107,7 +107,7 @@ instructions.
 
 Cost: $0.00 (no LLM-judged evals ran -- structural evals only, or judge not configured)
 
-Full report: memtrust-report-2026-07-20.json
+Full report: memtrust-report-2026-08-03.json
 ```
 
 That's the real, reproducible behavior of a fresh clone with no credentials: every backend reports
@@ -130,30 +130,30 @@ $ pytest --cov=memtrust --cov-report=term-missing
 ... (33 module rows total; the 11 most relevant to this README are shown below)
 Name                                                          Stmts   Miss  Cover
 -------------------------------------------------------------------------------------
-src/memtrust/adapters/base.py                                   305     16    95%
-src/memtrust/adapters/mempalace_adapter.py                      254     15    94%
+src/memtrust/adapters/base.py                                   290      1    99%
+src/memtrust/adapters/mempalace_adapter.py                      265     15    94%
 src/memtrust/adapters/mem0_adapter.py                            140     12    91%
-src/memtrust/adapters/mem0_direct_adapter.py                     277     34    88%
+src/memtrust/adapters/mem0_direct_adapter.py                     281     34    88%
 src/memtrust/adapters/openviking_adapter.py                      178     18    90%
 src/memtrust/adapters/zep_graphiti_adapter.py                     63      3    95%
-src/memtrust/adapters/zep_graphiti_selfhosted_adapter.py         161     24    85%
+src/memtrust/adapters/zep_graphiti_selfhosted_adapter.py         165     24    85%
 src/memtrust/evals/contradiction.py                              127      2    98%
 src/memtrust/evals/compression.py                                 86      1    99%
 src/memtrust/evals/temporal_kg_boundary.py                        90      3    97%
 src/memtrust/receipt.py                                          118     10    92%
 -------------------------------------------------------------------------------------
-TOTAL                                                            4147    276    93%
+TOTAL                                                            4167    265    94%
 
-589 passed, 8 skipped in 3.57s
+590 passed, 8 skipped in 5.92s
 ```
 
 This is an excerpt, not the full table -- the weakest-covered module in the repo,
 `evals/mempalace_metadata_scale.py` (70%), isn't one of the 11 shown above; run the command
 yourself for the complete per-module breakdown.
 
-589 passing tests across 33 source modules, 93% overall statement coverage, 98% on the
+590 passing tests across 33 source modules, 94% overall statement coverage, 98% on the
 contradiction-detection eval, 99% on compression/round-trip fidelity, 97% on the temporal-KG
-boundary eval, 85-95% across the adapter layer. The 8 skips are live-`mempalace`-package tests that
+boundary eval, 85-99% across the adapter layer. The 8 skips are live-`mempalace`-package tests that
 only run with the optional `mempalace-direct` extra installed (`pip install -e
 '.[dev,mempalace-direct]'`). Every test mocks its HTTP or wire
 layer, or uses an in-memory fake backend -- none of them touch a real network, though a meaningful
@@ -191,13 +191,14 @@ Commands:
 | Command | Flags | What it does |
 |---|---|---|
 | `memtrust run` | `--backends TEXT` comma-separated list or `all` (default `all`) · `--eval TEXT` comma-separated from `longmemeval,locomo,contradiction,resource_sync_safety,compression,ranking_quality,scale_stress,embedding_drift,crash_recovery,extraction_quality,migration_rollback,filter_injection,lock_contention,stats_accuracy,orphan_cleanup,result_consistency,temporal_kg_boundary`, or `all` (default `all`) · `--output FILE` (defaults to `./memtrust-report-<date>.json`) · `--locomo-dataset-path FILE` points the LoCoMo eval at a real, downloaded `locomo10.json` instead of the bundled synthetic fixture (memtrust does not bundle or auto-fetch the real dataset) · `--locomo-exclude-question-ids-file FILE` excludes known-bad-ground-truth LoCoMo question IDs from scoring · `--scale-stress-n-records INTEGER` (default `500`) sets how many synthetic records the scale-stress eval stores and re-queries · `--sign FILE` writes a signed `<output>.receipt.json` alongside the report, proving it was produced by the holder of the given Ed25519 private key | Runs the eval suite against the requested backends. A backend without its credential env var set prints `SKIPPED` and the run continues -- this command never crashes on missing credentials. `temporal_kg_boundary` only applies to the `mempalace` backend (the only adapter that wires `kg_add`/`kg_invalidate`/`kg_query`); requesting it against any other backend reports `not_applicable`, not an error. |
-| `memtrust report REPORT_PATH` | positional path to a prior JSON report | Reads a report written by `memtrust run` and prints a formatted summary. |
-| `memtrust keygen` | -- | Generates a new Ed25519 keypair for signing reports with `run --sign`. |
-| `memtrust verify RECEIPT_PATH` | -- | Verifies a signed receipt produced by `memtrust run --sign`; a tampered or mismatched receipt fails verification. |
+| `memtrust report REPORT_PATH` | positional path to a prior JSON report · `--json` prints the parsed report as JSON instead of a formatted summary | Reads a report written by `memtrust run` and prints a formatted summary. |
+| `memtrust keygen` | `--private-key-out FILE` (default `memtrust-key.pem`) · `--public-key-out FILE` (default `memtrust-key.pub`) · `--force` overwrites existing output files | Generates a new Ed25519 keypair for signing reports with `run --sign`. |
+| `memtrust verify RECEIPT_PATH` | `--public-key FILE` (or the `MEMTRUST_RECEIPT_PUBLIC_KEY` env var) · `--json` prints the result as JSON | Verifies a signed receipt produced by `memtrust run --sign`; a tampered or mismatched receipt fails verification. |
 | `memtrust --version` | -- | Prints the installed version. |
 
-Every line above came straight from running `memtrust --help`, `memtrust run --help`, and
-`memtrust report --help` against this repo. Nothing here is invented.
+Every line above came straight from running `memtrust --help`, `memtrust run --help`,
+`memtrust report --help`, `memtrust keygen --help`, and `memtrust verify --help` against this
+repo. Nothing here is invented.
 
 ![Terminal recording walking the full memtrust CLI surface: memtrust --help, then each subcommand's own --help output for run, report, keygen, and verify.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-3-cli-surface.gif)
 
@@ -262,10 +263,10 @@ section below until a live run actually produces them:
 
 | Backend | GitHub stars | Self-reported description |
 |---|---|---|
-| [MemPalace](https://github.com/MemPalace/mempalace) | 57,512 | "The best-benchmarked open-source AI memory system. And it's free." |
-| [Mem0](https://github.com/mem0ai/mem0) | 61,318 | "Universal memory layer for AI Agents" |
-| [Zep / Graphiti](https://github.com/getzep/graphiti) | 28,978 | "Build Real-Time Knowledge Graphs for AI Agents" |
-| [OpenViking](https://github.com/volcengine/OpenViking) | 27,016 | "Self-evolving Context Database for AI Agents. Unify Agent Memory, Knowledge RAG and Skills." |
+| [MemPalace](https://github.com/MemPalace/mempalace) | 58,032 | "The best-benchmarked open-source AI memory system. And it's free." |
+| [Mem0](https://github.com/mem0ai/mem0) | 62,450 | "Universal memory layer for AI Agents" |
+| [Zep / Graphiti](https://github.com/getzep/graphiti) | 29,526 | "Build Real-Time Knowledge Graphs for AI Agents" |
+| [OpenViking](https://github.com/volcengine/OpenViking) | 27,859 | "Self-evolving Context Database for AI Agents. Unify Agent Memory, Knowledge RAG and Skills." |
 
 None of these numbers say anything about which backend handles a contradicted fact correctly --
 that's the whole reason the harness exists. Star count measures adoption, not correctness.
@@ -481,35 +482,54 @@ LongMemEval/LoCoMo datasets). Nothing leaves your machine unless you choose to p
 
 ## Install
 
-### npx (agent-native)
+`pip install memtrust-cli` is the verified, working install path -- confirmed against a clean
+virtualenv as of this writing. `pip show memtrust-cli` and `memtrust --version` both report
+`0.3.4`.
 
-Both PyPI and npm are live. `pip install memtrust-cli` works today, and so does the `npx` command
-below -- `npm install memtrust-cli` no longer 404s.
+### npx (currently broken -- tracked, not hidden)
 
-For CI and agent runners that have Node.js available but not necessarily a Python toolchain:
+The npm package (`memtrust-cli`) is live and no longer 404s, and its source on `main`
+(`npm/memtrust-cli/bin/memtrust.js`) correctly runs `uv tool run --from
+memtrust-cli==<version> memtrust <args>`. The published `0.3.4` npm tarball, however, still
+ships the earlier, broken build of that same file, which runs `uv tool run --from
+memtrust==<version> memtrust <args>` instead -- pointed at a PyPI project named `memtrust` that
+has never existed (`pypi.org/pypi/memtrust/json` returns 404, same as the FAQ below already
+documents). The source fix landed on `main`; the npm publish that would ship it has not gone
+out yet. Confirmed live, today, by downloading the actual published tarball
+(`npm pack memtrust-cli@0.3.4`) and inspecting `bin/memtrust.js` directly, not by reading source
+and assuming it matches what's published:
 
 ```bash
-npx memtrust-cli run --backends mempalace,mem0,zep,openviking --eval all
+$ npx -y memtrust-cli --version
+npm error could not determine executable to run
+  × No solution found when resolving tool dependencies:
+  ╰─▶ Because memtrust was not found in the package registry and you
+      require memtrust==0.3.4, we can conclude that your requirements are
+      unsatisfiable.
 ```
+
+Until a new npm version ships with the fixed wrapper, use `pip install memtrust-cli` (above) --
+it is unaffected, since the bug is only in the npm wrapper script, not the PyPI package it
+bootstraps. For CI and agent runners that have Node.js but not Python: hold off on `npx
+memtrust-cli` until this section no longer carries this notice, or provision Python and use `pip
+install memtrust-cli` directly.
 
 The npm package is named `memtrust-cli` so it is unambiguous as a CLI tool at a glance (and so it
 doesn't collide with any future `memtrust` JS library package). `npx` always resolves the package
-name to its matching `bin` entry automatically, so `npx memtrust-cli ...` is what reliably works
-for a zero-install first run. Once installed, the package also exposes the shorter `memtrust`
-command as a second `bin` alias -- matching the underlying Python CLI's own command name -- so you
-are not stuck typing `memtrust-cli` for every subsequent invocation; `memtrust run ...` works too.
+name to its matching `bin` entry automatically, so `npx memtrust-cli ...` is the intended
+zero-install path once the fixed build ships. Once installed, the package also exposes the
+shorter `memtrust` command as a second `bin` alias -- matching the underlying Python CLI's own
+command name -- so you are not stuck typing `memtrust-cli` for every subsequent invocation.
 
-This is not a zero-dependency install: `npx memtrust-cli` still fetches `memtrust-cli` from PyPI on
-first use. What it removes is no Python toolchain to provision by hand -- `npx memtrust-cli`
-handles the interpreter and package fetch for you via a bundled, verified copy of Astral's
-[`uv`](https://github.com/astral-sh/uv). Each platform package bundles a genuine, SHA-256-verified
-copy of `uv`'s own GitHub release binary (fetched at npm package-publish time, never at end-user
-install time), and its `bin` shim runs `uv tool run --from memtrust-cli==<pinned version> memtrust
-<args>`, which transparently bootstraps a Python interpreter and installs that exact pinned
-`memtrust-cli` release from PyPI, caching it after the first run. The npm package is pinned to its
-own version -- bump `npm/memtrust-cli/package.json`'s version when a new PyPI release ships, and
-every subsequent install resolves to that exact release, not whatever happens to be newest at run
-time.
+This was never meant to be a zero-dependency install: `npx memtrust-cli` still fetches
+`memtrust-cli` from PyPI on first use. What it removes is a Python toolchain to provision by
+hand -- it bootstraps the interpreter and package fetch for you via a bundled, verified copy of
+Astral's [`uv`](https://github.com/astral-sh/uv). Each platform package bundles a genuine,
+SHA-256-verified copy of `uv`'s own GitHub release binary (fetched at npm package-publish time,
+never at end-user install time). The npm package is pinned to its own version -- bump
+`npm/memtrust-cli/package.json`'s version and republish when a new PyPI release ships, and every
+subsequent install resolves to that exact release, not whatever happens to be newest at run
+time. That republish is exactly the step still outstanding here.
 
 ## What a hosted trust layer would add
 
@@ -588,12 +608,22 @@ clear `no prebuilt uv binary available for <platform>/<arch>` error instead of a
 underlying `memtrust` PyPI package itself only requires Python 3.11+, so `pip install memtrust-cli`
 remains the fallback path on any platform the npm wrapper doesn't cover.
 
-**Do I need a Python toolchain installed to use memtrust?** Not if you go through the npm wrapper.
-`npx memtrust-cli run ...` runs `uv tool run --from memtrust-cli==<pinned version> memtrust <args>`
-under the hood, and `uv` provisions its own isolated Python interpreter and installs the exact
-pinned `memtrust-cli` release from PyPI on first use, caching it after that. If you already have
-Python 3.11+, `pip install memtrust-cli` (the PyPI package name) works directly with no Node.js
-involved.
+**Why does `npx memtrust-cli --version` fail with a "memtrust was not found in the package
+registry" error?** A real, currently-live packaging gap, confirmed by downloading the published
+tarball directly (`npm pack memtrust-cli@0.3.4`) rather than trusting the repo's source: the
+`0.3.4` build on npm still runs `uv tool run --from memtrust==<version>`, pointed at a PyPI
+project named `memtrust` that has never been published. The fix (`--from
+memtrust-cli==<version>`, the real published name) is already merged on `main`; it just hasn't
+gone out in an npm release yet. `pip install memtrust-cli` is unaffected and is the reliable
+install path until that release ships -- see "Install" above for the exact reproduction.
+
+**Do I need a Python toolchain installed to use memtrust?** The npm wrapper is designed to make
+that unnecessary -- `npx memtrust-cli run ...` is meant to run `uv tool run --from
+memtrust-cli==<pinned version> memtrust <args>` under the hood, letting `uv` provision its own
+isolated Python interpreter on first use. As of this writing the published `0.3.4` npm package
+still ships an earlier, broken build of that wrapper (see "Install" above for the confirmed
+repro); until a fixed version is published, you do need Python 3.11+ installed and should use
+`pip install memtrust-cli` (the PyPI package name) directly, no Node.js involved.
 
 **How does memtrust compare to a general-purpose LLM eval framework like RAGAS?** RAGAS evaluates
 RAG pipelines and other LLM applications with objective metrics and synthetic test-data generation;
@@ -629,8 +659,9 @@ distribution found for memtrust." `memtrust-cli` is the one real, published PyPI
 (`src/memtrust/__init__.py` still has a defensive fallback that would also read a `memtrust`-named
 distribution's version if one were ever installed locally -- e.g. from a local build -- but that
 is unrelated to whether a `memtrust` project is live on PyPI, which it is not.) The npm wrapper's
-`bin/memtrust.js` now pins `uv tool run --from memtrust-cli==<version>` for the same reason, so
-`npx memtrust-cli` no longer depends on a `memtrust`-named PyPI project existing at all.
+`bin/memtrust.js` on `main` now pins `uv tool run --from memtrust-cli==<version>` for the same
+reason -- the published `0.3.4` npm build has not picked that fix up yet, though; see "Install"
+above for the current, confirmed-broken state of `npx memtrust-cli`.
 
 **Has memtrust actually been run against a live memory backend, or is this all synthetic?** Both,
 and the README doesn't blur the line. The eval logic itself is proven against bundled synthetic
@@ -800,4 +831,3 @@ open, deliberately not counted as fixed: some point at real gaps this harness ge
 yet without a live vendor credential, and inflating a near-miss to PASS defeats the entire point of
 an independently-verified benchmark. See the confidence caveats throughout this README and in
 `docs/methodology.md` for exactly which claims rest on which kind of evidence.
-
