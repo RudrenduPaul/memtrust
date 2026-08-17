@@ -46,7 +46,7 @@ _TOOL_DESCRIPTION = (
     "OpenViking -- and returns the resulting JSON report. Call this when an "
     "agent needs a fresh, reproducible comparison of memory-backend quality "
     "or performance rather than trusting a vendor's self-reported numbers; "
-    "do not call it just to read documentation (pass `[\"--help\"]` for "
+    'do not call it just to read documentation (pass `["--help"]` for '
     "that instead) or to inspect a report that already exists on disk (use "
     "the CLI's `report` subcommand directly for that). A backend is only "
     "evaluated if its credential env var is set in the server's "
@@ -64,14 +64,14 @@ _TOOL_DESCRIPTION = (
     "report rather than mutating prior results. Runs can take several "
     "minutes (subprocess timeout is 600s) depending on which evals and "
     "backends are selected. On a non-zero CLI exit, the tool does not "
-    "raise; it returns `{\"error\": ..., \"returncode\": ..., \"stderr\": "
+    'raise; it returns `{"error": ..., "returncode": ..., "stderr": '
     "...}` so the calling agent can inspect what failed.\n\n"
     "Parameter: `args` is a list[str] of argv tokens appended to `memtrust "
-    "run` (NOT a shell string, and do not include \"run\" itself or an "
+    'run` (NOT a shell string, and do not include "run" itself or an '
     "`--output` flag -- the wrapper supplies its own temp output path). "
     "Real examples pulled from `memtrust run --help`:\n"
-    '  - [] -- run every eval against every configured backend (both flags '
-    "default to \"all\")\n"
+    "  - [] -- run every eval against every configured backend (both flags "
+    'default to "all")\n'
     '  - ["--backends", "mempalace", "--eval", "contradiction"] -- one '
     "backend, one eval\n"
     '  - ["--backends", "mem0,zep", "--eval", "longmemeval,locomo", '
