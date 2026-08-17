@@ -1,20 +1,27 @@
 # memtrust
 
-Agent memory backends each publish their own benchmark numbers, on different tests, measured
-different ways. memtrust runs the same evals against all four and publishes the raw logs. Run
-against the vendors, not by them.
+<!-- mcp-name: io.github.RudrenduPaul/memtrust -->
+<!-- Ownership-proof string for registry.modelcontextprotocol.io publishing. Do not remove. -->
+
 
 [![CI](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/RudrenduPaul/memtrust/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://github.com/RudrenduPaul/memtrust/blob/main/LICENSE)
 [![PyPI Version](https://img.shields.io/pypi/v/memtrust-cli)](https://pypi.org/project/memtrust-cli/)
+[![npm Version](https://img.shields.io/npm/v/memtrust-cli)](https://www.npmjs.com/package/memtrust-cli)
 [![PyPI](https://img.shields.io/badge/pypi-memtrust--cli-blue.svg)](https://pypi.org/project/memtrust-cli/)
+
+<a href="https://www.producthunt.com/products/memtrust?embed=true&utm_source=badge-featured&utm_medium=badge&utm_campaign=badge-memtrust" target="_blank" rel="noopener noreferrer"><img alt="memtrust - The benchmark vendors don't run on themselves | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1219788&theme=light"></a>
+
+Agent memory backends each publish their own benchmark numbers, on different tests, measured
+different ways. memtrust runs the same evals against all four and publishes the raw logs. Run
+against the vendors, not by them.
+
+![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/demo.gif)
 
 ```bash
 pip install memtrust-cli
 memtrust run --backends mempalace,mem0,zep,openviking --eval all
 ```
-
-![Terminal recording of installing memtrust-cli with pip into a clean virtualenv, then running memtrust run against all four tracked backends with no credentials configured -- every backend reports SKIPPED and a JSON report is still written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/demo.gif)
 
 (For contributing to this repo instead of just running it, see [Development](#development) --
 `pip install -e ".[dev]"` from a clone.)
@@ -105,7 +112,7 @@ Full report: memtrust-report-2026-08-03.json
 
 That's the real, reproducible behavior of a fresh clone with no credentials: every backend reports
 SKIPPED, the command exits cleanly, and a valid JSON report is still written. `memtrust --version`
-now correctly prints `0.3.4`, matching `pip show memtrust-cli`. Earlier releases printed
+now correctly prints the installed version, matching `pip show memtrust-cli`. Earlier releases printed
 `0.0.0+unknown` even when properly installed, because `src/memtrust/__init__.py` read
 `importlib.metadata.version("memtrust")` while the installed distribution is actually named
 `memtrust-cli` -- kept in the FAQ below for the record rather than deleted, since silently erasing
@@ -159,6 +166,8 @@ double built to match the real package's confirmed method signatures, not the re
 `docs/methodology.md`'s adapter confidence table for exactly which claim rests on which kind of
 verification.
 
+![Terminal recording of memtrust run against all four tracked backends with zero credentials configured, showing every backend report SKIPPED and a valid JSON report still get written.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-1-zero-credentials.gif)
+
 ## Commands
 
 ```
@@ -185,13 +194,51 @@ Commands:
 | `memtrust report REPORT_PATH` | positional path to a prior JSON report · `--json` prints the parsed report as JSON instead of a formatted summary | Reads a report written by `memtrust run` and prints a formatted summary. |
 | `memtrust keygen` | `--private-key-out FILE` (default `memtrust-key.pem`) · `--public-key-out FILE` (default `memtrust-key.pub`) · `--force` overwrites existing output files | Generates a new Ed25519 keypair for signing reports with `run --sign`. |
 | `memtrust verify RECEIPT_PATH` | `--public-key FILE` (or the `MEMTRUST_RECEIPT_PUBLIC_KEY` env var) · `--json` prints the result as JSON | Verifies a signed receipt produced by `memtrust run --sign`; a tampered or mismatched receipt fails verification. |
-| `memtrust --version` | -- | Prints the installed version (currently `0.3.4`). |
+| `memtrust --version` | -- | Prints the installed version. |
 
 Every line above came straight from running `memtrust --help`, `memtrust run --help`,
 `memtrust report --help`, `memtrust keygen --help`, and `memtrust verify --help` against this
 repo. Nothing here is invented.
 
+![Terminal recording walking the full memtrust CLI surface: memtrust --help, then each subcommand's own --help output for run, report, keygen, and verify.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-3-cli-surface.gif)
+
 ![Terminal recording of memtrust keygen generating an Ed25519 keypair, memtrust run --sign producing a signed receipt from a real run, and memtrust verify confirming the receipt's signature is valid.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/usage.gif)
+
+## MCP Server
+
+memtrust ships a [Model Context Protocol](https://modelcontextprotocol.io) server so an AI agent
+(Claude, Cursor, or any MCP-compatible client) can run a memory-backend benchmark directly, without
+a human invoking the CLI by hand.
+
+Install the extra:
+
+```bash
+pip install "memtrust-cli[mcp]"
+```
+
+Add it to your MCP client's config (for Claude Desktop, `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "memtrust": {
+      "command": "uvx",
+      "args": ["--from", "memtrust-cli", "memtrust-mcp"]
+    }
+  }
+}
+```
+
+The server exposes one tool, `run`, that shells out to `memtrust run` with the given arguments
+(memtrust has no `--json` flag, so the wrapper writes to a private temp `--output` file and reads
+it back) and returns the parsed JSON report:
+
+```
+run(["--backends", "mempalace", "--eval", "stats_accuracy"])
+```
+
+Transport is stdio, so there is nothing to host: the MCP client spawns the server as a local
+subprocess. Source: [`src/memtrust/mcp_server.py`](src/memtrust/mcp_server.py).
 
 ## How this differs from trusting a vendor's own numbers
 
@@ -283,14 +330,19 @@ comparison exactly. **This has not been run against a live MemPalace instance.**
 `memtrust run --eval temporal_kg_boundary` (see "Commands" above); against any backend other than
 `mempalace`, it reports `not_applicable` rather than an error.
 
+![Terminal recording of the temporal-KG boundary test suite running against the hand-written pre-#1914 and post-#1914 fakes, classifying the closed-interval boundary bug and confirming the fix's half-open-interval behavior.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-4-temporal-kg-tests.gif)
+
 ## Benchmarks
 
 **Live results: mem0_direct (self-hosted), July 2026.** MemPalace, Zep, and OpenViking are still
 not yet measured against a live backend -- see "Backend coverage" below for the confidence level
 on each adapter. Mem0 has one real result, produced against the actual `mem0ai` OSS library
 running self-hosted -- in-process, via `Mem0DirectAdapter`, backed by a local Qdrant instance and
-the OpenAI API for embeddings and extraction -- not against Mem0's hosted Platform API. Keep that
-distinction in mind before reading this as a claim about the hosted product.
+the OpenAI API for embeddings and extraction.
+
+> [!NOTE]
+> This result is from the self-hosted `mem0ai` OSS library, not Mem0's hosted Platform API. Don't
+> read it as a claim about the hosted product.
 
 ```
 $ export MEM0_DIRECT_EMBEDDER_PROVIDER=openai
@@ -333,9 +385,12 @@ What that means case by case, not just the percentage:
   also dropped -- stored but never came back on retrieval. The valid-side sample is small (n=3);
   treat this as a signal worth digging into further, not a settled number.
 
-**A real bug this run surfaced in mem0ai itself, not in memtrust.** Getting any of the numbers
-above required a fix first: a fresh `mem0ai==2.0.12` install with nothing but `OPENAI_API_KEY` set
-fails every single LLM-based extraction call, out of the box, for anyone. mem0's own default model
+> [!WARNING]
+> A real bug this run surfaced in mem0ai itself, not in memtrust: a fresh `mem0ai==2.0.12` install
+> with nothing but `OPENAI_API_KEY` set fails every single LLM-based extraction call, out of the
+> box, for anyone.
+
+Getting any of the numbers above required a fix first. mem0's own default model
 (`mem0/llms/openai.py`: `self.config.model = "gpt-5-mini"`) is a reasoning-tier model that only
 accepts the API's default temperature, but mem0's own reasoning-model detection
 (`mem0/llms/base.py`'s `reasoning_models` set) checks for the string `"gpt-5o-mini"`, not
@@ -506,6 +561,8 @@ chromadb-backed palace, not read off a docstring and trusted. It's the kind of m
 project exists to catch in other people's benchmarks; finding it in memtrust's own adapter and
 shipping the fix in the open, rather than quietly patching it, is the more useful story.
 
+![Terminal recording discovering that mempalace.Palace never existed in the installed package and walking the real mempalace.mcp_server functions that MemPalaceAdapter now calls instead.](https://raw.githubusercontent.com/RudrenduPaul/memtrust/main/docs/assets/dev-to-demos/demo-2-fictional-api-discovery.gif)
+
 | Backend | Adapter status | Confidence (see docs/methodology.md) |
 |---|---|---|
 | MemPalace | Implemented -- drawer API + knowledge-graph API | High on the real `mempalace.mcp_server` functions this adapter now calls, live-verified against an installed `mempalace` 3.5.0 instance (see above). Still best-effort on compression-mode names (`"raw"`/`"AAAK"`) and on whether `degraded_retrieval` warnings are ever populated by the installed version -- see the adapter's module docstring for both caveats stated plainly. |
@@ -579,19 +636,20 @@ RAGAS or a similar framework is the right tool; if you need to check whether a m
 silently drops or overwrites a contradicted fact, memtrust is the one built for that question.
 
 **Why did `memtrust --version` used to print a version that didn't match what pip said I
-installed?** This was a real, shipped bug through 0.3.1, not a hypothetical one: installing
+installed?** This was a real, shipped bug in an early release, not a hypothetical one: installing
 `memtrust-cli` from PyPI into a clean virtualenv and running `pip show memtrust-cli` reported the
 correct version, but `memtrust --version` printed `0.0.0+unknown` regardless, because
 `src/memtrust/__init__.py` read `importlib.metadata.version("memtrust")` -- the wrong distribution
 name -- instead of `version("memtrust-cli")`, the name the package is actually installed under.
-0.3.2's fix was itself incomplete: it hardcoded the lookup to `"memtrust-cli"`, which would have
-broken a `memtrust`-named mirror install the same way in reverse -- an environment with only a
-`memtrust`-named distribution installed has no `memtrust-cli` entry in its own installed-package
-metadata at all, so the lookup would always miss and fall through to the same `0.0.0+unknown`
-fallback. Fixed for real in 0.3.3: the lookup now tries `memtrust-cli` first, falls back to
-`memtrust`, and only reports `0.0.0+unknown` if neither distribution name is installed. That
-fallback is defensive, not evidence a `memtrust`-named PyPI project exists today -- see "Can I
-`pip install memtrust` instead of `memtrust-cli`?" below for the current, corrected answer.
+The first attempted fix was itself incomplete: it hardcoded the lookup to `"memtrust-cli"`, which
+would have broken a `memtrust`-named mirror install the same way in reverse -- an environment with
+only a `memtrust`-named distribution installed has no `memtrust-cli` entry in its own
+installed-package metadata at all, so the lookup would always miss and fall through to the same
+`0.0.0+unknown` fallback. Fixed for real in the following release: the lookup now tries
+`memtrust-cli` first, falls back to `memtrust`, and only reports `0.0.0+unknown` if neither
+distribution name is installed. That fallback is defensive, not evidence a `memtrust`-named PyPI
+project exists today -- see "Can I `pip install memtrust` instead of `memtrust-cli`?" below for
+the current, corrected answer.
 
 **Can I `pip install memtrust` instead of `memtrust-cli`?** No, not currently -- this README
 previously claimed a separate `memtrust`-named PyPI project existed in sync with `memtrust-cli`.
