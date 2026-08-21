@@ -1358,7 +1358,7 @@ def test_hypothetical_raw_distance_scores_would_invert_threshold_filtering() -> 
 # malformed LLM JSON response. Proves ExtractionSignal.EMPTY_EXTRACTION
 # fires instead of a crash, end to end through the real installed
 # package -- not just against the hand-written _FakeMemory double Layer 1
-# above uses. See tests/fixtures/extraction_quality_cases.json's new
+# above uses. See src/memtrust/data/extraction_quality_cases.json's new
 # malformed_llm_response_cases category for the case shapes this mirrors.
 # ---------------------------------------------------------------------------
 

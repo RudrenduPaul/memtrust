@@ -269,7 +269,7 @@ FalkorDB instance was started or reached during this build. That means:
     search pipeline calls on the caller's query string before it ever
     reaches this adapter. This adapter cannot patch, bypass, or directly
     unit-test that function; it can only route eval queries containing
-    the trigger characters (see tests/fixtures/contradiction_cases.json)
+    the trigger characters (see src/memtrust/data/contradiction_cases.json)
     at a live self-hosted instance, so a contributor who runs this
     adapter against a real deployment can compare BM25 ranking with and
     without those letters and observe the degradation directly.
@@ -718,7 +718,7 @@ class ZepGraphitiSelfHostedAdapter(MemoryBackendAdapter):
         string passed here reaches graphiti-core's own internal sanitizer
         before it ever hits the database -- this adapter has no surface to
         intercept or bypass that. Fixture cases containing uppercase
-        O/R/N/T/A/D (tests/fixtures/contradiction_cases.json) are what let
+        O/R/N/T/A/D (src/memtrust/data/contradiction_cases.json) are what let
         an eval run against a *live* self-hosted instance demonstrate the
         BM25 ranking degradation; against the mocked test double used in
         this repo's own test suite, the sanitizer never runs at all -- see

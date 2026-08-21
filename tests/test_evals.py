@@ -1,5 +1,5 @@
 """Eval runner tests. All run against the bundled synthetic fixtures in
-tests/fixtures/ through in-memory fake adapters -- no real backend or LLM
+src/memtrust/data/ through in-memory fake adapters -- no real backend or LLM
 API calls. This is what proves the harness's scoring logic works, fully
 offline and deterministically, independent of whether any live vendor
 credentials are ever configured.
