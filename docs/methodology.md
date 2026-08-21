@@ -115,7 +115,7 @@ verification is attempted against the wrong public key.
   `temporal-reasoning`, `knowledge-update`, `multi-session`), `question`, `answer`,
   `question_date`, `haystack_session_ids`, `haystack_dates`, `haystack_sessions` (a list of
   sessions, each a list of `{role, content}` turns), `answer_session_ids`.
-- **What ships in this repo:** `tests/fixtures/longmemeval_sample.json` -- 3 hand-written examples
+- **What ships in this repo:** `src/memtrust/data/longmemeval_sample.json` -- 3 hand-written examples
   matching that exact schema. The conversations and facts are invented for this repo; none of the
   text is copied from the real dataset. This was a deliberate choice, not a shortcut we're hiding:
   downloading and redistributing the full public dataset was out of scope for this build pass, and
@@ -137,7 +137,7 @@ verification is attempted against the wrong public key.
   The published dataset totals 1,986 questions: 1,540 "regular" questions across the first four
   categories, plus a 446-question adversarial category 5 -- deliberately unanswerable questions
   that test whether a backend admits it doesn't know rather than fabricating a confident answer.
-- **What ships in this repo:** `tests/fixtures/locomo_sample.json` -- 1 hand-written conversation,
+- **What ships in this repo:** `src/memtrust/data/locomo_sample.json` -- 1 hand-written conversation,
   2 sessions, 4 QA pairs across all 4 non-adversarial categories represented by 3 cases
   (single-hop, temporal, multi-hop) plus 1 adversarial case. Again, invented content matching the
   real schema, not copied data.
@@ -217,7 +217,7 @@ To use it:
 - **Not derived from any published dataset.** This is memtrust's own eval, built specifically
   because neither LongMemEval nor LoCoMo tests what happens when a stored fact is contradicted by
   a later one.
-- **Fixture:** `tests/fixtures/contradiction_cases.json` -- 7 hand-written cases, each with an
+- **Fixture:** `src/memtrust/data/contradiction_cases.json` -- 7 hand-written cases, each with an
   `initial_fact`, a `contradicting_fact`, a `query`, and the specific `initial_value`/
   `updated_value` substrings the classifier checks for (see Scoring logic below). Cases 6 and 7
   were added alongside `ZepGraphitiSelfHostedAdapter` (2026-07-16): case 6's query
@@ -253,7 +253,7 @@ To use it:
   operating mode. Neither LongMemEval, LoCoMo, nor the contradiction eval measures literal
   reconstruction fidelity -- they measure recall and conflict-handling, not "did the exact text
   survive the round trip."
-- **Fixture:** `tests/fixtures/compression_cases.json` -- 5 hand-written cases covering short,
+- **Fixture:** `src/memtrust/data/compression_cases.json` -- 5 hand-written cases covering short,
   long/multi-sentence, special-character/unicode, and structured/numeric content, each just a
   `case_id` and a `content` string (see Scoring logic below).
 - **Requires the new `mode` parameter.** `MemoryBackendAdapter.store()`/`query()` (see
@@ -287,7 +287,7 @@ To use it:
   first) with zero errors raised anywhere in the pipeline. Every individual returned drawer is
   itself a real, uncorrupted memory -- there is no contradiction anywhere in this bug, which is
   exactly why it was invisible to `ConflictSignal`.
-- **Fixture:** `tests/fixtures/ranking_quality_cases.json` -- 4 hand-written cases, each a
+- **Fixture:** `src/memtrust/data/ranking_quality_cases.json` -- 4 hand-written cases, each a
   `session_id`, `query`, `ranking_field` (which metadata key this case tests, e.g. `"importance"`),
   and a list of `records` to store in order (`content` + `metadata`). Case `mt-rank-001` and
   `mt-rank-004` reproduce the #1733 shape directly (constant value, and field never written at
@@ -341,7 +341,7 @@ To use it:
   behavior across two store() calls reproduces the exact bug shape (in-place overwrite with no
   dimension validation): records seeded under one label become unrecoverable once records seeded
   under a second label are stored into the same session.
-- **Fixture:** `tests/fixtures/embedding_drift_cases.json` -- 3 hand-written cases. `mt-embed-001`
+- **Fixture:** `src/memtrust/data/embedding_drift_cases.json` -- 3 hand-written cases. `mt-embed-001`
   and `mt-embed-002` each seed several `model_a_records` under one `model_a_label`, then several
   `model_b_records` under a genuinely different `model_b_label` in the same session. `mt-embed-003`
   is a deliberate same-label case (`model_a_label == model_b_label`) -- a "migration" that never
@@ -380,7 +380,7 @@ To use it:
   reachable (`index_resource()` in OpenViking's `embedding_utils.py` skipped every subdirectory
   during reindex, so nested-directory content was never vectorized and searches over it silently
   returned nothing -- reported by GitHub user SonicBotMan).
-- **Fixture:** `tests/fixtures/resource_sync_cases.json` -- 4 hand-written cases, each seeding a
+- **Fixture:** `src/memtrust/data/resource_sync_cases.json` -- 4 hand-written cases, each seeding a
   mix of `generated`/`user`-origin files under one resource prefix. Case `mt-resync-004` is the
   one added for this change: its seed files nest 3 real directory levels deep
   (`generated/entities/people/jordan-lee.md`, `user-notes/preferences/user-482/notification-
@@ -500,7 +500,7 @@ To use it:
   the underlying store still has it. `CrashRecoveryCleanFakeAdapter` (index correctly rebuilt on
   restart) and `CrashRecoveryDataLostFakeAdapter` (both index and store lost) are the negative
   controls that prove this eval does not just flag every crash as the #2644 shape.
-- **Fixture:** `tests/fixtures/crash_recovery_cases.json` -- 3 hand-written cases, each just a
+- **Fixture:** `src/memtrust/data/crash_recovery_cases.json` -- 3 hand-written cases, each just a
   `case_id`, `session_id`, and `content` string to store, then re-query after the simulated
   crash/restart.
 - **`simulate_crash_restart()` and `raw_store_contains()` are both new, optional capabilities on
@@ -544,7 +544,7 @@ To use it:
   stated). jamebobob also documented a feedback-loop case: a single hallucinated memory, once
   recalled back into an agent's context, got re-extracted and re-stored as "new" input, and that
   one re-store fanned out into 808 duplicate records, not one.
-- **Fixture:** `tests/fixtures/extraction_quality_cases.json` -- 15 hand-written `cases` (12 junk,
+- **Fixture:** `src/memtrust/data/extraction_quality_cases.json` -- 15 hand-written `cases` (12 junk,
   3 valid-content controls) covering every one of jamebobob's real junk categories
   (`boot_file_restating`, `cron_heartbeat_noise`, `system_dump`, `hallucinated_profile`, plus an
   `other_junk` catch-all) each carrying a `should_be_stored` ground-truth label memtrust itself

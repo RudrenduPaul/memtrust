@@ -41,13 +41,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import BackendAPIError, ConsistencySignal, MemoryBackendAdapter
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "result_consistency_cases.json"
+DEFAULT_FIXTURE_PATH = cast(
+    Path, resources.files("memtrust.data") / "result_consistency_cases.json"
 )
 
 #: Default number of times each case's query is repeated. ponsde's own
@@ -128,7 +129,7 @@ class ConsistencyEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[ConsistencyCase]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     return [
         ConsistencyCase(
