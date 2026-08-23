@@ -36,7 +36,7 @@ crash on missing dependency" contract. CI installs this group (see
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from importlib import resources
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1413,9 +1413,8 @@ def _build_real_memory_with_mocked_boundaries(llm_response_content: str):
 
 
 def _load_malformed_llm_response_cases() -> list[dict[str, Any]]:
-    fixture = json.loads(
-        (Path(__file__).parent / "fixtures" / "extraction_quality_cases.json").read_text()
-    )
+    fixture_path = resources.files("memtrust.data") / "extraction_quality_cases.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = fixture["malformed_llm_response_cases"]
     return cases
 
