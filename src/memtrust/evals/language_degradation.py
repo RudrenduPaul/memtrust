@@ -40,7 +40,7 @@ adapter holds a direct, in-process handle to `mem0.Memory` and can pass
 `explain=True` through to it) -- REST-facing adapters
 (`Mem0Adapter`/`Mem0SelfHostedAdapter`) have no equivalent parameter on
 their vendor HTTP surface to make this observable at all. This eval and
-its fixture (`tests/fixtures/language_degradation_cases.json`) prove the
+its fixture (`src/memtrust/data/language_degradation_cases.json`) prove the
 classification logic is correct given a `score_details` response shape;
 it has not been run against a live mem0 instance with real spaCy/embedder
 credentials configured in this environment -- same "structurally capable,
@@ -52,14 +52,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import BackendAPIError, LanguageDegradationSignal
 from memtrust.adapters.mem0_direct_adapter import Mem0DirectAdapter
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "language_degradation_cases.json"
+DEFAULT_FIXTURE_PATH = cast(
+    Path, resources.files("memtrust.data") / "language_degradation_cases.json"
 )
 
 
@@ -133,7 +134,7 @@ class LanguageDegradationEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[LanguageDegradationCase]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     return [
         LanguageDegradationCase(

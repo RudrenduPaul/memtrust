@@ -16,7 +16,7 @@ session_<n>/session_<n>_date_time turn lists, and a qa list of
      multi-hop, temporal, open-domain, adversarial) alongside the verdict
      so results can be broken down by reasoning type, not just aggregated.
 
-The bundled tests/fixtures/locomo_sample.json is a small, explicitly
+The bundled src/memtrust/data/locomo_sample.json is a small, explicitly
 synthetic sample matching the real dataset's schema -- see its top-level
 "_note" field and docs/methodology.md for exactly what is synthetic here
 versus what would run against the real, full public dataset given network
@@ -73,15 +73,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import BackendAPIError, MemoryBackendAdapter
 from memtrust.scoring.llm_judge import JudgeVerdict, LLMJudge
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "locomo_sample.json"
-)
+DEFAULT_FIXTURE_PATH = cast(Path, resources.files("memtrust.data") / "locomo_sample.json")
 
 #: The real LoCoMo benchmark's category label for its adversarial,
 #: deliberately-unanswerable question set (published as "category 5" /
@@ -225,7 +224,7 @@ def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[dict[str, Any]
             '"LoCoMo" section for the download link and expected schema.'
         )
     try:
-        data = json.loads(resolved.read_text())
+        data = json.loads(resolved.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"LoCoMo dataset file at {resolved} is not valid JSON ({exc}). Expected the "
@@ -270,7 +269,7 @@ def load_exclude_question_ids(path: Path | str) -> set[str]:
     derived from an audit like dial481/locomo-audit's 99 flagged
     ground-truth errors -- would be plugged in through; no such list
     ships with this repo (see module docstring)."""
-    text = Path(path).read_text()
+    text = Path(path).read_text(encoding="utf-8")
     stripped = text.strip()
     if stripped.startswith("["):
         ids = json.loads(stripped)

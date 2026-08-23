@@ -40,8 +40,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import (
     BackendAPIError,
@@ -50,9 +51,7 @@ from memtrust.adapters.base import (
     QueryResult,
 )
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "contradiction_cases.json"
-)
+DEFAULT_FIXTURE_PATH = cast(Path, resources.files("memtrust.data") / "contradiction_cases.json")
 
 
 @dataclass
@@ -75,7 +74,7 @@ class ContradictionCase:
     per-record properties (e.g. self-hosted graphiti-core's
     `EntityEdge.attributes`) has somewhere for this eval to observe them,
     instead of every case only ever carrying plain fact text. See
-    tests/fixtures/contradiction_cases.json for the case that uses this,
+    src/memtrust/data/contradiction_cases.json for the case that uses this,
     and docs/methodology.md for the honesty caveat: graphiti-core's real
     `add_episode()` has no generic metadata parameter to receive this
     (confirmed against source, see
@@ -140,7 +139,7 @@ class ContradictionEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[ContradictionCase]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     return [
         ContradictionCase(

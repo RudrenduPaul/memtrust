@@ -58,7 +58,7 @@ holds a direct, in-process handle to the vendor library's own
 establish for their own opt-in capability flags.
 
 **Honest scope of what this eval can and cannot prove.** This eval's
-fixture cases (`tests/fixtures/filter_injection_cases.json`) are
+fixture cases (`src/memtrust/data/filter_injection_cases.json`) are
 submitted to whichever vector store `Mem0DirectAdapter` is configured
 against with a real, mocked-at-the-wire-client `mem0.vector_stores.*`
 class in the test suite (see `tests/test_mem0_direct_adapter.py`), so a
@@ -136,14 +136,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import StrEnum
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import MemoryBackendAdapter, RawFilterProbeResult
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "filter_injection_cases.json"
-)
+DEFAULT_FIXTURE_PATH = cast(Path, resources.files("memtrust.data") / "filter_injection_cases.json")
 
 
 class FilterInjectionSignal(StrEnum):
@@ -277,7 +276,7 @@ class FilterInjectionEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[FilterInjectionCase]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     return [
         FilterInjectionCase(

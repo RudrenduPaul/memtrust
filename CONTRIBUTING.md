@@ -92,7 +92,7 @@ to match. See `evals/contradiction.py` for the simplest example (no LLM judge ne
 `evals/longmemeval.py` for the LLM-judged pattern.
 
 To extend the contradiction-detection eval's case set, add entries to
-`tests/fixtures/contradiction_cases.json`. Read `docs/methodology.md`'s note on how the
+`src/memtrust/data/contradiction_cases.json`. Read `docs/methodology.md`'s note on how the
 `contradicting_fact` field should be phrased before adding a case -- a correction that restates
 the old value inside its own text can produce a misleading classification (this happened once
 during the initial build and is documented there in detail).

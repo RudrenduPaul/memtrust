@@ -16,7 +16,7 @@ haystack_sessions -- a list of chat sessions, each a list of
      "Baxter the golden retriever" should count as correct for an answer
      of "Baxter").
 
-The bundled tests/fixtures/longmemeval_sample.json is a small, explicitly
+The bundled src/memtrust/data/longmemeval_sample.json is a small, explicitly
 synthetic sample matching the real dataset's schema -- see its top-level
 "_note" field and docs/methodology.md for exactly what is synthetic here
 versus what would run against the real, full public dataset given network
@@ -57,15 +57,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import BackendAPIError, MemoryBackendAdapter
 from memtrust.scoring.llm_judge import JudgeVerdict, LLMJudge
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "longmemeval_sample.json"
-)
+DEFAULT_FIXTURE_PATH = cast(Path, resources.files("memtrust.data") / "longmemeval_sample.json")
 
 #: Default `top_k` passed to every `adapter.query()` call in
 #: `run_longmemeval()`. Pulled out as a named constant (rather than the
@@ -174,7 +173,7 @@ class LongMemEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[dict[str, Any]]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     examples: list[dict[str, Any]] = data["examples"]
     return examples
 

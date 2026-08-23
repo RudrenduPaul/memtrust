@@ -36,7 +36,7 @@ crash on missing dependency" contract. CI installs this group (see
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from importlib import resources
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -1358,7 +1358,7 @@ def test_hypothetical_raw_distance_scores_would_invert_threshold_filtering() -> 
 # malformed LLM JSON response. Proves ExtractionSignal.EMPTY_EXTRACTION
 # fires instead of a crash, end to end through the real installed
 # package -- not just against the hand-written _FakeMemory double Layer 1
-# above uses. See tests/fixtures/extraction_quality_cases.json's new
+# above uses. See src/memtrust/data/extraction_quality_cases.json's new
 # malformed_llm_response_cases category for the case shapes this mirrors.
 # ---------------------------------------------------------------------------
 
@@ -1413,9 +1413,8 @@ def _build_real_memory_with_mocked_boundaries(llm_response_content: str):
 
 
 def _load_malformed_llm_response_cases() -> list[dict[str, Any]]:
-    fixture = json.loads(
-        (Path(__file__).parent / "fixtures" / "extraction_quality_cases.json").read_text()
-    )
+    fixture_path = resources.files("memtrust.data") / "extraction_quality_cases.json"
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = fixture["malformed_llm_response_cases"]
     return cases
 

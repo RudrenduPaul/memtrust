@@ -41,14 +41,13 @@ from __future__ import annotations
 import difflib
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import BackendAPIError, MemoryBackendAdapter, QueryResult, StoreResult
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "compression_cases.json"
-)
+DEFAULT_FIXTURE_PATH = cast(Path, resources.files("memtrust.data") / "compression_cases.json")
 
 #: Mode label used when an adapter declares no `supported_modes` at all
 #: (an empty tuple). The eval still runs exactly once per case in this
@@ -124,7 +123,7 @@ class CompressionEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[CompressionCase]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     return [
         CompressionCase(

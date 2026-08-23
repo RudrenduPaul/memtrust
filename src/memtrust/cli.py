@@ -540,7 +540,7 @@ def main() -> None:
         "Path to a real locomo10.json (download it yourself from "
         "https://github.com/snap-research/locomo -- memtrust does not bundle or "
         "auto-fetch it) to run the locomo eval against, instead of the bundled "
-        "synthetic tests/fixtures/locomo_sample.json. See docs/methodology.md's "
+        "synthetic src/memtrust/data/locomo_sample.json. See docs/methodology.md's "
         '"LoCoMo" section for the schema and download link. Ignored if --eval does '
         "not include locomo."
     ),

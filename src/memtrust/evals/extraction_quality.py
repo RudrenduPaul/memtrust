@@ -48,7 +48,7 @@ in `store()`'s metadata." That second fake is a stand-in for "a backend
 with *some* extraction-quality gate," not a claim that any adapter in
 this repo talks to a live mem0 instance's real LLM-driven extraction
 pipeline -- no adapter here does. This eval and its fixture
-(`tests/fixtures/extraction_quality_cases.json`) prove the
+(`src/memtrust/data/extraction_quality_cases.json`) prove the
 *classification logic* is correct against those fakes. Neither has been
 run against a live mem0 instance at jamebobob's real 10,000+ entry scale;
 see docs/methodology.md for the full caveat.
@@ -58,8 +58,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import (
     BackendAPIError,
@@ -68,8 +69,8 @@ from memtrust.adapters.base import (
     QueryResult,
 )
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "extraction_quality_cases.json"
+DEFAULT_FIXTURE_PATH = cast(
+    Path, resources.files("memtrust.data") / "extraction_quality_cases.json"
 )
 
 #: A single feedback-loop re-store() call is expected to add exactly one
@@ -222,7 +223,7 @@ class ExtractionQualityEvalResult:
 def load_dataset(
     path: Path | str = DEFAULT_FIXTURE_PATH,
 ) -> tuple[list[ExtractionQualityCase], list[FeedbackLoopCase]]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     feedback_cases: list[dict[str, Any]] = data.get("feedback_loop_cases", [])
     return (

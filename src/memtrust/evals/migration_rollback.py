@@ -88,13 +88,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from enum import StrEnum
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import BackendAPIError, MemoryBackendAdapter
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "migration_rollback_cases.json"
+DEFAULT_FIXTURE_PATH = cast(
+    Path, resources.files("memtrust.data") / "migration_rollback_cases.json"
 )
 
 
@@ -196,7 +197,7 @@ class MigrationRollbackEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[MigrationRollbackCase]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     return [
         MigrationRollbackCase(

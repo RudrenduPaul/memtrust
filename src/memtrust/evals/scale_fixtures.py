@@ -1,7 +1,7 @@
 """Deterministic large-scale synthetic corpus generator for
 evals/scale_stress.py.
 
-Every other fixture in this repo (`tests/fixtures/*.json`) is a hand-written
+Every other fixture in this repo (`src/memtrust/data/*.json`) is a hand-written
 file with 3-7 examples -- fine for exercising contradiction/ranking/
 resource-sync logic, but 3-5 orders of magnitude below the ~100K-record or
 ~300-episode scale where several real, documented vendor bugs actually

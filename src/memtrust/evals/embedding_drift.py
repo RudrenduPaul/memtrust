@@ -73,8 +73,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from memtrust.adapters.base import (
     BackendAPIError,
@@ -82,9 +83,7 @@ from memtrust.adapters.base import (
     MemoryBackendAdapter,
 )
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "embedding_drift_cases.json"
-)
+DEFAULT_FIXTURE_PATH = cast(Path, resources.files("memtrust.data") / "embedding_drift_cases.json")
 
 
 @dataclass
@@ -164,7 +163,7 @@ class EmbeddingDriftEvalResult:
 
 
 def load_dataset(path: Path | str = DEFAULT_FIXTURE_PATH) -> list[EmbeddingDriftCase]:
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     cases: list[dict[str, Any]] = data["cases"]
     return [
         EmbeddingDriftCase(
