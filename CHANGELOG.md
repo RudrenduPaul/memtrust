@@ -7,6 +7,22 @@ All notable changes to this project are documented here. Format loosely follows
 
 ### Fixed
 
+- **npm's published `memtrust-cli` package was two releases behind PyPI, and PyPI's own latest
+  published release (0.3.7, uploaded 2026-08-11) predates and does not contain PR #20's
+  eval-fixtures packaging fix (merged 2026-08-24).** `npm/memtrust-cli/bin/memtrust.js` pins `uv
+  tool run --from memtrust-cli==<this package's own version>`, so npm's `package.json` version was
+  still `0.3.5` while PyPI had already moved to `0.3.7` -- meaning `npx memtrust-cli`, promoted
+  throughout the GTM docs as equivalent to `pip install memtrust-cli`, resolved a stale PyPI
+  release two versions behind. Separately, PyPI's `0.3.7` wheel itself was published 13 days
+  before PR #20 landed on `main`, so republishing under the existing `0.3.7` version number isn't
+  possible (PyPI rejects re-uploads of an already-used version) -- the fix requires a new version.
+  Both `pyproject.toml` and `npm/memtrust-cli/package.json` are bumped to `0.3.8` here so the next
+  `python -m build` / `twine upload` and `npm publish` (both manual, outside this repo's automated
+  CI) produce a PyPI release that actually carries the eval-fixtures fix and an npm release pinned
+  to that same fixed version, closing the gap. No npm-side equivalent of the fixture-packaging bug
+  was found: `npm/memtrust-cli` ships no fixture data of its own (`files` is just `bin/`,
+  `LICENSE`, `README.md`) -- it's a thin wrapper that always shells out to the PyPI package via
+  `uv`, so PR #20's fix, once published, covers both install paths.
 - **`npx memtrust-cli` was broken end-to-end for every user, on every platform.**
   `npm/memtrust-cli/bin/memtrust.js` pinned `uv tool run --from memtrust==<version>`, fetching a
   PyPI project literally named `memtrust`. That project has never been published --
