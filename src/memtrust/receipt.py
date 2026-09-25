@@ -274,8 +274,8 @@ def verify_receipt(receipt: dict[str, Any], trusted_public_key: Ed25519PublicKey
 
     try:
         signature = base64.b64decode(signature_b64, validate=True)
-    except ValueError as exc:
-        return VerifyResult(valid=False, reason=f"signature is not valid base64: {exc}")
+    except ValueError:
+        return VerifyResult(valid=False, reason="signature is not valid base64")
 
     embedded_key_matches: bool | None = None
     if embedded_public_key_b64 is not None:
