@@ -239,7 +239,12 @@ class VerifyResult:
 
     valid: bool
     reason: str
-    embedded_key_matches_trusted_key: bool | None = None
+    embedded_matches_trusted: bool | None = None
+
+    @property
+    def embedded_key_matches_trusted_key(self) -> bool | None:
+        """Backward-compatible alias for `embedded_matches_trusted`."""
+        return self.embedded_matches_trusted
 
 
 def verify_receipt(receipt: dict[str, Any], trusted_public_key: Ed25519PublicKey) -> VerifyResult:
@@ -291,13 +296,13 @@ def verify_receipt(receipt: dict[str, Any], trusted_public_key: Ed25519PublicKey
                 "-- either the payload was tampered with, or it was signed by a "
                 "different key than the one supplied to `memtrust verify`"
             ),
-            embedded_key_matches_trusted_key=embedded_key_matches,
+            embedded_matches_trusted=embedded_key_matches,
         )
 
     return VerifyResult(
         valid=True,
         reason="signature verified: payload is unaltered and was signed by the supplied key",
-        embedded_key_matches_trusted_key=embedded_key_matches,
+        embedded_matches_trusted=embedded_key_matches,
     )
 
 

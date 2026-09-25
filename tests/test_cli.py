@@ -665,6 +665,27 @@ def test_run_with_sign_produces_valid_receipt_verified_by_verify_command(
     assert "valid: True" in verify_result.output
 
 
+def test_verify_json_output_schema_is_stable(tmp_path: Path) -> None:
+    from memtrust.receipt import generate_keypair, sign_report, write_keypair
+
+    priv_path = tmp_path / "k.pem"
+    pub_path = tmp_path / "k.pub"
+    write_keypair(priv_path, pub_path, overwrite=False)
+    private_key, _ = generate_keypair()
+    receipt_path = tmp_path / "r.receipt.json"
+    receipt_path.write_text(json.dumps(sign_report({"run_id": "x"}, private_key)))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["verify", str(receipt_path), "--public-key", str(pub_path), "--json"]
+    )
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert set(data) == {"valid", "reason", "embedded_key_matches_trusted_key"}
+    assert data["valid"] is False
+    assert data["embedded_key_matches_trusted_key"] is False
+
+
 def test_run_without_sign_does_not_produce_receipt(tmp_path: Path) -> None:
     runner = CliRunner()
     out_path = tmp_path / "report.json"

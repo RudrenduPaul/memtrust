@@ -1273,7 +1273,7 @@ def verify(receipt_path: Path, public_key_path: Path | None, json_mode: bool) ->
                 {
                     "valid": result.valid,
                     "reason": result.reason,
-                    "embedded_key_matches_trusted_key": result.embedded_key_matches_trusted_key,
+                    "embedded_key_matches_trusted_key": result.embedded_matches_trusted,
                 }
             )
         )
@@ -1284,7 +1284,7 @@ def verify(receipt_path: Path, public_key_path: Path | None, json_mode: bool) ->
     color = "green" if result.valid else "red"
     console.print(f"[{color}]valid: {result.valid}[/{color}]")
     console.print(result.reason)
-    if result.embedded_key_matches_trusted_key is False:
+    if result.embedded_matches_trusted is False:
         console.print(
             "[yellow]Note: the public key embedded in the receipt does not match "
             "the trusted public key you supplied.[/yellow]"
