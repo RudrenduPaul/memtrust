@@ -5,6 +5,20 @@ All notable changes to this project are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Changed (2026-09-24)
+
+- Dependency upgrades: the runtime `rich` range widened from `<14.0` to `<16.0`; the optional
+  `mem0-direct` extra's `google-genai`, `redis` and `elasticsearch` caps were widened, and the
+  `dev` extra's `pytest-cov` and `mypy` caps were widened. These ride in the still-unpublished
+  `0.3.8` release below, so no further version bump.
+- npm publishing moves to npm Trusted Publishing (GitHub Actions OIDC, no long-lived token) via
+  `.github/workflows/publish-npm.yml`. On a published GitHub Release it publishes the six
+  `@memtrust-cli/<platform>` packages first and then `memtrust-cli`, and waits for the matching
+  PyPI `memtrust-cli` release before publishing the wrapper, since the wrapper pins it.
+- The six `@memtrust-cli/<platform>` packages are bumped to `0.1.2` (same bundled uv `0.11.28`) and
+  now carry `repository` and `directory` fields, which Trusted Publishing requires. The
+  `memtrust-cli` wrapper's `optionalDependencies` now point at `^0.1.2`.
+
 ### Fixed
 
 - **npm's published `memtrust-cli` package was two releases behind PyPI, and PyPI's own latest

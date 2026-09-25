@@ -1,0 +1,92 @@
+name: Publish npm
+
+# Publishes the six @memtrust-cli/<platform> binary packages first, then the
+# memtrust-cli wrapper (whose optionalDependencies point at them). Each platform
+# package's own "prepack" script downloads Astral's uv 0.11.28 from its GitHub
+# release and verifies its SHA-256 before packing, so no binary is committed.
+# Authentication is npm Trusted Publishing (OIDC); no token is used.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Use Node.js 24
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Use npm 11 (Trusted Publishing needs 11.5.1 or newer)
+        run: npm install -g npm@11
+
+      - name: Check wrapper syntax and package versions
+        run: |
+          node --check npm/memtrust-cli/bin/memtrust.js
+          node --check npm/scripts/fetch-binary.js
+          node -e '
+            const fs = require("fs");
+            const main = JSON.parse(fs.readFileSync("npm/memtrust-cli/package.json", "utf8"));
+            const py = fs.readFileSync("pyproject.toml", "utf8").match(/^version = "([^"]+)"/m)[1];
+            if (main.version !== py) throw new Error("npm wrapper " + main.version + " != pyproject " + py);
+            for (const [name, range] of Object.entries(main.optionalDependencies)) {
+              const dir = "npm/platforms/@memtrust-cli-" + name.split("/")[1];
+              const pkg = JSON.parse(fs.readFileSync(dir + "/package.json", "utf8"));
+              if (pkg.name !== name) throw new Error(dir + " is named " + pkg.name);
+              if (range !== "^" + pkg.version) throw new Error(name + ": " + range + " does not match " + pkg.version);
+              if (!pkg.repository || !pkg.repository.url.endsWith("/RudrenduPaul/memtrust.git")) throw new Error(name + ": missing repository");
+            }
+          '
+
+      - name: Wait for the matching memtrust-cli release on PyPI
+        run: |
+          VERSION=$(node -p 'require("./npm/memtrust-cli/package.json").version')
+          for i in $(seq 1 40); do
+            if curl -fsS "https://pypi.org/pypi/memtrust-cli/${VERSION}/json" > /dev/null; then
+              echo "memtrust-cli ${VERSION} is live on PyPI"
+              exit 0
+            fi
+            echo "memtrust-cli ${VERSION} not on PyPI yet (attempt ${i}/40), waiting 30s"
+            sleep 30
+          done
+          echo "memtrust-cli ${VERSION} never appeared on PyPI; the npm wrapper pins that version" >&2
+          exit 1
+
+      - name: Publish @memtrust-cli/darwin-arm64
+        run: npm publish --access public
+        working-directory: npm/platforms/@memtrust-cli-darwin-arm64
+
+      - name: Publish @memtrust-cli/darwin-x64
+        run: npm publish --access public
+        working-directory: npm/platforms/@memtrust-cli-darwin-x64
+
+      - name: Publish @memtrust-cli/linux-arm64
+        run: npm publish --access public
+        working-directory: npm/platforms/@memtrust-cli-linux-arm64
+
+      - name: Publish @memtrust-cli/linux-x64
+        run: npm publish --access public
+        working-directory: npm/platforms/@memtrust-cli-linux-x64
+
+      - name: Publish @memtrust-cli/win32-arm64
+        run: npm publish --access public
+        working-directory: npm/platforms/@memtrust-cli-win32-arm64
+
+      - name: Publish @memtrust-cli/win32-x64
+        run: npm publish --access public
+        working-directory: npm/platforms/@memtrust-cli-win32-x64
+
+      - name: Publish memtrust-cli
+        run: npm publish --access public
+        working-directory: npm/memtrust-cli
